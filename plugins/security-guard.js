@@ -475,15 +475,25 @@ export default {
 
       if ((action === "edit" || action === "write") && roots.length > 0) {
         for (const path of resources) {
-          if (typeof path !== "string" || !path.startsWith("/")) continue;
+          if (typeof path !== "string" || path === "") continue;
+          // (guard v16, H11): resolve relative targets against the project
+          // directory instead of skipping them. The runtime resolves relative
+          // tool paths against the session directory, so `../outside.txt`
+          // must not become a confinement bypass that relies solely on the
+          // first-layer `permissions`. Absolute paths keep the previous
+          // symlink-aware checks; `/tmp/opencode` stays writable.
+          const absolute = path.startsWith("/")
+            ? normalizeLexical(path)
+            : normalizeLexical(roots[0] + "/" + path);
           // Resolve symlinks so a link inside the project cannot be used to
           // write outside it. Check both the literal path and its real target
           // (and the real parent, since the target may not exist yet).
-          const candidates = [path];
-          const real = tryRealpath(path);
+          const candidates = [absolute];
+          const real = tryRealpath(absolute);
           if (real) candidates.push(real);
-          const parent = tryRealpath(path.replace(/\/[^/]*$/, "") || "/");
-          if (parent) candidates.push(parent + "/" + path.replace(/.*\//, ""));
+          const parent = tryRealpath(absolute.replace(/\/[^/]*$/, "") || "/");
+          if (parent)
+            candidates.push(parent + "/" + absolute.replace(/.*\//, ""));
           const outside = candidates.some(
             (c) => !roots.some((r) => c === r || c.startsWith(r + "/")),
           );
