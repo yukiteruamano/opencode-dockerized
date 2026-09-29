@@ -467,10 +467,10 @@ EOF
         config_success "Refreshed security permissions at $CONFIG_DIR/opencode.json"
     fi
 
-    # (Re)generate the rules when missing, or when predating the Tool Usage
-    # section or still recommending LSP/formatters (markers below). A pre-existing
-    # file is backed up first — never silently overwritten.
-    if [ ! -f "$CONFIG_DIR/AGENTS.md" ] || ! grep -q "Language Tooling" "$CONFIG_DIR/AGENTS.md" 2>/dev/null || ! grep -q "## Tool Usage" "$CONFIG_DIR/AGENTS.md" 2>/dev/null || ! grep -q "private-keys-v1.d" "$CONFIG_DIR/AGENTS.md" 2>/dev/null || ! grep -q "id_ed25519" "$CONFIG_DIR/AGENTS.md" 2>/dev/null || ! grep -q "setting.env_file" "$CONFIG_DIR/AGENTS.md" 2>/dev/null || grep -q "Prefer LSP servers and formatters" "$CONFIG_DIR/AGENTS.md" 2>/dev/null; then
+    # (Re)generate the rules when missing, or when predating the Tool Usage,
+    # Core Workflow or expanded Language Tooling sections (markers below).
+    # A pre-existing file is backed up first — never silently overwritten.
+    if [ ! -f "$CONFIG_DIR/AGENTS.md" ] || ! grep -q "Language Tooling" "$CONFIG_DIR/AGENTS.md" 2>/dev/null || ! grep -q "## Tool Usage" "$CONFIG_DIR/AGENTS.md" 2>/dev/null || ! grep -q "## Core Workflow" "$CONFIG_DIR/AGENTS.md" 2>/dev/null || ! grep -q "private-keys-v1.d" "$CONFIG_DIR/AGENTS.md" 2>/dev/null || ! grep -q "id_ed25519" "$CONFIG_DIR/AGENTS.md" 2>/dev/null || ! grep -q "setting.env_file" "$CONFIG_DIR/AGENTS.md" 2>/dev/null || grep -q "Prefer LSP servers and formatters" "$CONFIG_DIR/AGENTS.md" 2>/dev/null; then
         if [ -f "$CONFIG_DIR/AGENTS.md" ]; then
             cp "$CONFIG_DIR/AGENTS.md" "$CONFIG_DIR/AGENTS.md.bak" 2>/dev/null || true
             config_warning "Backed up pre-tooling AGENTS.md to AGENTS.md.bak"
@@ -529,6 +529,19 @@ commit messages, heredocs and `grep` patterns. Keep that in mind:
 - If a legitimate command is wrongly blocked, tell the user instead of finding
   a workaround.
 
+## Core Workflow — quality bar for every task
+
+Applies to all languages. Security sections above always win on conflict.
+
+- Evidence before synthesis: inspect files with `read`/`grep` before claiming anything; reproduce a bug before fixing it.
+- Verify by execution: after implementing or fixing, run the project's build + tests + lint/typecheck and report the output. Never mark work done without running it.
+- Prefer project tooling: use `package.json` / `pyproject.toml` / `Makefile` / `CMakePresets.json` / `go.mod` / `Cargo.toml` scripts before generic commands.
+- Small, verifiable diffs: prefer `edit` over creating files; never create files unless needed. Review the diff before risky changes.
+- Clean code: small single-responsibility functions, intentional names, early returns, no dead code, no `TODO` without a ticket, keep complexity low.
+- Maintainability: one module = one responsibility; split files past ~300-500 LOC; keep dependencies one-directional; inject dependencies instead of globals; document only non-obvious `why`, not `what`.
+- Modularity: separate I/O / domain / infrastructure; public APIs small and explicit; accept small interfaces, return concrete types; no circular imports.
+- Secure by default: validate inputs at the boundary, fail closed, least privilege, never log or return secrets/internals, handle every error path.
+
 ## Language Tooling & Practices
 
 The container provides Node.js (NVM), pnpm, uv and Git. Other toolchains
@@ -540,50 +553,83 @@ tooling when it exists.
 
 - Never use `pip`, `python -m pip` or `ensurepip`, not even inside a venv.
 - Always create a venv first: `uv venv`, then `uv sync`, run with `uv run`.
-- Add dependencies with `uv add`, never by hand-editing lockfiles.
+- Add dependencies with `uv add`, never by hand-editing `uv.lock`.
 - One-off tools via `uvx` (e.g. `uvx httpie`).
 - Respect `requires-python` in `pyproject.toml`.
+- Clean/verify: `uv run ruff check`, `uv run ruff format --check`, `uv run mypy` or `pyright`, `uv run pytest -q` must pass before handing in work.
+- Style: full type hints on public functions, pure functions where possible, `src/` layout, thin `__init__.py`, no circular imports.
+- Security: no `eval`/`exec`/`pickle` on external input; use `secrets` for tokens; parameterize SQL; run `pip-audit`/`bandit` when available.
 
 ### JavaScript/TypeScript — pnpm only
 
 - Never use `npm install`; use `pnpm add|install|run` and `pnpm dlx`.
 - `npx` is acceptable only to serve local MCP servers.
 - Respect the `packageManager` field and commit `pnpm-lock.yaml`.
+- Clean/verify: `pnpm exec tsc --noEmit`, `pnpm lint`, `pnpm exec prettier --check .`, `pnpm test` must pass before handing in work.
+- Style: `strict:true`, no untyped `any` at boundaries (validate with `zod`), small modules, no `eval` / `innerHTML` with untrusted data.
+- Security: sanitize HTML, set CSRF/XSS headers server-side, run `pnpm audit` and fix high/critical.
 
 ### C/C++
 
-- Set the standard explicitly (`-std=c17`, `-std=c++20`) with `-Wall -Wextra`.
+- Set the standard explicitly (`-std=c17`, `-std=c++20`) with `-Wall -Wextra -Werror` in dev/CI.
 - Keep builds out of the source tree; prefer CMake (see below).
-- Format with the project's configured formatter.
+- Format with the project's configured formatter (`clang-format --dry-run --Werror`); lint with `clang-tidy` when configured.
+- Style: headers expose a minimal API (`#pragma once`), `.cpp` holds details; no `using namespace std` in headers; RAII in C++; no mutable globals.
+- Security: no `strcpy`/`sprintf`/`gets`; check bounds and return codes; test with `-fsanitize=address,undefined`; pair every allocation with ownership.
 
 ### Rust
 
-- `cargo fmt --check` and `cargo clippy` must pass before handing in work.
+- `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test` must pass before handing in work.
 - Use edition 2021 or newer; commit `Cargo.lock` for binaries, not for libraries.
+- Style: no `unwrap`/`expect` outside tests; propagate with `?`; `thiserror` for library errors; small modules, small traits.
+- Security: no new `unsafe` without a `// SAFETY:` comment plus a test; run `cargo audit`/`cargo deny` when available; never `panic!` on network input.
 
 ### Go
 
-- `gofmt -l` must be clean; run `go vet ./...` before handing in work.
-- Always work inside a module (`go.mod`); use `staticcheck`/`govulncheck` when available.
+- `gofmt -l` must be clean; run `go vet ./...` and `go test ./...` (plus `-race` for concurrent code) before handing in work.
+- Always work inside a module (`go.mod`); use `staticcheck` and `govulncheck ./...` when available.
+- Style: wrap errors with `%w`, never ignore `err`; `context.Context` as first arg on I/O; accept small interfaces, return structs; keep packages small (`internal/` for non-public).
+- Security: validate inputs, set HTTP timeouts, parameterize SQL, no `unsafe`.
 
 ### Make
 
 - Mark non-file targets `.PHONY`; keep recipes parallel-safe (`make -j`).
 - Provide a `help` target documenting the available targets.
+- Style: one target = one responsibility; delegate lint/test to `make lint` / `make test`; shellcheck recipe lines containing shell.
 
 ### CMake
 
-- Always configure out-of-source (`cmake -S . -B build`); prefer presets (`CMakePresets.json`).
-- Modern target-based style (`target_link_libraries`, no global `include_directories`).
+- Always configure out-of-source (`cmake -S . -B build`); prefer presets (`CMakePresets.json`); build with `cmake --build --preset <p>` and test with `ctest --preset <p>`.
+- Modern target-based style (`target_link_libraries`, no global `include_directories`); set `-Wall -Wextra -Werror` per target.
+- Style: one directory = one target with a clear name; keep toolchain details in presets, not in logic.
 
 ### Meson + Ninja
 
-- `meson setup builddir`, then build and test with `ninja -C builddir` / `meson test -C builddir`.
+- `meson setup builddir`, then build and test with `ninja -C builddir` / `meson test -C builddir --print-errorlogs`.
+- Style: keep `meson_options.txt` typed with sane defaults; one test entry per suite.
 
 ### HTML/CSS
 
 - Semantic HTML5 (`header`/`main`/`nav`/`section`, real `button`/`a` elements).
-- Format with `prettier`; keep a basic accessibility bar (labels, alt text, contrast).
+- Format with `prettier --check`; use design tokens and mobile-first responsive CSS; avoid large inline-style blocks.
+- Accessibility bar (WCAG 2.2 AA): labels on inputs, alt text, visible focus, contrast >= 4.5:1; escape dynamic data; add `rel="noopener"` to `target="_blank"`.
+
+### Bash — for repo and project scripts
+
+- Start scripts with `#!/bin/bash` and `set -euo pipefail`; quote `"$vars"`; use `$()` and arrays for command args.
+- `bash -n` and `shellcheck -S warning` must pass; format with `shfmt` when the project uses it.
+- Style: `snake_case` functions with a usage comment; fail with a message on stderr and non-zero exit.
+
+### Dockerfile — when touching images
+
+- Pin the base (`debian:trixie-slim`, never `latest`); set `SHELL ["/bin/bash", "-o", "pipefail", "-c"]`; parameterize versions via `ARG`.
+- Never add privilege escalation, the daemon, or `--privileged`; run as non-root; clean apt caches in the same `RUN` layer.
+- Style: one concern per layer; verify with `hadolint` when available.
+
+### Git workflow
+
+- Small focused commits with conventional subjects (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`); explain `git push --force` and destructive history rewrites before running them.
+- Never commit secrets, lockfile hand-edits outside the package manager, or generated build output.
 EOF
         config_success "Created security rules at $CONFIG_DIR/AGENTS.md"
     fi
@@ -834,7 +880,7 @@ check_security_layer() {
 
     # Managed session rules must carry the current markers (sync regenerates
     # them with a backup when they predate the template).
-    if [ -f "$CONFIG_DIR/AGENTS.md" ] && grep -q "Language Tooling" "$CONFIG_DIR/AGENTS.md" 2>/dev/null && grep -q "## Tool Usage" "$CONFIG_DIR/AGENTS.md" 2>/dev/null && grep -q 'private-keys-v1.d' "$CONFIG_DIR/AGENTS.md" 2>/dev/null && grep -q 'id_ed25519' "$CONFIG_DIR/AGENTS.md" 2>/dev/null && grep -q 'setting.env_file' "$CONFIG_DIR/AGENTS.md" 2>/dev/null && ! grep -q "Prefer LSP servers and formatters" "$CONFIG_DIR/AGENTS.md" 2>/dev/null; then
+    if [ -f "$CONFIG_DIR/AGENTS.md" ] && grep -q "Language Tooling" "$CONFIG_DIR/AGENTS.md" 2>/dev/null && grep -q "## Tool Usage" "$CONFIG_DIR/AGENTS.md" 2>/dev/null && grep -q "## Core Workflow" "$CONFIG_DIR/AGENTS.md" 2>/dev/null && grep -q 'private-keys-v1.d' "$CONFIG_DIR/AGENTS.md" 2>/dev/null && grep -q 'id_ed25519' "$CONFIG_DIR/AGENTS.md" 2>/dev/null && grep -q 'setting.env_file' "$CONFIG_DIR/AGENTS.md" 2>/dev/null && ! grep -q "Prefer LSP servers and formatters" "$CONFIG_DIR/AGENTS.md" 2>/dev/null; then
         config_success "AGENTS.md rules (in sync)"
     else
         config_warning "AGENTS.md rules stale or missing"

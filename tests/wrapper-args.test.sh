@@ -80,6 +80,22 @@ grep -q 'private-keys-v1.d' "$CONFIG_DIR/opencode.json" ||
 grep -q 'private-keys-v1.d' "$OC_CONFIG_DIR/AGENTS.md" ||
     fail "GnuPG private keys must be listed as secrets in the generated rules"
 
+# Expanded quality bar: Core Workflow plus per-language clean/modular/secure rules.
+grep -q '## Core Workflow' "$OC_CONFIG_DIR/AGENTS.md" ||
+    fail "Core Workflow section must be present in the generated rules"
+grep -q 'Verify by execution' "$OC_CONFIG_DIR/AGENTS.md" ||
+    fail "Core Workflow must require verification by execution"
+grep -q 'ruff check' "$OC_CONFIG_DIR/AGENTS.md" ||
+    fail "Python rules must require ruff"
+grep -q 'tsc --noEmit' "$OC_CONFIG_DIR/AGENTS.md" ||
+    fail "JS/TS rules must require tsc --noEmit"
+grep -q 'cargo clippy' "$OC_CONFIG_DIR/AGENTS.md" ||
+    fail "Rust rules must require clippy"
+grep -q 'staticcheck' "$OC_CONFIG_DIR/AGENTS.md" ||
+    fail "Go rules must mention staticcheck"
+grep -q 'shellcheck' "$OC_CONFIG_DIR/AGENTS.md" ||
+    fail "Bash rules must require shellcheck"
+
 build_standard_volume_args "$PROJECT" false
 build_common_docker_args
 
