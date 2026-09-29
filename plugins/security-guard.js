@@ -337,6 +337,16 @@ const DENY_BASH = [
   // Extract a public key from a private key file. Case-sensitive: `-Y sign`
   // (used by git SSH signing) must stay allowed.
   /\bssh-keygen\b[^\n|;&]*-y\b[^\n|;&]*-f\b/,
+  // (guard v17, N4): git subcommands that print committed content over key
+  // material. `show`/`cat-file` use `rev:path` form (so key-named branches
+  // stay usable); `log` only dumps with `-p`/`--patch` (`--oneline` is
+  // metadata); `diff` dumps unless `--stat`. `git show HEAD:README.md` and
+  // `git log --oneline` stay allowed.
+  new RegExp(`\\bgit\\b\\s+(?:show|cat-file)\\b[^\\n|;&]*:[^\\s;|&]*${KEY_TOKEN}`),
+  new RegExp(`\\bgit\\b\\s+grep\\b[^\\n|;&]*${KEY_TOKEN}`),
+  new RegExp(`\\bgit\\b\\s+archive\\b[^\\n|;&]*${KEY_TOKEN}`),
+  new RegExp(`\\bgit\\b\\s+log\\b[^\\n|;&]*(?:-p\\b|--patch\\b)[^\\n|;&]*${KEY_TOKEN}`),
+  new RegExp(`\\bgit\\b\\s+diff\\b(?![^\\n|;&]*--stat\\b)[^\\n|;&]*${KEY_TOKEN}`),
   // GnuPG private material and secret-key export (defense in depth; the private
   // keys are never copied into the container anyway).
   /\bprivate-keys-v1\.d\b/,
