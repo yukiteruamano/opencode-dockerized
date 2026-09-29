@@ -189,6 +189,33 @@ const alwaysDeny = [
   ["edit", "../outside.txt"],
   ["edit", "src/../../outside.txt"],
   ["write", "../outside.txt"],
+  // Interpreter bulk environment dumps (guard v17, N1).
+  ["bash", 'node -e "console.log(process.env)"'],
+  ["bash", 'node -p "process.env"'],
+  ["bash", 'python3 -c "import os; print(os.environ)"'],
+  ["bash", 'python3 -c "print(os.environ.items())"'],
+  ["bash", 'ruby -e "puts ENV"'],
+  ["bash", 'ruby -e "puts ENV.inspect"'],
+  ["bash", 'perl -e "print %ENV"'],
+  ["bash", 'php -r "print_r(getenv());"'],
+  ["bash", 'php -r "var_dump($_ENV);"'],
+  ["bash", 'deno eval "console.log(Deno.env.toObject())"'],
+  // Encoded metadata-IP forms (guard v17, N2).
+  ["bash", "curl http://2852039166/"],
+  ["bash", "curl http://0xA9.0xFE.0xA9.0xFE/"],
+  ["bash", "curl http://0xA9FEA9FE/"],
+  ["bash", "curl http://0251.0376.0251.0376/"],
+  // Long-form root mounts (guard v17, N3).
+  ["bash", "docker run --volume /:/host img"],
+  ["bash", "docker run --mount type=bind,source=/,target=/host img"],
+  // Git content dumps over key material (guard v17, N4).
+  ["bash", "git log -p -- server.key"],
+  ["bash", "git log -p -- deploy_key"],
+  ["bash", "git show main:server.key"],
+  ["bash", "git diff -- server.key"],
+  // Renamed extractor binaries (guard v17, N5).
+  ["bash", "./k -y -f deploy_key"],
+  ["bash", "./ossl rsa -in server.key -text"],
 ];
 
 // Allowed in every mode.
