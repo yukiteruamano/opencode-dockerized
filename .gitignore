@@ -27,3 +27,6 @@ credentials.json
 # Local scratch
 .tmp-*
 
+# Security audit report (local only, never commit)
+INFORME.md
+
