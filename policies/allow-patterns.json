@@ -3,5 +3,10 @@
     "id": "dotenv-example",
     "pattern": "(^|[\\s'\"=:(/])\\.env\\.example(?![.\\w])",
     "reason": "Allow reading/creating .env.example templates (boundary-anchored; never applies to chained commands)"
+  },
+  {
+    "id": "public-key-pub",
+    "pattern": "(^|[\\s'\"=:(/])[\\w.-]*\\.(?:pem|key)\\.pub(?![\\w.])",
+    "reason": "Allow public keys (server.key.pub / server.pem.pub); private material without the .pub suffix stays denied. Never applies to chained commands."
   }
 ]
