@@ -55,7 +55,21 @@ if [ ! -d "$INSTALL_DIR" ]; then
     echo "Cloning opencode-dockerized into $INSTALL_DIR ..."
     git clone "$REPO_URL" "$INSTALL_DIR"
 elif [ -d "$INSTALL_DIR/.git" ]; then
-    # Reused checkout: best-effort fast-forward so curl always installs latest.
+    # Reused checkout: ensure upstream tracking first (manual checkouts
+    # via init + remote add lack @{u}, which breaks `update`/`upgrade`).
+    # Best-effort, never fails the install.
+    if command -v git >/dev/null 2>&1; then
+        _br=$(git -C "$INSTALL_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+        if [ -n "$_br" ] && [ "$_br" != "HEAD" ] \
+            && ! git -C "$INSTALL_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1 \
+            && git -C "$INSTALL_DIR" rev-parse --verify "refs/remotes/origin/$_br" >/dev/null 2>&1; then
+            git -C "$INSTALL_DIR" branch --set-upstream-to="origin/$_br" "$_br" >/dev/null 2>&1 \
+                && echo "Tracking upstream: $_br -> origin/$_br (self-update enabled)" \
+                || echo "warning: could not set upstream tracking in $INSTALL_DIR" >&2
+        fi
+        unset _br
+    fi
+    # Best-effort fast-forward so curl always installs latest.
     if git -C "$INSTALL_DIR" fetch origin >/dev/null 2>&1; then
         _lr=$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || true)
         _rr=$(git -C "$INSTALL_DIR" rev-parse '@{u}' 2>/dev/null || true)
