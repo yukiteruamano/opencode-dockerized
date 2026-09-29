@@ -113,16 +113,35 @@ the least access it needs to be useful.
   secret-like names (`printenv SECRET`, `printenv *_KEY`, `*_TOKEN`,
   `*_PASSWORD`, `*CREDENTIAL*`) are denied; `echo $VAR` expansion stays allowed
   by design (blocking it would break ordinary scripting).
+- **Bulk interpreter dumps are denied, member access stays allowed.**
+  `console.log(process.env)`, `print(os.environ)`, `puts ENV`, `print %ENV`,
+  `print_r($_ENV)` and `Deno.env.toObject()` dumps are blocked in every mode;
+  single-variable reads (`process.env.PATH`, `os.environ.get("X")`,
+  `ENV["X"]`, `$ENV{X}`, `getenv("X")`) stay allowed — they are normal config
+  reads, and blocking them would break ordinary apps. Staged copies
+  (`x = {...process.env}` printed later) remain a documented residual.
 - **Destructive root targets are denied.** `rm -rf /`, `rm -rf /*` and `rm`
   with `/..` traversals, `chmod 777 /|/*|traversal` and `chown /|traversal`,
   `mkfs`, `dd of=/dev/…` and `>/dev/sd*` are blocked in every mode.
   Project-scoped deletion (`rm -rf dist/*`, `rm -rf .`) stays allowed: the
   project mount is read-write by design.
 - **Proc/metadata/docker-escape backstops are mode-independent.** Reads of
-  `/proc/*/environ`, the cloud metadata IP (`169.254.169.254`), `docker -v /:/`
-  mounts and `docker --privileged` are blocked even with
+  `/proc/*/environ`, the cloud metadata IP (literal, decimal, hex and octal
+  forms) and `docker -v /:/`, `--volume /:/` and `--mount …,source=/,…`
+  mounts plus `docker --privileged` are blocked even with
   `setting.security_policy=off` (the vendored patterns alone only cover them in
-  `balanced`/`strict`).
+  `balanced`/`strict`). Named volumes and host subdirectories stay allowed.
+- **Git exfiltration over key material is denied.** `show`/`cat-file` of
+  `rev:path` key paths, `log -p`, non-`--stat` `diff`, `grep` and `archive`
+  over `*.key`/`*.pem`/key-like names are blocked in every mode; `git log
+  --oneline`, `git show HEAD:README.md` and `git diff --stat` stay allowed.
+- **Renamed extractor binaries are denied (token-gated).** A local executable
+  (`./k`, `/tmp/…`) with `ssh-keygen -y -f` or `openssl … -in/-text` flag
+  shapes over a key-like target is blocked; the same flags over ordinary files
+  (`./backup.sh -y -f /tmp/bak`) stay allowed. Plain renamed readers without
+  extraction flags (a copied `cat` reading `deploy_key`) remain a documented
+  heuristic residual — like staged copies, they cannot be closed without
+  breaking legitimate file management (`ls`/`rm`/`chmod` over key files).
 - **Write confinement depends on the hook.** The generated `permissions` cannot
   encode a project-scoped write rule (the project path is dynamic), so edits are
   confined by the `security-guard` hook — including relative targets, which are
