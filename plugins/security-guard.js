@@ -312,6 +312,11 @@ const DENY_BASH = [
   /\b2852039166\b|\b0x[aA]9[fF][eE][aA]9[fF][eE]\b|0x[aA]9\s*\.\s*0x[fF][eE]\s*\.\s*0x[aA]9\s*\.\s*0x[fF][eE]\b|\b0251\.0376\.0251\.0376\b|::ffff:(a9fe:a9fe|169\.254\.169\.254)/i,
   /\bdocker\b[^\n|;&]*-v\s+\/:/,
   /\bdocker\b[^\n|;&]*--privileged\b/,
+  // (guard v17, N3): long-form root mounts. `--volume /:/host` and
+  // `--mount …,source=/,…` escape like `-v /:/…`; named volumes (`data:/data`)
+  // and host subdirectories stay allowed.
+  /\bdocker\b[^\n|;&]*--volume\s+\/:\//,
+  /\bdocker\b[^\n|;&]*--mount\b[^\n|;&]*\bsource\s*=\s*\/([\s,]|$)/,
   // Secret files: block any command that references them (cat/grep/curl/...),
   // not only the `read` tool. Covers provider/MCP credentials and SSH keys.
   SECRET_PATH_RE,
