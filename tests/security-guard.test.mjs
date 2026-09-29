@@ -254,6 +254,15 @@ const alwaysAllow = [
   // Relative writes inside the project stay allowed (guard v16, H11).
   ["edit", "src/new.ts"],
   ["write", "src/new.ts"],
+  // Scoped reads and mounts allowed in every mode (guard v17, N1/N3/N4):
+  // single-variable interpreter access, named/subdir Docker volumes, and git
+  // metadata over ordinary paths are legitimate daily use.
+  ["bash", 'php -r "echo getenv(\\"PATH\\");"'],
+  ["bash", "docker run -v ./data:/data img"],
+  ["bash", "docker run --volume data:/data img"],
+  ["bash", "git log --oneline"],
+  ["bash", "git show HEAD:README.md"],
+  ["bash", "git diff main..main"],
   // Writes inside the project scratch root stay allowed for both actions.
   ["write", join(PROJECT, "src/new.ts")],
   ["write", "/tmp/opencode/probe.txt"],
