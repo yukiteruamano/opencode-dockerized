@@ -105,13 +105,28 @@ the least access it needs to be useful.
   `apiKey`/`token`/`secret`/`password` values are rejected by the wrapper and
   reported by `doctor`. Keep the values in `setting.env_file` (never mounted,
   passed via `docker --env-file`).
-- **Bare environment dumps are denied.** `env`, `printenv`, `set` and `export`
-  with no arguments (plus `export -p`, `compgen -e`, `declare -x`, `typeset -x`)
-  are blocked in every policy mode; scoped uses (`printenv PATH`,
-  `env FOO=1 cmd`, `set -e`) stay allowed.
+- **Bare environment dumps are denied.** `env`, `printenv`, `set`, `export`,
+  `declare` and `typeset` with no arguments (plus `export -p`, `declare -p`,
+  `typeset -p`, `compgen -e`, `compgen -v`, `declare -x`, `typeset -x`) are
+  blocked in every policy mode; scoped uses (`printenv PATH`,
+  `env FOO=1 cmd`, `set -e`, `declare -A map`) stay allowed. Targeted reads of
+  secret-like names (`printenv SECRET`, `printenv *_KEY`, `*_TOKEN`,
+  `*_PASSWORD`, `*CREDENTIAL*`) are denied; `echo $VAR` expansion stays allowed
+  by design (blocking it would break ordinary scripting).
+- **Destructive root targets are denied.** `rm -rf /`, `rm -rf /*` and `rm`
+  with `/..` traversals, `chmod 777 /|/*|traversal` and `chown /|traversal`,
+  `mkfs`, `dd of=/dev/…` and `>/dev/sd*` are blocked in every mode.
+  Project-scoped deletion (`rm -rf dist/*`, `rm -rf .`) stays allowed: the
+  project mount is read-write by design.
+- **Proc/metadata/docker-escape backstops are mode-independent.** Reads of
+  `/proc/*/environ`, the cloud metadata IP (`169.254.169.254`), `docker -v /:/`
+  mounts and `docker --privileged` are blocked even with
+  `setting.security_policy=off` (the vendored patterns alone only cover them in
+  `balanced`/`strict`).
 - **Write confinement depends on the hook.** The generated `permissions` cannot
   encode a project-scoped write rule (the project path is dynamic), so edits are
-  confined by the `security-guard` hook; if the plugin fails to load, writes fall
+  confined by the `security-guard` hook — including relative targets, which are
+  resolved against the project directory; if the plugin fails to load, writes fall
   back to the runtime default. The config tree is mounted read-only and the guard
   is delivered read-only, so a session cannot relax it.
 - **Prompt injection is only partly mitigated.** Rules and hooks reduce the
