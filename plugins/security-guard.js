@@ -292,6 +292,11 @@ const DENY_BASH = [
   /\bdd\b[^|;&]*\bof=\/(dev\/)?[a-z]/, // dd of=/dev/...
   /\b(shutdown|reboot|halt|poweroff)\b/,
   /\bchmod\s+(-[a-zA-Z]+\s+)*0?777\s+\/(\s|$)/,
+  // (guard v16, H12): chmod traversals/globs and any chown of `/`.
+  /\bchmod\s+[^\n|;&]*\s\/\*([\s;|&]|$)/,
+  /\bchmod\s+[^\n|;&]*\/\.\.(\/|$)/,
+  /\bchown\s+[^\n|;&]*\s\/([\s;|&*]|$)/,
+  /\bchown\s+[^\n|;&]*\/\.\.(\/|$)/,
   />\s*\/dev\/(sd|nvme|hd)/,
   // Secret files: block any command that references them (cat/grep/curl/...),
   // not only the `read` tool. Covers provider/MCP credentials and SSH keys.
