@@ -345,6 +345,12 @@ const DENY_BASH = [
   /\bcompgen\s+-v\b/i,
   /\bdeclare\s+-x\b/i,
   /\btypeset\s+-x\b/i,
+  // (guard v16, H3): targeted reads of secret-like variable names. `printenv
+  // PATH` stays allowed (yellow-team requirement); `printenv SECRET`,
+  // `printenv OPENCODE_API_KEY`, `printenv *_TOKEN`, etc. are denied in every
+  // mode. `echo $VAR` expansion stays allowed by design (blocking it would
+  // break ordinary scripting; see BALANCED_EXCLUDED_IDS).
+  /\bprintenv\b\s+[^\n|;&]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTH|API[_-]?KEY)\b/i,
   // Forwarded SSH agent is a signing oracle: forbid manipulating the host agent
   // (delete/lock identities, or remove a specific one with -e). Signing and
   // listing stay allowed.
