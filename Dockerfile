@@ -6,6 +6,11 @@ FROM debian:trixie-slim
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Parameterize tool versions for easier updates
+# Pin releases for reproducible builds; override with --build-arg.
+# OPENCODE_VERSION pins the CLI release (update with --build-arg
+# OPENCODE_BUILD_TIME to bust the pnpm cache; see `update`). Avoid `latest`
+# in production builds: a moving tag breaks reproducibility and widens
+# supply-chain exposure if a tag is ever mutated.
 ARG NVM_VERSION=v0.40.8
 ARG PNPM_VERSION=12.5.1
 # OpenCode CLI release; override with --build-arg OPENCODE_VERSION=x.y.z
