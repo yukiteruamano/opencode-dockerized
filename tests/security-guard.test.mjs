@@ -220,6 +220,13 @@ const alwaysAllow = [
   ["bash", "set -e"],
   ["bash", "set -o pipefail"],
   ["bash", "export FOO=1"],
+  // Declaration flags stay allowed (guard v16, H2): only bare `declare` and
+  // `-p` (dump) are denied.
+  ["bash", "declare -A map"],
+  ["bash", "declare -r FOO=1"],
+  // Relative writes inside the project stay allowed (guard v16, H11).
+  ["edit", "src/new.ts"],
+  ["write", "src/new.ts"],
   // Writes inside the project scratch root stay allowed for both actions.
   ["write", join(PROJECT, "src/new.ts")],
   ["write", "/tmp/opencode/probe.txt"],
