@@ -129,6 +129,7 @@ GPG_AUTOSTART_AGENT=true        # Launch the host gpg-agent when its socket is m
 GPG_RELAY=true                  # Relay the agent socket through a normal-fs socket
 GPG_RELAY_SOCKET=""             # Active relay socket for the current session
 DOCKER_SOCKET=false             # Boolean flag: mount the host Docker socket (opt-in, root-equivalent)
+NETWORK="host"                  # Container network: host (default, simple) | bridge (more isolated)
 SECURITY_POLICY="balanced"      # Security policy mode: strict | balanced | off
 MEMORY=""                       # Optional container memory limit (docker --memory), e.g. 4g
 CPUS=""                         # Optional container CPU limit (docker --cpus), e.g. 2
@@ -1481,9 +1482,17 @@ build_common_docker_args() {
     # shellcheck disable=SC2034  # DOCKER_COMMON_ARGS is used by callers that source this file
     # Block runs whose user config carries inline secrets (must use {env:}).
     validate_opencode_config || exit 1
+    # Allowlist the network mode (config values are user-edited).
+    case "${NETWORK:-host}" in
+    host | bridge) ;;
+    *)
+        config_warning "Invalid network '$NETWORK' (use host|bridge); falling back to host"
+        NETWORK="host"
+        ;;
+    esac
     DOCKER_COMMON_ARGS=(
         --rm
-        --network host
+        --network "$NETWORK"
         --user "$(id -u):$(id -g)"
         --group-add coder
         --security-opt no-new-privileges:true
@@ -1647,7 +1656,10 @@ build_standard_volume_args() {
     # --group-add (the socket's GID) instead of a runtime `usermod` that required
     # root. It is appended to VOLUME_ARGS because it is part of what this
     # function contributes to the `docker run` command.
+    # WARNING: root-equivalent on the host — enable only for Docker-in-Docker /
+    # Testcontainers (setting.docker_socket=true).
     if [ "$include_docker_socket" = true ] && [ -S /var/run/docker.sock ]; then
+        config_warning "Docker socket mounted: root-equivalent on the host (disable with setting.docker_socket=false when not needed)"
         VOLUME_ARGS+=(-v /var/run/docker.sock:/var/run/docker.sock)
         VOLUME_ARGS+=(--group-add "$(stat -c '%g' /var/run/docker.sock)")
     fi
@@ -1697,6 +1709,10 @@ init_config_file() {
 # host Docker daemon, which is effectively root on the host. Enable only when
 # you need Docker-in-Docker / Testcontainers.
 # setting.docker_socket=false
+
+# Container network: host (default, simple; shares the host network namespace)
+# or bridge (more isolated; host services are reached via host.docker.internal).
+# setting.network=host
 
 # Security policy mode enforced by the mounted security-guard.js hook.
 # strict = every vendored opencode-policy pattern; balanced = drop the noisy
@@ -1788,6 +1804,7 @@ load_config() {
     GPG_AUTOSTART_AGENT=true
     GPG_RELAY=true
     DOCKER_SOCKET=false
+    NETWORK="host"
     SECURITY_POLICY="balanced"
     MEMORY=""
     CPUS=""
@@ -1810,6 +1827,12 @@ load_config() {
         gpg_autostart_agent) [[ "$value" == "false" ]] && GPG_AUTOSTART_AGENT=false ;;
         gpg_relay) [[ "$value" == "false" ]] && GPG_RELAY=false ;;
         docker_socket) [[ "$value" == "true" ]] && DOCKER_SOCKET=true ;;
+        network)
+            case "$value" in
+            "" | host | bridge) NETWORK="${value:-host}" ;;
+            *) config_warning "Invalid network '$value' (use host|bridge); keeping host" ;;
+            esac
+            ;;
         env_file) ENV_FILE="$value" ;;
         websearch_provider)
             case "$value" in
@@ -1900,6 +1923,8 @@ save_config() {
         echo "setting.gpg_relay=$GPG_RELAY"
         echo "# Docker socket (opt-in; grants host Docker control — root-equivalent)"
         echo "setting.docker_socket=$DOCKER_SOCKET"
+        echo "# Container network: host (default) | bridge (more isolated)"
+        echo "setting.network=$NETWORK"
         echo "# Security policy mode: strict | balanced | off"
         echo "setting.security_policy=$SECURITY_POLICY"
         echo "# Optional container resource limits (empty = no limit)"
@@ -2641,6 +2666,27 @@ prompt_docker_socket() {
     fi
 }
 
+# Interactive container network prompt
+# host = simple (shares host network namespace); bridge = more isolated.
+prompt_network() {
+    echo ""
+    config_info "Container Network"
+    echo "  host   = shares the host network namespace (default, simple)"
+    echo "  bridge = more isolated (reach host services via host.docker.internal)"
+    read -r -p "Container network (host|bridge) [$NETWORK]: " network || network=""
+    case "$network" in
+    host | bridge)
+        NETWORK="$network"
+        ;;
+    "")
+        ;;
+    *)
+        config_warning "Invalid network '$network' (use host|bridge); keeping $NETWORK"
+        ;;
+    esac
+    config_success "Container network: $NETWORK"
+}
+
 # Interactive security policy prompt
 # Selects which vendored opencode-policy pattern set the guard enforces.
 prompt_security_policy() {
@@ -2831,6 +2877,10 @@ print_config() {
     echo "  GPG agent autostart: $GPG_AUTOSTART_AGENT"
     echo "  GPG socket relay: $GPG_RELAY"
     echo "  Docker socket: $DOCKER_SOCKET"
+    if [ "$DOCKER_SOCKET" = true ]; then
+        echo "  Docker socket WARNING: root-equivalent on the host (Docker-in-Docker only)"
+    fi
+    echo "  Container network: $NETWORK"
     echo "  Security policy: $SECURITY_POLICY"
     echo "  Memory limit: ${MEMORY:-(none)}"
     echo "  CPU limit: ${CPUS:-(none)}"
@@ -2914,6 +2964,7 @@ interactive_config_setup() {
         prompt_gpg_agent_support
         prompt_gpg_agent_options
         prompt_docker_socket
+        prompt_network
         prompt_security_policy
         prompt_memory
         prompt_cpus
@@ -2932,6 +2983,7 @@ interactive_config_setup() {
             prompt_gpg_agent_support
             prompt_gpg_agent_options
             prompt_docker_socket
+            prompt_network
             prompt_security_policy
             prompt_memory
             prompt_cpus
@@ -2939,7 +2991,7 @@ interactive_config_setup() {
             prompt_theme
             prompt_custom_mounts
             prompt_env_vars
-            if [ ${#CUSTOM_MOUNTS[@]} -gt 0 ] || [ "$SSH_AGENT_SUPPORT" = true ] || [ "$GPG_AGENT_SUPPORT" = true ] || [ "$DOCKER_SOCKET" = true ] || [ -n "$MEMORY" ] || [ -n "$CPUS" ] || [ "$SECURITY_POLICY" != "balanced" ] || [ -n "$ENV_FILE" ] || [ -n "$WEBSEARCH_PROVIDER" ] || [ -n "$THEME" ]; then
+            if [ ${#CUSTOM_MOUNTS[@]} -gt 0 ] || [ "$SSH_AGENT_SUPPORT" = true ] || [ "$GPG_AGENT_SUPPORT" = true ] || [ "$DOCKER_SOCKET" = true ] || [ "$NETWORK" != "host" ] || [ -n "$MEMORY" ] || [ -n "$CPUS" ] || [ "$SECURITY_POLICY" != "balanced" ] || [ -n "$ENV_FILE" ] || [ -n "$WEBSEARCH_PROVIDER" ] || [ -n "$THEME" ]; then
                 save_config
                 print_config
             else
