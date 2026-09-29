@@ -2244,6 +2244,7 @@ build_env_file_args() {
         esac
     done <"$env_file"
 
+    # shellcheck disable=SC2034 # populated here, consumed by bin/opencode-dockerized and tests
     DOCKER_ENV_FILE_ARGS=(--env-file "$env_file")
 }
 
