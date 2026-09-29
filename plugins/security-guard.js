@@ -298,6 +298,12 @@ const DENY_BASH = [
   /\bchown\s+[^\n|;&]*\s\/([\s;|&*]|$)/,
   /\bchown\s+[^\n|;&]*\/\.\.(\/|$)/,
   />\s*\/dev\/(sd|nvme|hd)/,
+  // (guard v16, H4): mode-independent backstops. The vendored patterns cover
+  // these in balanced/strict, but `off` disables them entirely.
+  /\/proc\/[^/\s]*\/environ\b/,
+  /169\.254\.169\.254/,
+  /\bdocker\b[^\n|;&]*-v\s+\/:/,
+  /\bdocker\b[^\n|;&]*--privileged\b/,
   // Secret files: block any command that references them (cat/grep/curl/...),
   // not only the `read` tool. Covers provider/MCP credentials and SSH keys.
   SECRET_PATH_RE,
