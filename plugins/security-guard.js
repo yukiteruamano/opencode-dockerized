@@ -283,6 +283,11 @@ const DENY_BASH = [
   /\bsudo\b/,
   /\brm\s+(-[a-zA-Z]+\s+)*-[a-zA-Z]*[rf][a-zA-Z]*\s+\/(\s|$)/, // rm -rf /
   /\brm\s+.*\s+\/\s*$/, // rm ... /
+  // (guard v16, H1): `rm -rf /*` and `/..` traversals (`/tmp/../`,
+  // `/tmp/opencode/../../`) resolve to `/` but miss the bare-slash rules.
+  // `rm -rf dist/*` (no leading slash) stays allowed.
+  /\brm\s+[^\n|;&]*\s\/\*([\s;|&]|$)/,
+  /\brm\s+[^\n|;&]*\/\.\.(\/|$)/,
   /\bmkfs(\.\w+)?\b/,
   /\bdd\b[^|;&]*\bof=\/(dev\/)?[a-z]/, // dd of=/dev/...
   /\b(shutdown|reboot|halt|poweroff)\b/,
