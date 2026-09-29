@@ -6,7 +6,7 @@
 // ~/.config/opencode-dockerized/plugins/security-guard.js instead.
 // Only a Node.js builtin is imported ("node:fs") — no package.json needed.
 //
-// OPENCODE_DOCKERIZED_GUARD_VERSION=16
+// OPENCODE_DOCKERIZED_GUARD_VERSION=17
 //
 // Policy modes (env OPENCODE_DOCKERIZED_POLICY, set by the wrapper from
 // `setting.security_policy`; default "balanced"):
@@ -278,6 +278,10 @@ const KEY_FILE =
 // private key for file-reading verbs. The trailing boundary keeps public
 // artifacts such as `public-keys.d`, `authorized_keys` and `*.pub` readable.
 const BARE_KEY = "(?:[\\w.-]*key)(?![A-Za-z0-9])(?!\\.pub\\b)";
+
+// Key-like tokens shared by the git-plumbing (N4) and renamed-extractor (N5)
+// rules below: private extensions, extensionless key names and bare `*key`.
+const KEY_TOKEN = `(?:\\.pem\\b(?!\\.pub\\b)|\\.key\\b(?!\\.pub\\b)|${KEY_FILE}|${BARE_KEY})`;
 
 const DENY_BASH = [
   /\bsudo\b/,
