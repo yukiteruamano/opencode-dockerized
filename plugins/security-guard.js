@@ -6,7 +6,7 @@
 // ~/.config/opencode-dockerized/plugins/security-guard.js instead.
 // Only a Node.js builtin is imported ("node:fs") — no package.json needed.
 //
-// OPENCODE_DOCKERIZED_GUARD_VERSION=15
+// OPENCODE_DOCKERIZED_GUARD_VERSION=16
 //
 // Policy modes (env OPENCODE_DOCKERIZED_POLICY, set by the wrapper from
 // `setting.security_policy`; default "balanced"):
@@ -210,6 +210,24 @@ const normalizeShell = (cmd) =>
     .replace(/\$\{IFS[^}]*\}/gi, " ")
     .replace(/\$'\\t'/g, " ")
     .replace(/\$'\\n'/g, " ");
+
+// Lexically normalize a path (resolve `.`/`..`/duplicate slashes) without
+// touching the filesystem. Used for relative edit/write targets (guard v16,
+// H11) and documented here so the rm/chmod traversal rules below stay in sync.
+const normalizeLexical = (p) => {
+  const absolute = p.startsWith("/");
+  const parts = p.split("/");
+  const stack = [];
+  for (const part of parts) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (stack.length > 0) stack.pop();
+      continue;
+    }
+    stack.push(part);
+  }
+  return (absolute ? "/" : "") + stack.join("/");
+};
 
 // Secret file names/paths referenced from a shell command (any tool).
 // Provider/MCP credentials and SSH keys that need an explicit shell block so the
