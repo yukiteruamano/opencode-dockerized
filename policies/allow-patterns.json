@@ -1,0 +1,7 @@
+[
+  {
+    "id": "dotenv-example",
+    "pattern": "(^|[\\s'\"=:(/])\\.env\\.example(?![.\\w])",
+    "reason": "Allow reading/creating .env.example templates (boundary-anchored; never applies to chained commands)"
+  }
+]

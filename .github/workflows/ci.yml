@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: |
+          bash -n bin/opencode-dockerized install.sh opencode-dockerized.sh setup.sh run-simple.sh
+          for f in lib/*.sh completions/*.sh; do
+            bash -n "$f"
+          done
+
+      - name: ShellCheck
+        uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          scandir: .
+        env:
+          SHELLCHECK_OPTS: -x -S warning
+
+      - name: Wrapper args test
+        run: bash tests/wrapper-args.test.sh
+
+      - name: Config sync round-trip (ephemeral HOME, no Docker)
+        run: |
+          export HOME="$RUNNER_TEMP/fakehome"
+          mkdir -p "$HOME"
+          bash bin/opencode-dockerized config sync
+          bash bin/opencode-dockerized config sync --check
+
+  dockerfile:
+    name: Dockerfile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          config: .hadolint.yaml
+
+  policy:
+    name: Security policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Guard syntax
+        run: node --check plugins/security-guard.js
+
+      - name: Policy regression tests
+        run: node tests/security-guard.test.mjs

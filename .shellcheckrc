@@ -1,0 +1,9 @@
+# shellcheck configuration — see https://www.shellcheck.net/wiki/ShellCheckrc
+
+# Follow `source` directives relative to the including script where possible.
+external-sources=true
+source-path=SCRIPTDIR
+
+# Scripts source lib/config-lib.sh via resolved $BIN_DIR/$REPO_ROOT variables,
+# which shellcheck cannot follow statically.
+disable=SC1091

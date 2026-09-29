@@ -1,0 +1,909 @@
+#!/bin/bash
+
+# OpenCode Docker Wrapper Script
+# This script makes it easy to run OpenCode in a secure Docker container
+
+set -e
+
+# Binary lives in bin/ of the self-contained checkout (Doom-style).
+# It is reached via PATH, never via a symlink in ~/.local/bin.
+BIN_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+REPO_ROOT="$(cd "$BIN_DIR/.." && pwd)"
+IMAGE_NAME="opencode-dockerized:latest"
+
+# Wrapper release line, shown by the version command next to the OpenCode
+# version and the bundled security-guard version.
+WRAPPER_VERSION="0.14.0"
+
+# Keep temporary files in the approved scratch dir unless overridden.
+# Bare `mktemp` honors TMPDIR, so relay sockets, server logs and merge temps
+# land there without touching every call site.
+export TMPDIR="${TMPDIR:-/tmp/opencode}"
+mkdir -p "$TMPDIR" 2>/dev/null || export TMPDIR="/tmp"
+
+# Seconds to wait for the in-container OpenCode server to become ready
+PRIVATE_SERVER_TIMEOUT=120
+
+# Runs an opencode command against a private server inside the container.
+# V2's --standalone queries before providers finish loading (empty 'models')
+# and gives up when a large session database slows startup ('stats'),
+# so readiness is awaited explicitly before the command runs.
+# Args: <ready_path> <ready_pattern> <timeout_seconds> <opencode_args...>
+# shellcheck disable=SC2016 # expanded inside the container, not here
+PRIVATE_SERVER_SCRIPT='
+ready_path="$1"; ready_pattern="$2"; timeout="$3"; shift 3
+OPENCODE_SERVER_PASSWORD=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d " \n")
+export OPENCODE_SERVER_PASSWORD
+log=$(mktemp)
+opencode serve --hostname 127.0.0.1 --port 0 >"$log" 2>&1 &
+server_pid=$!
+trap "kill $server_pid 2>/dev/null" EXIT
+for _ in $(seq "$timeout"); do
+    url=$(grep -oE "http://127\.0\.0\.1:[0-9]+" "$log" | head -n 1)
+    if [ -n "$url" ] && curl -sf -u "opencode:$OPENCODE_SERVER_PASSWORD" "$url$ready_path" | grep -q "$ready_pattern"; then
+        opencode "$@" --server "$url"
+        exit
+    fi
+    sleep 1
+done
+echo "OpenCode server was not ready after ${timeout}s" >&2
+cat "$log" >&2
+exit 1
+'
+
+# In-container diagnostics for the security layer, SSH and GnuPG forwarding.
+# Read-only: it only reports what is actually usable and exits non-zero on a
+# real failure (e.g. GPG enabled but the agent socket or public keyring is
+# missing, so signed commits would fail).
+# shellcheck disable=SC2016 # expanded inside the container, not here
+DOCTOR_SCRIPT='
+status=0
+note() { printf "%s\n" "$1"; }
+echo "== security guard =="
+if [ -f /home/coder/.config/opencode/plugins/security-guard.js ]; then
+    grep -m1 OPENCODE_DOCKERIZED_GUARD_VERSION /home/coder/.config/opencode/plugins/security-guard.js || true
+else
+    note "MISSING security-guard.js"; status=1
+fi
+echo "== ssh agent =="
+if [ "${OPENCODE_DOCKERIZED_SSH_AGENT:-false}" != true ]; then
+    note "ssh agent forwarding: disabled in wrapper config (skipped)"
+elif [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
+    ssh-add -l 2>&1 || true
+else
+    note "SSH_AUTH_SOCK is unset or not a socket"; status=1
+fi
+echo "== gnupg =="
+if [ "${OPENCODE_DOCKERIZED_GPG_AGENT:-false}" != true ]; then
+    note "gnupg forwarding: disabled in wrapper config (skipped)"
+else
+gpg_home="${GNUPGHOME:-$HOME/.gnupg}"
+if [ -S "$gpg_home/S.gpg-agent" ]; then
+    note "agent socket: ok"
+else
+    note "agent socket: MISSING ($gpg_home/S.gpg-agent)"; status=1
+fi
+if [ -f "$gpg_home/pubring.kbx" ] || [ -f "$gpg_home/public-keys.d/pubring.db" ]; then
+    note "public keyring: ok"
+else
+    note "public keyring: MISSING (signed commits will fail)"; status=1
+fi
+if gpg --list-keys >/dev/null 2>&1; then
+    note "list-keys: ok"
+else
+    note "list-keys: FAILED"; gpg --list-keys 2>&1 | head -3; status=1
+fi
+if ! gpg --list-secret-keys >/dev/null 2>&1; then
+    note "list-secret-keys: none visible (the forwarded agent can still sign by key id)"
+fi
+signingkey=$(gpg --list-keys --with-colons 2>/dev/null | grep "^pub:" | head -n1 | cut -d: -f5)
+if [ -n "$signingkey" ]; then
+    if printf test | timeout 5 gpg --batch --local-user "$signingkey" --sign >/dev/null 2>&1; then
+        note "sign probe: ok ($signingkey)"
+    else
+        note "sign probe: could not sign non-interactively ($signingkey); confirm with a real signed commit (pinentry runs on the host)"
+    fi
+else
+    note "sign probe: skipped (no public key)"
+fi
+fi
+echo "== config secrets =="
+oc=/home/coder/.config/opencode/opencode.json
+if [ -f "$oc" ] && grep -oE "\"(apiKey|api_key|token|secret|password|authorization)\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$oc" 2>/dev/null | grep -qvE "\{(env|file):"; then
+    note "inline secrets: FOUND in opencode.json (migrate to {env:} references)"; status=1
+else
+    note "inline secrets: none"
+fi
+echo "== websearch =="
+ws="${OPENCODE_DOCKERIZED_WEBSEARCH:-}"
+if [ -z "$ws" ]; then
+    note "websearch provider: not preset (TUI will ask once)"
+else
+    case "$ws" in
+    exa) key=EXA_API_KEY ;; firecrawl) key=FIRECRAWL_API_KEY ;;
+    parallel) key=PARALLEL_API_KEY ;; tavily) key=TAVILY_API_KEY ;; *) key="" ;;
+    esac
+    if [ "$ws" = random ]; then
+        note "websearch provider: random (any provider key enables search)"
+    elif [ -n "$key" ] && [ -n "${!key:-}" ]; then
+        note "websearch provider: $ws (key present)"
+    else
+        note "websearch provider: $ws (key MISSING: ${key:-unknown})"; status=1
+    fi
+fi
+echo "== theme =="
+if [ -n "${OPENCODE_DOCKERIZED_THEME:-}" ]; then
+    note "theme: ${OPENCODE_DOCKERIZED_THEME} (via inline CLI config)"
+else
+    note "theme: default (not preset)"
+fi
+echo "== env file =="
+if [ "${OPENCODE_DOCKERIZED_ENV_FILE:-no}" = yes ]; then
+    note "env file: loaded (--env-file)"
+else
+    note "env file: not configured"
+fi
+echo "== result =="
+if [ "$status" -eq 0 ]; then note "all good"; else note "problems detected"; fi
+exit "$status"
+'
+
+# Colors for output (defined before sourcing config-lib so it picks them up)
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Source the shared config module
+source "$REPO_ROOT/lib/config-lib.sh"
+
+# Function to print colored output
+print_info() {
+    echo -e "${BLUE}ℹ${NC} $1"
+}
+
+print_success() {
+    echo -e "${GREEN}✓${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}✗${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}⚠${NC} $1"
+}
+
+# Function to check if Docker is running
+check_docker() {
+    if ! docker info >/dev/null 2>&1; then
+        print_error "Docker is not running. Please start Docker and try again."
+        exit 1
+    fi
+}
+
+# Refuse to run as root. The container is launched with the host UID/GID, so a
+# root invocation would start the sandbox as root and defeat the whole setup.
+check_not_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        print_error "Do not run this wrapper as root."
+        print_info "Run it as your normal user so the container starts as your host UID/GID."
+        exit 1
+    fi
+}
+
+# Function to build the Docker image
+build_image() {
+    print_info "Building OpenCode Docker image..."
+    # Regular build uses Docker layer cache normally.
+    # Only the 'update' command passes OPENCODE_BUILD_TIME to bust the npm cache.
+    docker build -t "$IMAGE_NAME" "$REPO_ROOT"
+    print_success "Docker image built successfully"
+}
+
+# Function to check required configuration files (self-contained OCODE_HOME tree)
+check_config() {
+    local missing_files=()
+
+    if [ ! -f "$OCODE_HOME/.config/opencode/opencode.json" ] && [ ! -f "$OCODE_HOME/.config/opencode/opencode.jsonc" ]; then
+        missing_files+=("$OCODE_HOME/.config/opencode/opencode.json (or opencode.jsonc)")
+    fi
+
+    if [ ! -d "$OCODE_HOME/.local/share/opencode" ]; then
+        missing_files+=("$OCODE_HOME/.local/share/opencode/")
+    fi
+
+    if [ ! -d "$OCODE_HOME/.local/state/opencode" ]; then
+        missing_files+=("$OCODE_HOME/.local/state/opencode/")
+    fi
+
+    if [ ${#missing_files[@]} -gt 0 ]; then
+        print_warning "Some OpenCode configuration files are missing:"
+        for file in "${missing_files[@]}"; do
+            echo "  - $file"
+        done
+        print_info "OpenCode will run but may need configuration. Run 'opencode auth login' inside the container."
+    fi
+
+    # Ensure OpenCode storage directories exist and the security layer is present
+    # (also generates the opencode-dockerized defaults on first run)
+    # According to docs: https://opencode.ai/docs/troubleshooting/#storage
+    ensure_opencode_dirs
+}
+
+# Run a one-off OpenCode CLI command inside the container.
+# The project directory is mounted so project-level configuration applies.
+# Usage: run_cli_command <name_suffix> <project_dir> <docker_socket> <opencode_args...>
+run_cli_command() {
+    local name_suffix="$1"
+    local project_dir="$2"
+    local docker_socket="$3"
+    shift 3
+
+    if [ -n "$project_dir" ]; then
+        if [ ! -d "$project_dir" ]; then
+            print_error "Project directory does not exist: $project_dir"
+            exit 1
+        fi
+        project_dir="$(cd "$project_dir" && pwd -P)"
+        validate_project_dir "$project_dir" || exit 1
+    fi
+
+    check_image "$IMAGE_NAME" || exit 1
+    ensure_opencode_dirs
+
+    parse_config
+    build_mount_args
+    build_env_args
+    build_env_file_args
+    build_common_docker_args
+    build_standard_volume_args "$project_dir" "$docker_socket"
+
+    # Allocate a TTY only when attached to one, so the command stays pipeable
+    local -a tty_args=(-i)
+    [ -t 0 ] && [ -t 1 ] && tty_args=(-it)
+
+    local -a workdir_args=()
+    [ -n "$CONTAINER_WORKDIR" ] && workdir_args=(--workdir "$CONTAINER_WORKDIR")
+
+    local -a docker_cmd=(
+        docker run "${tty_args[@]}"
+        --name "opencode-${name_suffix}-$$"
+        "${workdir_args[@]}"
+        "${DOCKER_COMMON_ARGS[@]}"
+        "${VOLUME_ARGS[@]}"
+        "${GIT_WORKTREE_ARGS[@]}"
+        "${DOCKER_MOUNT_ARGS[@]}"
+        "${DOCKER_ENV_ARGS[@]}"
+        "${DOCKER_ENV_FILE_ARGS[@]}"
+        "$IMAGE_NAME"
+        "$@"
+    )
+
+    if [ "${DRY_RUN:-false}" = true ]; then
+        print_info "Dry run — would execute:"
+        dry_run_print "${docker_cmd[@]}"
+        stop_gpg_relay "$GPG_RELAY_SOCKET"
+        GPG_RELAY_SOCKET=""
+        return 0
+    fi
+
+    # Stop the per-session GnuPG relay when the container exits (also on error
+    # or Ctrl-C via the EXIT/INT/TERM trap).
+    trap 'stop_gpg_relay "$GPG_RELAY_SOCKET"' EXIT INT TERM
+    "${docker_cmd[@]}"
+    stop_gpg_relay "$GPG_RELAY_SOCKET"
+    GPG_RELAY_SOCKET=""
+    trap - EXIT INT TERM
+}
+
+# Function to run OpenCode authentication
+run_auth() {
+    print_info "Running OpenCode authentication..."
+
+    # Config and data directories are mounted read-write (shared with the host),
+    # so credentials and settings persist without any special handling
+    if ! run_cli_command auth "" false opencode auth login --standalone; then
+        print_error "Authentication failed"
+        exit 1
+    fi
+
+    print_success "Authentication complete! Your credentials are saved in $OCODE_HOME/.local/share/opencode"
+}
+
+# Function to run OpenCode
+run_opencode() {
+    local project_dir="${1:-$(pwd)}"
+    local dry_run="${DRY_RUN:-false}"
+
+    # Validate project directory exists
+    if [ ! -d "$project_dir" ]; then
+        print_error "Project directory does not exist: $project_dir"
+        exit 1
+    fi
+
+    # Convert to absolute, symlink-resolved path (a symlink to $HOME or / must
+    # not slip past validate_project_dir).
+    project_dir="$(cd "$project_dir" && pwd -P)"
+
+    # Never mount "/", $HOME or an ancestor of $HOME: it would expose the host
+    # home (or the whole filesystem) read-write to the agent.
+    validate_project_dir "$project_dir" || exit 1
+
+    check_image "$IMAGE_NAME" || exit 1
+
+    # Generate unique container name based on project directory and random suffix
+    local dir_name
+    dir_name=$(sanitize_container_name "$(basename "$project_dir")")
+    local random_suffix
+    random_suffix=$(generate_random_suffix)
+    local container_name="opencode-${dir_name}-${random_suffix}"
+
+    print_info "Starting OpenCode in Docker..."
+    print_info "Project directory: $project_dir"
+    print_info "Container name: $container_name"
+
+    # Parse custom config and build docker arguments
+    parse_config
+    build_mount_args
+    build_env_args
+    build_env_file_args
+    build_common_docker_args
+    # Docker socket is opt-in: mounting it is root-equivalent on the host.
+    build_standard_volume_args "$project_dir" "$DOCKER_SOCKET"
+
+    # Build the full docker run command as an array
+    # CONTAINER_WORKDIR is set by build_standard_volume_args (host path with $HOME stripped)
+    # --standalone gives the container its own private server: with --network host the
+    # client would otherwise attach to a shared server running outside the sandbox.
+    local -a docker_cmd=(
+        docker run -it
+        --name "$container_name"
+        --workdir "$CONTAINER_WORKDIR"
+        -e "OPENCODE_WORKDIR=$CONTAINER_WORKDIR"
+        "${DOCKER_COMMON_ARGS[@]}"
+        "${VOLUME_ARGS[@]}"
+        "${GIT_WORKTREE_ARGS[@]}"
+        "${DOCKER_MOUNT_ARGS[@]}"
+        "${DOCKER_ENV_ARGS[@]}"
+        "${DOCKER_ENV_FILE_ARGS[@]}"
+        "$IMAGE_NAME"
+        opencode --standalone
+    )
+
+    if [ "$dry_run" = true ]; then
+        print_info "Dry run — would execute:"
+        dry_run_print "${docker_cmd[@]}"
+        stop_gpg_relay "$GPG_RELAY_SOCKET"
+        GPG_RELAY_SOCKET=""
+        return 0
+    fi
+
+    # Stop the per-session GnuPG relay when the container exits.
+    trap 'stop_gpg_relay "$GPG_RELAY_SOCKET"' EXIT INT TERM
+    if ! "${docker_cmd[@]}"; then
+        stop_gpg_relay "$GPG_RELAY_SOCKET"
+        GPG_RELAY_SOCKET=""
+        trap - EXIT INT TERM
+        print_error "OpenCode exited with an error"
+        exit 1
+    fi
+    stop_gpg_relay "$GPG_RELAY_SOCKET"
+    GPG_RELAY_SOCKET=""
+    trap - EXIT INT TERM
+}
+
+# Self-update helpers: `update` and `upgrade` both perform the full upgrade
+# (git pull from GitHub + security-layer sync + image rebuild). They differ
+# only in prompting defaults: `upgrade` asks before pulling when interactive,
+# `update` pulls without asking (preserves its historic one-shot behavior).
+# Both accept [--check] (report only) [--yes] (no prompt) [--no-build].
+# Usage: _git_pull_wrapper <yes:true|false> <check_only:true|false>
+_git_pull_wrapper() {
+    local yes="$1" check_only="$2"
+    if [ ! -d "$REPO_ROOT/.git" ]; then
+        print_error "Not a git checkout ($REPO_ROOT); reinstall with install.sh to enable self-update."
+        return 1
+    fi
+    if ! command -v git >/dev/null 2>&1; then
+        print_error "git is required for self-update."
+        return 1
+    fi
+    if ! git -C "$REPO_ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+        print_error "No upstream tracking branch; set one with 'git branch --set-upstream-to=origin/<branch>'."
+        return 1
+    fi
+    git -C "$REPO_ROOT" fetch origin >/dev/null 2>&1 || {
+        print_error "Could not fetch from origin."
+        return 1
+    }
+    local local_rev remote_rev base
+    local_rev=$(git -C "$REPO_ROOT" rev-parse HEAD)
+    remote_rev=$(git -C "$REPO_ROOT" rev-parse '@{u}')
+    base=$(git -C "$REPO_ROOT" merge-base HEAD '@{u}')
+    if [ "$local_rev" = "$remote_rev" ]; then
+        print_success "Already up to date."
+        return 2
+    fi
+    if [ "$local_rev" != "$base" ]; then
+        print_error "Local checkout diverged from upstream; resolve manually with git (no --force pull attempted)."
+        git -C "$REPO_ROOT" status -sb | head -5
+        return 1
+    fi
+    local n
+    n=$(git -C "$REPO_ROOT" rev-list --count HEAD..'@{u}')
+    print_info "Update available: $n commit(s) behind upstream."
+    if [ "$check_only" = true ]; then
+        return 1
+    fi
+    if [ "$yes" != true ] && [ -t 0 ]; then
+        local ans
+        read -r -p "Pull $n commit(s)? (Y/n): " ans || ans=""
+        case "${ans:-y}" in
+        [Yy] | "") ;;
+        *)
+            print_info "Aborted."
+            return 1
+            ;;
+        esac
+    fi
+    git -C "$REPO_ROOT" pull --ff-only || {
+        print_error "Pull failed."
+        return 1
+    }
+    print_success "Code updated to latest version."
+    return 0
+}
+
+# Rebuild the image with cache-busting so the latest OpenCode is installed.
+_rebuild_opencode_image() {
+    print_info "Rebuilding image with latest code..."
+    docker build --build-arg "OPENCODE_BUILD_TIME=$(date +%s)" -t "$IMAGE_NAME" "$REPO_ROOT"
+    print_info "Updated OpenCode version:"
+    docker run --rm --entrypoint bash "$IMAGE_NAME" -c "opencode --version" 2>/dev/null || true
+}
+
+# Parse self-update flags shared by `update` and `upgrade`.
+# Sets: _UP_CHECK, _UP_YES, _UP_NO_BUILD. Returns 0 on success/--help, 1 on bad usage.
+# Usage: _parse_self_update_flags <command-name> [flags...]
+_parse_self_update_flags() {
+    local cmd="$1"; shift
+    _UP_CHECK=false; _UP_YES=false; _UP_NO_BUILD=false
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+        --check) _UP_CHECK=true ;;
+        --yes) _UP_YES=true ;;
+        --no-build) _UP_NO_BUILD=true ;;
+        --help | -h)
+            echo "Usage: $0 $cmd [--check] [--yes] [--no-build]"
+            echo "  --check    only report whether an update is available"
+            echo "  --yes      pull and rebuild without asking"
+            echo "  --no-build pull + sync only, skip the image rebuild"
+            return 0
+            ;;
+        *)
+            print_error "Unknown $cmd option: $arg (use --check|--yes|--no-build)"
+            return 1
+            ;;
+        esac
+    done
+    return 0
+}
+
+# Full upgrade: git pull + security-layer sync + image rebuild.
+# Usage: full_upgrade <command-name> [--check] [--yes] [--no-build]
+full_upgrade() {
+    local cmd="$1"; shift
+    _parse_self_update_flags "$cmd" "$@" || return $?
+    if [ "$_UP_CHECK" = true ]; then
+        _git_pull_wrapper true true
+        local check_rc=$?
+        if [ "$check_rc" -eq 2 ]; then
+            return 0
+        fi
+        return 1
+    fi
+    local pull_rc=0
+    # `update` never prompts (historic one-shot); `upgrade` prompts when tty.
+    if [ "$cmd" = "update" ]; then
+        _git_pull_wrapper true false; pull_rc=$?
+    else
+        _git_pull_wrapper "$_UP_YES" false; pull_rc=$?
+    fi
+    if [ "$pull_rc" -eq 1 ]; then
+        return 1
+    fi
+    print_success "Refreshing security layer..."
+    parse_config || true
+    sync_security_layer || true
+    if [ "$_UP_NO_BUILD" = true ]; then
+        print_info "Skipping image rebuild (--no-build)."
+        print_success "Upgrade complete (code + config synced, image untouched)."
+        return 0
+    fi
+    check_docker || return 1
+    if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+        print_info "Image not found, building fresh..."
+    else
+        print_info "Current OpenCode version:"
+        docker run --rm --entrypoint bash "$IMAGE_NAME" -c "opencode --version" 2>/dev/null || true
+    fi
+    _rebuild_opencode_image
+    print_success "Upgrade complete (code + config + image)."
+}
+
+# Self-update the wrapper checkout from GitHub (Doom-style `doom upgrade`).
+# `update` and `upgrade` both run the full upgrade (git pull + sync + rebuild).
+# Usage: upgrade_wrapper [--check] [--yes] [--no-build]
+upgrade_wrapper() {
+    full_upgrade upgrade "$@"
+}
+
+# Function to update OpenCode (full upgrade: git pull + sync + rebuild).
+# Usage: update_opencode [--check] [--yes] [--no-build]
+update_opencode() {
+    full_upgrade update "$@"
+}
+
+# Run an opencode command against a private server once <ready_path> matches <ready_pattern>
+# Usage: run_with_private_server <name_suffix> <project_dir> <docker_socket> <ready_path> <ready_pattern> <opencode_args...>
+run_with_private_server() {
+    local name_suffix="$1"
+    local project_dir="$2"
+    local docker_socket="$3"
+    local ready_path="$4"
+    local ready_pattern="$5"
+    shift 5
+    run_cli_command "$name_suffix" "$project_dir" "$docker_socket" \
+        bash -c "$PRIVATE_SERVER_SCRIPT" private-server \
+        "$ready_path" "$ready_pattern" "$PRIVATE_SERVER_TIMEOUT" "$@"
+}
+
+# Function to list the models available to the configured providers
+list_models() {
+    run_with_private_server models "${1:-$(pwd)}" false /api/model '"id"' models
+}
+
+# Function to show usage statistics
+show_stats() {
+    run_with_private_server stats "$(pwd)" false /api/config . stats "$@"
+}
+
+# Warn that the OpenCode config is read-only inside the container and point the
+# user at the host-side file to edit. Usage: config_readonly_guard <what>
+config_readonly_guard() {
+    local what="${1:-changes}"
+    print_error "OpenCode config is read-only inside the container; '$what' is not available from here."
+    print_info "Edit it on the host instead: $0 config opencode edit"
+    print_info "File: $OCODE_HOME/.config/opencode/opencode.json"
+}
+
+# Function to manage MCP servers (list, add, auth, logout)
+manage_mcp() {
+    local subcommand="${1:-list}"
+    shift || true
+    # 'add' writes to the OpenCode config, which is mounted read-only; auth/logout
+    # write tokens to the data dir and keep working.
+    case "$subcommand" in
+    add)
+        config_readonly_guard "opencode mcp add"
+        exit 1
+        ;;
+    esac
+    run_cli_command mcp "$(pwd)" false opencode mcp "$subcommand" "$@"
+}
+
+# Function to manage plugins (list, add, check, update, remove)
+manage_plugins() {
+    local subcommand="${1:-list}"
+    shift || true
+    # Mutating subcommands write to the read-only OpenCode config.
+    case "$subcommand" in
+    add | update | remove | rm)
+        config_readonly_guard "opencode plugin $subcommand"
+        exit 1
+        ;;
+    esac
+    run_cli_command plugin "$(pwd)" false opencode plugin "$subcommand" "$@"
+}
+
+# Function to run OpenCode debugging tools (agents, config, paths)
+# Routed through the private server (like models/stats) because `debug config`
+# depends on a running server and hangs when attached to the background service.
+run_debug() {
+    local subcommand="${1:-paths}"
+    shift || true
+    run_with_private_server debug "$(pwd)" false /api/config . debug "$subcommand" "$@"
+}
+
+# Diagnose the security layer, SSH and GnuPG forwarding inside the container.
+# Project-independent: doctor needs no project mount (like auth).
+run_doctor() {
+    run_cli_command doctor "" false bash -c "$DOCTOR_SCRIPT"
+}
+
+# Function to run a non-interactive prompt and print the result
+exec_prompt() {
+    if [ $# -eq 0 ]; then
+        print_error "A message is required: $0 exec \"<message>\" [OPTIONS]"
+        exit 1
+    fi
+    # Docker socket follows the opt-in config, as in 'run'. parse_config must run
+    # first so DOCKER_SOCKET reflects setting.docker_socket before it is read.
+    parse_config
+    run_with_private_server exec "$(pwd)" "$DOCKER_SOCKET" /api/config . run "$@"
+}
+
+# Function to clean up Docker image
+clean_image() {
+    # Drop any relay processes/dirs left by crashed sessions.
+    cleanup_stale_relays
+    if relay_dir_ok; then
+        rm -rf "$GPG_RELAY_DIR" 2>/dev/null || true
+    fi
+    if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+        print_info "Removing Docker image '$IMAGE_NAME'..."
+        docker rmi "$IMAGE_NAME"
+        print_success "Docker image removed"
+    else
+        print_info "Docker image '$IMAGE_NAME' does not exist"
+    fi
+}
+
+# Function to show or edit configuration
+show_config() {
+    local subcommand="${1:-show}"
+    shift || true
+
+    case "$subcommand" in
+    show)
+        parse_config
+        print_config
+        maybe_drift_hint
+        ;;
+    edit)
+        local editor
+        if ! editor=$(resolve_editor); then
+            print_error "No editor found (set \$EDITOR or install sensible-editor, vi or nano)"
+            exit 1
+        fi
+        if [ ! -f "$CONFIG_FILE" ]; then
+            print_warning "Config file does not exist. Running install first..."
+            # shellcheck source=lib/install-lib.sh
+            source "$REPO_ROOT/lib/install-lib.sh"
+            run_install_main --yes --only config || exit 1
+        else
+            "$editor" "$CONFIG_FILE"
+        fi
+        ;;
+    path)
+        echo "$CONFIG_FILE"
+        ;;
+    sync)
+        # Local-only command: refresh the versioned security layer (guard,
+        # policies, permissions, mirror) from the repo without starting a
+        # container. With --check it only reports drift.
+        parse_config || true
+        sync_security_layer "${1:-}"
+        ;;
+    opencode)
+        # The OpenCode config (MCP servers, models, plugins) is mounted
+        # read-only in the container; edit it here on the host.
+        local oc_sub="${1:-path}"
+        local oc_config="$OCODE_HOME/.config/opencode/opencode.json"
+        case "$oc_sub" in
+        path)
+            echo "$oc_config"
+            ;;
+        edit)
+            local editor
+            if ! editor=$(resolve_editor); then
+                print_error "No editor found (set \$EDITOR or install sensible-editor, vi or nano)"
+                exit 1
+            fi
+            if [ ! -f "$oc_config" ]; then
+                print_warning "OpenCode config does not exist. Running install first..."
+                # shellcheck source=lib/install-lib.sh
+                source "$REPO_ROOT/lib/install-lib.sh"
+                run_install_main --yes || exit 1
+            fi
+            "$editor" "$oc_config"
+            ;;
+        *)
+            print_error "Usage: $0 config opencode [path|edit]"
+            exit 1
+            ;;
+        esac
+        ;;
+    *)
+        print_error "Unknown config subcommand: $subcommand"
+        echo "Usage: $0 config [show|edit|path|sync|opencode]"
+        exit 1
+        ;;
+    esac
+}
+
+# Function to show help
+show_help() {
+    cat <<EOF
+OpenCode Docker Wrapper
+
+Usage: $0 [COMMAND] [OPTIONS]
+
+Commands:
+    run [DIR]           Run OpenCode in Docker (default: current directory)
+    auth                Run OpenCode authentication (opencode auth login)
+    models [DIR]        List models available to the configured providers
+    exec MSG [OPTS]     Run a non-interactive prompt (opencode run)
+    mcp [ARGS]          Manage MCP servers (list|auth|logout; 'add' is host-only)
+    plugin [ARGS]       Manage plugins (list|check; add/update/remove are host-only)
+    stats [OPTS]        Show usage statistics
+    debug [ARGS]        Debugging tools (paths|config|agents, default: paths)
+    doctor              Diagnose install, guard, SSH/GPG, websearch, theme and env file
+    install [OPTS]      First-time install / repair PATH, config, completions, aliases
+    upgrade [--check|--yes|--no-build]  Full upgrade: git pull + sync + image rebuild
+    build               Build the Docker image
+    update [--check|--yes|--no-build]   Full upgrade: git pull + sync + image rebuild
+    version             Show wrapper, guard and OpenCode versions
+    config [show|edit|path|sync]      Wrapper config (INI)
+    config opencode [path|edit]       OpenCode config (opencode.json)
+    clean               Remove the Docker image
+    help                Show this help message
+
+Environment Variables:
+    DRY_RUN=true        Print the Docker command without executing it
+
+Examples:
+    $0 run                          # Run in current directory
+    $0 run /path/to/project         # Run in specific directory
+    $0 auth                         # Authenticate with your LLM provider
+    $0 models                       # List available models
+    $0 exec "Explain this repo"     # Non-interactive prompt
+    $0 mcp list                     # Show MCP servers and their status
+    $0 plugin list                  # Show loaded plugins
+    $0 stats --days 7               # Usage for the last 7 days
+    $0 debug config                 # Show configuration sources
+    $0 build                        # Build the Docker image
+    $0 update                       # Full upgrade: git pull + sync + rebuild
+    $0 update --no-build            # Pull + sync only, skip rebuild
+    $0 upgrade --check              # Check for updates from GitHub
+    $0 config show                  # Show current configuration
+    $0 config edit                  # Edit wrapper config in \$EDITOR
+    $0 config opencode edit         # Edit the OpenCode config (MCP, models)
+    $0 config sync                  # Refresh security layer (guard/policies) from repo
+    $0 clean                        # Remove Docker image
+    DRY_RUN=true $0 run             # Show Docker command without running
+
+Getting Started:
+    1. ./install.sh                   # One-liner install (curl|bash): PATH + config
+    2. $0 build                     # Build the Docker image (or install --only build)
+    3. $0 auth                      # Authenticate with your LLM provider
+    4. $0 run /path/to/project      # Run OpenCode
+
+Security Features:
+    - Isolated environment: only access to mounted project directory
+    - Persistent config: OpenCode state lives on the host under
+      ~/.config/opencode-dockerized/home/ and survives restarts and image
+      rebuilds. The OpenCode config dir is mounted READ-ONLY: edit it on the
+      host (or with 'config opencode edit') to add MCP servers/models
+    - Security layer: opencode-dockerized directory (permissions, hooks, AGENTS.md)
+      is generated once on the host and never mounted; its files are delivered
+      read-only (permissions via OPENCODE_CONFIG_CONTENT)
+    - Non-root user: runs as non-root user inside container
+    - Automatic cleanup: containers are removed on exit (--rm)
+
+Note: The host Docker socket is NOT mounted by default. It is opt-in because it
+grants the container full control of the host Docker daemon (root-equivalent
+on the host) and defeats the sandbox. Enable it with setting.docker_socket=true
+in the config only when you need Docker-in-Docker / Testcontainers.
+
+Security policy: setting.security_policy (strict | balanced | off) controls the
+opencode-policy pattern sets enforced by the security hooks. The default
+balanced drops patterns meant for shared cloud sandboxes and other common
+false positives while keeping the dangerous ones.
+
+OpenCode's self-update is disabled inside the container.
+
+For more information, see README.md
+EOF
+}
+
+# Function to show version
+show_version() {
+    echo "opencode-dockerized $WRAPPER_VERSION (guard $(grep -oE 'OPENCODE_DOCKERIZED_GUARD_VERSION=[0-9]+' "$REPO_ROOT/plugins/security-guard.js" 2>/dev/null | head -1 || echo unknown))"
+    check_image "$IMAGE_NAME" || exit 1
+    docker run --rm --entrypoint bash "$IMAGE_NAME" -c "opencode --version"
+}
+
+# Main script logic
+main() {
+    check_not_root
+
+    local command="${1:-run}"
+    shift || true
+
+    case "$command" in
+    run)
+        check_docker
+        check_config
+        run_opencode "$@"
+        ;;
+    auth)
+        check_docker
+        run_auth
+        ;;
+    models)
+        check_docker
+        list_models "$@"
+        ;;
+    exec)
+        check_docker
+        exec_prompt "$@"
+        ;;
+    mcp)
+        check_docker
+        manage_mcp "$@"
+        ;;
+    plugin)
+        check_docker
+        manage_plugins "$@"
+        ;;
+    stats)
+        check_docker
+        show_stats "$@"
+        ;;
+    debug)
+        check_docker
+        run_debug "$@"
+        ;;
+    doctor)
+        check_docker
+        run_doctor
+        ;;
+    build)
+        check_docker
+        build_image
+        ;;
+    install)
+        # shellcheck source=lib/install-lib.sh
+        source "$REPO_ROOT/lib/install-lib.sh"
+        run_install_main "$@"
+        ;;
+    upgrade)
+        upgrade_wrapper "$@"
+        ;;
+    uninstall)
+        print_info "To uninstall: remove the 'opencode-dockerized/bin' PATH line from ~/.bashrc/~/.zshrc,"
+        print_info "then delete $REPO_ROOT (config in $CONFIG_DIR is left untouched)."
+        ;;
+    update)
+        update_opencode "$@"
+        ;;
+    version)
+        check_docker
+        show_version
+        ;;
+    config)
+        # Local-only command: works without a running Docker daemon.
+        show_config "$@"
+        ;;
+    clean)
+        check_docker
+        clean_image
+        ;;
+    help | --help | -h)
+        show_help
+        ;;
+    *)
+        print_error "Unknown command: $command"
+        echo
+        show_help
+        exit 1
+        ;;
+    esac
+}
+
+# Run main function
+main "$@"

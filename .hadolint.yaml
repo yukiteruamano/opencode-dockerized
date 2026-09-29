@@ -1,0 +1,12 @@
+# hadolint configuration — see https://github.com/hadolint/hadolint
+#
+# Only unactionable or intentional findings are ignored; anything else still
+# fails CI.
+ignored:
+  # Debian trixie package versions change over time; pinning them is brittle and
+  # the image is rebuilt/updated as a unit.
+  - DL3008
+  # Keeping recommends on purpose for the coding-agent toolchain.
+  - DL3015
+  # `USER coder` is a real, resolvable account created earlier in the image.
+  - DL3066

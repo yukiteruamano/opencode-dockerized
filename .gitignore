@@ -1,0 +1,29 @@
+# Git
+.env
+
+# Docker
+.docker/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Sensitive files (should never be committed)
+auth.json
+*.pem
+*.key
+credentials.json
+
+# Local scratch
+.tmp-*
+
