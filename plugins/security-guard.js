@@ -347,6 +347,17 @@ const DENY_BASH = [
   new RegExp(`\\bgit\\b\\s+archive\\b[^\\n|;&]*${KEY_TOKEN}`),
   new RegExp(`\\bgit\\b\\s+log\\b[^\\n|;&]*(?:-p\\b|--patch\\b)[^\\n|;&]*${KEY_TOKEN}`),
   new RegExp(`\\bgit\\b\\s+diff\\b(?![^\\n|;&]*--stat\\b)[^\\n|;&]*${KEY_TOKEN}`),
+  // (guard v17, N5): renamed extractor binaries (`./k -y -f deploy_key`).
+  // Token-gated (a key-like `-f`/`-in` target) so local tools with `-y`/`-f`
+  // flags over ordinary files stay allowed. Plain renamed readers without
+  // extraction flags remain a documented heuristic residual.
+  new RegExp(
+    `(?:^|[;|&\\s])(?:\\bssh-keygen\\b|[^\\s;|&]+\\/[\\w.-]+)[^\\n|;&]*-y\\b[^\\n|;&]*-f\\b[^\\n|;&]*${KEY_TOKEN}`,
+  ),
+  new RegExp(
+    `(?:^|[;|&\\s])(?:\\bopenssl\\b|[^\\s;|&]+\\/[\\w.-]+)\\s+(?:rsa|pkey|ec|dsa|pkcs8|pkcs12|asn1parse)\\b[^\\n|;&]*(?:-inkey\\b|-in\\b|-text\\b)[^\\n|;&]*${KEY_TOKEN}`,
+    "i",
+  ),
   // GnuPG private material and secret-key export (defense in depth; the private
   // keys are never copied into the container anyway).
   /\bprivate-keys-v1\.d\b/,
