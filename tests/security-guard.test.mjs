@@ -290,6 +290,12 @@ const devIdioms = [
   // `env` with assignments stays allowed in balanced/off (upstream denies it
   // in strict, like `printenv PATH` above).
   ["bash", "env FOO=1 ./run"],
+  // Scoped interpreter reads stay allowed in balanced/off (guard v17, N1):
+  // member access is normal config reads, only bulk dumps are denied.
+  // (Strict denies these too via vendored patterns, hence devIdioms.)
+  ["bash", 'python3 -c "print(os.environ.get(\\"PATH\\"))"'],
+  ["bash", 'ruby -e "puts ENV.fetch(\\"PATH\\")"'],
+  ["bash", 'php -r "echo $_SERVER[\\"REQUEST_URI\\"];"'],
   // `base64 <file>` is a common encoding step, not only exfiltration: only
   // `strict` keeps the broad upstream rule (guard v9).
   ["bash", "base64 README.md"],
