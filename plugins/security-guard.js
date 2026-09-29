@@ -364,6 +364,20 @@ const DENY_BASH = [
   // mode. `echo $VAR` expansion stays allowed by design (blocking it would
   // break ordinary scripting; see BALANCED_EXCLUDED_IDS).
   /\bprintenv\b\s+[^\n|;&]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTH|API[_-]?KEY)\b/i,
+  // (guard v17, N1): full environment dumps via interpreters. Bulk reads
+  // (`console.log(process.env)`, `print(os.environ)`, `puts ENV`,
+  // `print_r($_ENV)`) are denied in every mode; scoped member access
+  // (`process.env.PATH`, `os.environ.get("X")`, `ENV["X"]`, `$ENV{X}`)
+  // stays allowed for normal config reads. Staged copies (`x =
+  // {...process.env}` printed later) remain a documented residual.
+  /\bconsole\s*\.\s*(?:log|dir|debug|info)\s*\(\s*process\s*\.\s*env\s*\)/,
+  /\bnode\b[^\n|;&]*-(?:p\b|print\b)[^\n|;&]*\bprocess\s*\.\s*env\b(?!\s*(\.\s*[A-Za-z_$][\w$]*|\[\s*["']))/,
+  /\bprint\s*\(\s*os\s*\.\s*environ(?:\s*\.\s*(?:copy|items|keys|values)\s*\(\s*\))?\s*\)/,
+  /\bpprint\s*\(\s*os\s*\.\s*environ\s*\)/,
+  /\bputs\s+ENV\b(?!\s*(\[|\.\s*(?:fetch|key\?|slice|dig|values_at)\s*\())|\bp\s+ENV\b(?!\s*(\[|\.\s*(?:fetch|key\?|slice|dig|values_at)\s*\())|\bENV\s*\.\s*(?:inspect|to_h|to_hash)\b/,
+  /(?:\bprint\b|\bsay\b|\bwarn\b|\bprintf\b)[^\n;&]*%ENV\b/,
+  /(?:\bprint_r\b|\bvar_dump\b|\bvar_export\b)\s*\(\s*(?:getenv\s*\(\s*\)|\$_ENV\b(?!\s*\[)|\$_SERVER\b(?!\s*\[))/,
+  /\bconsole\s*\.\s*(?:log|dir)\s*\(\s*Deno\s*\.\s*env\s*\.\s*toObject\s*\(\s*\)\s*\)/,
   // Forwarded SSH agent is a signing oracle: forbid manipulating the host agent
   // (delete/lock identities, or remove a specific one with -e). Signing and
   // listing stay allowed.
