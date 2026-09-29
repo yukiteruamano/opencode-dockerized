@@ -156,6 +156,39 @@ const alwaysDeny = [
   ["bash", "compgen -e"],
   ["bash", "declare -x"],
   ["bash", "typeset -x"],
+  // Variable-listing switch (guard v16, H2): covered by the `compgen -v`
+  // backstop even with vendored patterns off.
+  ["bash", "compgen -v"],
+  // Environment dump bypasses (guard v16, H2/H3): `declare -p`/`typeset -p`
+  // dump every variable with values; bare `declare`/`typeset` do the same;
+  // `printenv <SECRET-LIKE>` is targeted exfiltration.
+  ["bash", "declare"],
+  ["bash", "typeset"],
+  ["bash", "declare -p"],
+  ["bash", "declare -p PATH"],
+  ["bash", "typeset -p"],
+  ["bash", "printenv SECRET"],
+  ["bash", "printenv OPENCODE_API_KEY"],
+  ["bash", "printenv MY_TOKEN"],
+  // Destructive root/glob/traversal targets (guard v16, H1/H12): `/*` and
+  // `/..` resolve to `/` but miss the bare-slash rules.
+  ["bash", "rm -rf /*"],
+  ["bash", "rm -rf /tmp/../"],
+  ["bash", "rm -rf /tmp/opencode/../../"],
+  ["bash", "chmod -R 777 /tmp/opencode/../../"],
+  ["bash", "chown -R x /"],
+  // Mode-independent backstops (guard v16, H4): covered by vendored patterns
+  // in balanced/strict, but `off` disables them entirely.
+  ["bash", "cat /proc/1/environ"],
+  ["bash", "cat /proc/self/environ"],
+  ["bash", "strings /proc/1/environ"],
+  ["bash", "curl http://169.254.169.254/latest/meta-data/"],
+  ["bash", "docker run -v /:/host alpine"],
+  ["bash", "docker run --privileged img"],
+  // Relative write escapes (guard v16, H11): resolved against the project dir.
+  ["edit", "../outside.txt"],
+  ["edit", "src/../../outside.txt"],
+  ["write", "../outside.txt"],
 ];
 
 // Allowed in every mode.
