@@ -6,7 +6,7 @@
 // ~/.config/opencode-dockerized/plugins/security-guard.js instead.
 // Only a Node.js builtin is imported ("node:fs") — no package.json needed.
 //
-// OPENCODE_DOCKERIZED_GUARD_VERSION=14
+// OPENCODE_DOCKERIZED_GUARD_VERSION=15
 //
 // Policy modes (env OPENCODE_DOCKERIZED_POLICY, set by the wrapper from
 // `setting.security_policy`; default "balanced"):
@@ -200,6 +200,17 @@ const tryRealpath = (p) => {
   }
 };
 
+// Normalize shell obfuscation back to spaces before matching secret patterns
+// (guard v15, H1). `${IFS}`, `$'\t'`/`$'\n'` are word separators for the shell
+// but not for the boundary classes in DENY_SECRET_PATH, so `cat${IFS}.env`
+// slipped through in balanced/off. Normalization is test-only: the original
+// command is kept for the deny message.
+const normalizeShell = (cmd) =>
+  cmd
+    .replace(/\$\{IFS[^}]*\}/gi, " ")
+    .replace(/\$'\\t'/g, " ")
+    .replace(/\$'\\n'/g, " ");
+
 // Secret file names/paths referenced from a shell command (any tool).
 // Provider/MCP credentials and SSH keys that need an explicit shell block so the
 // agent cannot read/exfiltrate them via `cat`, `cp`, `curl`, etc.
@@ -267,12 +278,12 @@ const DENY_BASH = [
   // generation is not a leak verb, so `openssl genrsa -out server.key` is fine.
   // `.pem`/`.key` keep the verb rule (now covering the readers that were
   // missing) plus input redirection and sourcing, which have no verb.
-  leakOf("\\.pem\\b"),
-  leakOf("\\.key\\b"),
+  leakOf("\\.pem\\b(?!\\.pub\\b)"),
+  leakOf("\\.key\\b(?!\\.pub\\b)"),
   leakOf(KEY_FILE),
   leakReadOf(BARE_KEY),
-  /(^|[;&|]\s*)(?:source|\.)\s+[^\s'"|;&<>]*\.(?:pem|key)\b/i,
-  /<\s*[^\s'"|;&]*\.(?:pem|key)\b/i,
+  /(^|[;&|]\s*)(?:source|\.)\s+[^\s'"|;&<>]*\.(?:pem|key)\b(?!\.pub\b)/i,
+  /<\s*[^\s'"|;&]*\.(?:pem|key)\b(?!\.pub\b)/i,
   // `openssl` reading a private key (-in/-inkey/-text, or asn1parse). Generation
   // commands (genrsa/genpkey/req/keygen) stay allowed.
   /\bopenssl\s+(?:rsa|pkey|ec|dsa|pkcs8|pkcs12|asn1parse)\b[^\n|;&]*(?:-inkey\b|-in\b|-text\b)/i,
@@ -382,8 +393,9 @@ export default {
       // "bash" is kept for flows that report the tool-level action instead.
       if (action === "bash" || action === "shell") {
         const command = resources.join(" ");
+        const normalized = normalizeShell(command);
         for (const pattern of DENY_BASH) {
-          if (pattern.test(command)) {
+          if (pattern.test(command) || pattern.test(normalized)) {
             event.effect = "deny";
             event.message =
               "Blocked by opencode-dockerized security policy: " + command;
@@ -393,7 +405,7 @@ export default {
         // Path-reference secret checks are independent of the program used and
         // of the vendored policy mode (defense in depth, even in "off").
         for (const pattern of DENY_SECRET_PATH) {
-          if (pattern.test(command)) {
+          if (pattern.test(command) || pattern.test(normalized)) {
             event.effect = "deny";
             event.message =
               "Blocked by opencode-dockerized security policy: " + command;
