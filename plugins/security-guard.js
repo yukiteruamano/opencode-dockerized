@@ -306,6 +306,10 @@ const DENY_BASH = [
   // these in balanced/strict, but `off` disables them entirely.
   /\/proc\/[^/\s]*\/environ\b/,
   /169\.254\.169\.254/,
+  // (guard v17, N2): encoded metadata-IP forms. Decimal, dotted/packed hex
+  // and octal all reach the same host; the trailing-dot form is already
+  // caught by the literal above.
+  /\b2852039166\b|\b0x[aA]9[fF][eE][aA]9[fF][eE]\b|0x[aA]9\s*\.\s*0x[fF][eE]\s*\.\s*0x[aA]9\s*\.\s*0x[fF][eE]\b|\b0251\.0376\.0251\.0376\b|::ffff:(a9fe:a9fe|169\.254\.169\.254)/i,
   /\bdocker\b[^\n|;&]*-v\s+\/:/,
   /\bdocker\b[^\n|;&]*--privileged\b/,
   // Secret files: block any command that references them (cat/grep/curl/...),
