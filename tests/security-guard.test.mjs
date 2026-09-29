@@ -123,6 +123,11 @@ const alwaysDeny = [
   ["bash", "dd if=.env"],
   ["bash", "while read l; do echo $l; done < .env"],
   ["bash", "find . -name .env -execdir cat {} +"],
+  // Shell word-separator obfuscation (guard v15, H1): ${IFS} / $'\t' must not
+  // hide a secret path in any mode.
+  ["bash", "cat${IFS}.env"],
+  ["bash", "cp${IFS}.env /tmp/opencode/x"],
+  ["bash", "cat$'\t'.env"],
   ["bash", "node --env-file=.env script.js"],
   // Private keys named without the .key/.pem extension (guard v8).
   ["bash", "cat deploy_key"],
@@ -173,6 +178,8 @@ const alwaysAllow = [
   ["bash", "ssh-keygen -Y sign -n git -f /tmp/x"],
   // Public keys and agent listing stay allowed.
   ["bash", "cat ~/.ssh/id_ed25519.pub"],
+  ["bash", "cat server.key.pub"],
+  ["bash", "cat server.pem.pub"],
   ["bash", "ssh-add -l"],
   // git SSH signing must not be mistaken for `ssh-keygen -y` (guard v11).
   ["bash", "ssh-keygen -Y sign -n git -f /tmp/x"],

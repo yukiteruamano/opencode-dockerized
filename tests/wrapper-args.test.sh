@@ -629,6 +629,25 @@ grep -qx -- '4g' <<<"$common_lim" || fail "memory value not passed"
 grep -qx -- '--cpus' <<<"$common_lim" || fail "--cpus not added when setting.cpus is set"
 grep -qx -- '2' <<<"$common_lim" || fail "cpus value not passed"
 
+# Container network defaults to host, honors bridge, and rejects garbage.
+NETWORK="host"
+build_common_docker_args
+common_net="$(printf '%s\n' "${DOCKER_COMMON_ARGS[@]}")"
+grep -qx -- '--network' <<<"$common_net" || fail "--network flag missing"
+grep -qx -- 'host' <<<"$common_net" || fail "default network must be host"
+NETWORK="bridge"
+build_common_docker_args
+common_net="$(printf '%s\n' "${DOCKER_COMMON_ARGS[@]}")"
+grep -qx -- 'bridge' <<<"$common_net" || fail "bridge network must be honored"
+NETWORK="bogus"
+build_common_docker_args
+common_net="$(printf '%s\n' "${DOCKER_COMMON_ARGS[@]}")"
+grep -qx -- 'host' <<<"$common_net" || fail "invalid network must fall back to host"
+if grep -qx -- 'bogus' <<<"$common_net"; then
+    fail "invalid network value must never reach docker"
+fi
+NETWORK="host"
+
 # config sync refreshes a stale guard copy (and --check detects drift).
 printf '// OPENCODE_DOCKERIZED_GUARD_VERSION=0\n' >"$CONFIG_DIR/plugins/security-guard.js"
 if sync_security_layer --check >/dev/null 2>&1; then
