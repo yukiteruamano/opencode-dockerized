@@ -329,13 +329,20 @@ const DENY_BASH = [
   /\bprivate-keys-v1\.d\b/,
   /\bgpg\b[^\n|;&]*--export-secret(-keys|-subkeys)?\b/i,
   // Bare environment dumps (no arguments or assignments): `env`, `printenv`,
-  // `set` and `export` alone print the whole environment, including provider
-  // keys from the env file. With arguments or assignments (`printenv PATH`,
-  // `env FOO=1 cmd`, `set -e`, `export FOO=1`) they stay allowed.
-  /(^|[;|&(`\n])\s*\b(env|printenv|set|export)\b\s*([;|&\n]|$)/i,
-  // Dump switches that ignore arguments and always print the environment.
+  // `set`, `export`, `declare` and `typeset` alone print the whole
+  // environment, including provider keys from the env file. With arguments or
+  // assignments (`printenv PATH`, `env FOO=1 cmd`, `set -e`, `export FOO=1`,
+  // `declare -A map`) they stay allowed.
+  /(^|[;|&(`\n])\s*\b(env|printenv|set|export|declare|typeset)\b\s*([;|&\n]|$)/i,
+  // Dump switches that ignore arguments and always print the environment
+  // (guard v16, H2): `declare -p`/`typeset -p` dump every variable with values,
+  // bypassing the bare-dump rule above. Declaration flags (`-A/-a/-r/...`)
+  // stay allowed.
   /\bexport\s+-p\b/i,
+  /\bdeclare\s+-p\b/i,
+  /\btypeset\s+-p\b/i,
   /\bcompgen\s+-e\b/i,
+  /\bcompgen\s+-v\b/i,
   /\bdeclare\s+-x\b/i,
   /\btypeset\s+-x\b/i,
   // Forwarded SSH agent is a signing oracle: forbid manipulating the host agent
