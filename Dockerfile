@@ -12,7 +12,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # in production builds: a moving tag breaks reproducibility and widens
 # supply-chain exposure if a tag is ever mutated.
 ARG NVM_VERSION=v0.40.8
-ARG PNPM_VERSION=12.5.1
+ARG PNPM_VERSION=12.10.1
 # OpenCode CLI release; override with --build-arg OPENCODE_VERSION=x.y.z
 ARG OPENCODE_VERSION=latest
 
