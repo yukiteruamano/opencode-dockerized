@@ -148,6 +148,51 @@ the least access it needs to be useful.
   resolved against the project directory; if the plugin fails to load, writes fall
   back to the runtime default. The config tree is mounted read-only and the guard
   is delivered read-only, so a session cannot relax it.
+- **Shell obfuscation is normalised, not solved (guard v20).** Quotes,
+  backslashes, ANSI-C quotes (`$'\x2e'`), `$IFS` variants and `{a,b}` brace words
+  are undone before matching, and globs that can expand to a secret dotfile
+  (`.e*`, `.[e]nv`) are refused when a reading verb is present. Variable assembly
+  (`f=.en; cat ${f}v`) and staged scripts are still only caught by the `strict`
+  vendored rules: regexes cannot close that class, so keep secrets out of the
+  mounted project.
+- **Destructive targets are canonicalised.** `rm`/`chmod`/`chown`/`mv`/`find
+  -delete` aimed at `/`, `~`, `$HOME`, `/usr`, `/etc`, `/home`, `/tmp`… are denied
+  in every mode, including `//`, `/.`, quoted and `/*` spellings and `cd / && rm
+  -rf *`. Paths below those directories (`~/.cache/x`, `/tmp/opencode/*`) stay
+  allowed.
+- **Network egress of secrets.** `curl`/`wget`/`nc` carrying a secret-named
+  variable (`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*AUTH*`, `*COOKIE*`…) or
+  uploading a local file (`-d @file`, `-F f=@file`, `-T`, `--post-file`, `< file`)
+  to a non-local host are denied in every mode (`balanced` drops the vendored
+  rules for this). Local hosts (`localhost`, `127.*`, `host.docker.internal`) and
+  uploads from `/tmp/opencode` stay allowed. `--network host` itself is not
+  restricted; a host-level egress allow-list is the real fix.
+- **Writes that run later are gated.** `edit`/`write`/`multiedit` of
+  `.git/hooks/*` and `.git/config` are denied (and shell redirects/`tee`/`cp`
+  into `.git/hooks`); `.github/workflows/`, `opencode.json*`, `.mcp.json`,
+  `.opencode/`, `.envrc`, `.vscode/` and `.husky/` ask for approval, because
+  those files execute outside the sandbox or reconfigure the agent. Whether
+  OpenCode loads project-level plugins from `.opencode/` is not verified here.
+- **Web fetch.** Only `http(s)` URLs are fetched; cloud metadata hosts are
+  denied; loopback, private and `*.internal` targets ask for approval (the
+  container shares the host network). DNS rebinding is not covered.
+- **`git push` / `git reset --hard` ask even behind wrappers** (`git -C . push`,
+  `command git push`, `env git push`).
+- **The guard fails closed.** Malformed events, a hook exception, values over
+  16 KiB (the vendored regexes have quadratic worst cases; use the write tool for
+  large payloads) and a balanced/strict policy set that failed to load (shell
+  commands are refused until `config sync` repairs it) are all denied, never
+  silently allowed. Vendored patterns that backtrack catastrophically are
+  rewritten as documented local patches (`policies/README.md`), and
+  `tests/policy-lint.test.mjs` fuzzes every rule against a time budget.
+- **Audit log.** Decisions are appended as JSON lines to
+  `~/.local/state/opencode/guard-audit.jsonl` (rule, action, length and a short
+  hash, never the command text; rotated at 2 MiB). Actions the guard does not
+  know are logged once as `unmapped-action`, to review the runtime's real names.
+- **The security layer is verified by content.** `config sync` and `config sync
+  --check` compare file content (not the version marker), install through a temp
+  file and atomic rename, keep three timestamped backups, and a failed install
+  makes the wrapper refuse to start instead of running unguarded.
 - **Prompt injection is only partly mitigated.** Rules and hooks reduce the
   impact; they do not make the agent trustworthy. Review its actions.
 
