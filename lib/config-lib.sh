@@ -1650,7 +1650,9 @@ build_common_docker_args() {
     # (see build_standard_volume_args).
     if [ -f "$CONFIG_DIR/opencode.json" ]; then
         local sandbox_rule_json
-        if sandbox_rule_json=$(tr -d '\n' <"$CONFIG_DIR/opencode.json" 2>/dev/null) && [ -n "$sandbox_rule_json" ]; then
+        if sandbox_rule_json=$(tr -d '\r\n' <"$CONFIG_DIR/opencode.json" 2>/dev/null) && [ -n "$sandbox_rule_json" ]; then
+            # Drop trailing whitespace so the closing brace is really last.
+            sandbox_rule_json="${sandbox_rule_json%"${sandbox_rule_json##*[![:space:]]}"}"
             # Optional built-in websearch provider (setting.websearch_provider).
             # Merged into the inline config alongside the permissions; the file
             # keeps its known shape (a single object ending in `}`), so a suffix

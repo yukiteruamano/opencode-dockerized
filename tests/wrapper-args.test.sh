@@ -703,6 +703,26 @@ if grep -qF -- '"websearch"' <<<"$websearch_common"; then
 fi
 WEBSEARCH_PROVIDER=""
 
+# The merge must survive a rules file that ends with spaces or CRLF (hand-edited
+# or checked out on another OS) and the result must still be valid JSON.
+saved_rules="$(cat "$CONFIG_DIR/opencode.json")"
+printf '{\r\n  "permissions": [{"action": "shell", "resource": "*", "effect": "allow"}]\r\n}  \r\n\r\n' >"$CONFIG_DIR/opencode.json"
+WEBSEARCH_PROVIDER="exa"
+build_common_docker_args
+inline_cfg=""
+for arg in "${DOCKER_COMMON_ARGS[@]}"; do
+    case "$arg" in OPENCODE_CONFIG_CONTENT=*) inline_cfg="${arg#OPENCODE_CONFIG_CONTENT=}" ;; esac
+done
+[ -n "$inline_cfg" ] || fail "inline config must be produced from a CRLF rules file"
+grep -qF -- '"websearch":{"provider":"exa"}' <<<"$inline_cfg" ||
+    fail "websearch must merge into a rules file with trailing whitespace"
+if $have_node; then
+    printf '%s' "$inline_cfg" | node -e 'const c=JSON.parse(require("fs").readFileSync(0,"utf8")); if(!Array.isArray(c.permissions)||c.websearch.provider!=="exa") process.exit(1)' ||
+        fail "the merged inline config must be valid JSON with permissions and websearch"
+fi
+printf '%s\n' "$saved_rules" >"$CONFIG_DIR/opencode.json"
+WEBSEARCH_PROVIDER=""
+
 # Optional theme is passed as inline CLI config.
 THEME="catppuccin"
 build_common_docker_args
