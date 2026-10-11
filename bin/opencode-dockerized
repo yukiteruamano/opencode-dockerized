@@ -438,8 +438,10 @@ _git_pull_wrapper() {
         return 1
     fi
     local n
-    n=$(git -C "$REPO_ROOT" rev-list --count HEAD..'@{u}')
+    n=$(git -C "$REPO_ROOT" rev-list --count "HEAD..$remote_rev")
+    _UP_LOCAL_REV="$local_rev"; _UP_REMOTE_REV="$remote_rev"; _UP_BEHIND="$n"
     print_info "Update available: $n commit(s) behind upstream."
+    _show_incoming_changes "$remote_rev"
     if [ "$check_only" = true ]; then
         return "$UP_AVAILABLE"
     fi
@@ -454,7 +456,18 @@ _git_pull_wrapper() {
             ;;
         esac
     fi
-    git -C "$REPO_ROOT" pull --ff-only || {
+    # Opt-in: refuse an upstream head without a valid signature.
+    if [ "${OCD_VERIFY_SIGNATURES:-false}" = true ] &&
+        ! git -C "$REPO_ROOT" verify-commit "$remote_rev" >/dev/null 2>&1; then
+        print_error "Upstream head ${remote_rev:0:12} has no valid signature (OCD_VERIFY_SIGNATURES=true); refusing to merge."
+        return 1
+    fi
+    # Keep the previous revision so `rollback` can point back to it.
+    mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+    printf '%s\n' "$local_rev" >"$CONFIG_DIR/.previous-rev" 2>/dev/null || true
+    # Merge the exact revision that was shown above, not whatever a second
+    # fetch inside `git pull` might resolve to.
+    git -C "$REPO_ROOT" merge --ff-only "$remote_rev" || {
         print_error "Pull failed."
         return 1
     }
@@ -462,10 +475,31 @@ _git_pull_wrapper() {
     return 0
 }
 
+# List the incoming commits and flag changes to the security layer or the image
+# build, so the user sees what a pull brings before it is merged.
+# Usage: _show_incoming_changes <remote_rev>
+_show_incoming_changes() {
+    local remote_rev="$1" touched
+    git -C "$REPO_ROOT" log --oneline --no-merges -n 20 "HEAD..$remote_rev" | sed 's/^/    /'
+    touched=$(git -C "$REPO_ROOT" diff --name-only "HEAD..$remote_rev" -- \
+        Dockerfile entrypoint.sh lib plugins policies | head -10)
+    if [ -n "$touched" ]; then
+        print_warning "Incoming changes touch the security layer or the image build:"
+        printf '%s\n' "$touched" | sed 's/^/    /'
+    fi
+}
+
 # Rebuild the image with cache-busting so the latest OpenCode is installed.
 _rebuild_opencode_image() {
+    local previous_tag="${IMAGE_NAME%:*}:previous"
+    if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+        docker tag "$IMAGE_NAME" "$previous_tag" || true
+    fi
     print_info "Rebuilding image with latest code..."
-    docker build --build-arg "OPENCODE_BUILD_TIME=$(date +%s)" -t "$IMAGE_NAME" "$REPO_ROOT"
+    if ! docker build --build-arg "OPENCODE_BUILD_TIME=$(date +%s)" -t "$IMAGE_NAME" "$REPO_ROOT"; then
+        print_error "Image build failed; the previous image is kept as $previous_tag. Run '$(basename "$0") rollback' to restore it."
+        return 1
+    fi
     print_info "Updated OpenCode version:"
     docker run --rm --entrypoint bash "$IMAGE_NAME" -c "opencode --version" 2>/dev/null || true
 }
@@ -475,15 +509,17 @@ _rebuild_opencode_image() {
 # Usage: _parse_self_update_flags <command-name> [flags...]
 _parse_self_update_flags() {
     local cmd="$1"; shift
-    _UP_CHECK=false; _UP_YES=false; _UP_NO_BUILD=false
+    _UP_CHECK=false; _UP_YES=false; _UP_NO_BUILD=false; _UP_JSON=false; _UP_POST_PULL=false
     local arg
     for arg in "$@"; do
         case "$arg" in
         --check) _UP_CHECK=true ;;
         --yes) _UP_YES=true ;;
         --no-build) _UP_NO_BUILD=true ;;
+        --json) _UP_JSON=true ;;
+        --post-pull) _UP_POST_PULL=true ;; # internal: set by the re-exec after a pull
         --help | -h)
-            echo "Usage: $0 $cmd [--check] [--yes] [--no-build]"
+            echo "Usage: $0 $cmd [--check [--json]] [--yes] [--no-build]"
             echo "  --check    only report whether an update is available"
             echo "  --yes      pull and rebuild without asking"
             echo "  --no-build pull + sync only, skip the image rebuild"
@@ -491,12 +527,76 @@ _parse_self_update_flags() {
             return 0
             ;;
         *)
-            print_error "Unknown $cmd option: $arg (use --check|--yes|--no-build)"
+            print_error "Unknown $cmd option: $arg (use --check|--json|--yes|--no-build)"
             return 1
             ;;
         esac
     done
     return 0
+}
+
+# Machine-readable result of `--check --json`.
+# Usage: _print_check_json <pull_rc>
+_print_check_json() {
+    local status
+    case "$1" in
+    "$UP_CURRENT") status=current ;;
+    "$UP_AVAILABLE") status=available ;;
+    *) status=error ;;
+    esac
+    printf '{"status":"%s","behind":%s,"local":"%s","remote":"%s"}\n' \
+        "$status" "${_UP_BEHIND:-0}" "${_UP_LOCAL_REV:-}" "${_UP_REMOTE_REV:-}"
+}
+
+# Serialise the commands that rewrite the checkout, the image or the config
+# tree (update, upgrade, install, clean, config sync). flock when available,
+# an atomic mkdir lock otherwise (macOS). The lock survives the re-exec after
+# a pull through OCD_LOCK_HELD.
+acquire_wrapper_lock() {
+    if [ -n "${OCD_LOCK_HELD:-}" ]; then
+        # shellcheck disable=SC2016  # expanded when the trap fires
+        [ -n "${OCD_LOCK_DIR:-}" ] && trap 'rmdir "$OCD_LOCK_DIR" 2>/dev/null || true' EXIT
+        return 0
+    fi
+    mkdir -p "$CONFIG_DIR" 2>/dev/null || return 0
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$CONFIG_DIR/.lock" || return 0
+        if ! flock -n 9; then
+            print_error "Another opencode-dockerized update/install/clean is already running (lock: $CONFIG_DIR/.lock)."
+            return 1
+        fi
+    else
+        export OCD_LOCK_DIR="$CONFIG_DIR/.lock.d"
+        if ! mkdir "$OCD_LOCK_DIR" 2>/dev/null; then
+            print_error "Another opencode-dockerized update/install/clean is already running (remove $OCD_LOCK_DIR if it is stale)."
+            unset OCD_LOCK_DIR
+            return 1
+        fi
+        # shellcheck disable=SC2016  # expanded when the trap fires
+        trap 'rmdir "$OCD_LOCK_DIR" 2>/dev/null || true' EXIT
+    fi
+    export OCD_LOCK_HELD=1
+}
+
+# Undo the last upgrade: restore the previous image tag and point at the
+# previous wrapper revision. The git step is only printed, never run, because
+# it rewrites the checkout.
+rollback_wrapper() {
+    local previous_tag="${IMAGE_NAME%:*}:previous" rev_file="$CONFIG_DIR/.previous-rev" restored=false
+    if docker image inspect "$previous_tag" >/dev/null 2>&1; then
+        docker tag "$previous_tag" "$IMAGE_NAME"
+        print_success "Image restored from $previous_tag."
+        restored=true
+    fi
+    if [ -s "$rev_file" ]; then
+        print_info "To restore the previous wrapper code, run:"
+        echo "  git -C \"$REPO_ROOT\" reset --hard $(cat "$rev_file")"
+        restored=true
+    fi
+    if [ "$restored" != true ]; then
+        print_error "Nothing to roll back (no previous image or recorded revision)."
+        return 1
+    fi
 }
 
 # Full upgrade: git pull + security-layer sync + image rebuild.
@@ -506,12 +606,20 @@ full_upgrade() {
     _parse_self_update_flags "$cmd" "$@" || return $?
     local pull_rc=0
     if [ "$_UP_CHECK" = true ]; then
-        _git_pull_wrapper true true || pull_rc=$?
+        if [ "$_UP_JSON" = true ]; then
+            _git_pull_wrapper true true >/dev/null 2>&1 || pull_rc=$?
+            _print_check_json "$pull_rc"
+        else
+            _git_pull_wrapper true true || pull_rc=$?
+        fi
         [ "$pull_rc" -eq "$UP_CURRENT" ] && return 0
         return "$pull_rc"
     fi
+    acquire_wrapper_lock || return 1
     # `update` never prompts (historic one-shot); `upgrade` prompts when tty.
-    if [ "$cmd" = "update" ]; then
+    if [ "$_UP_POST_PULL" = true ]; then
+        pull_rc=$UP_CURRENT # the code was already pulled by the previous process
+    elif [ "$cmd" = "update" ]; then
         _git_pull_wrapper true false || pull_rc=$?
     else
         _git_pull_wrapper "$_UP_YES" false || pull_rc=$?
@@ -519,6 +627,12 @@ full_upgrade() {
     # Already up to date still refreshes the security layer and the image.
     if [ "$pull_rc" -eq "$UP_FAILED" ]; then
         return 1
+    fi
+    # Bash reads this file incrementally, so continue in a fresh process that
+    # runs the pulled code instead of the stale, already-parsed copy.
+    if [ "$pull_rc" -eq 0 ]; then
+        print_info "Restarting with the updated code..."
+        exec "$BIN_DIR/opencode-dockerized" "$cmd" --post-pull "$@"
     fi
     print_success "Refreshing security layer..."
     local sync_failed=false
@@ -536,7 +650,7 @@ full_upgrade() {
         print_info "Current OpenCode version:"
         docker run --rm --entrypoint bash "$IMAGE_NAME" -c "opencode --version" 2>/dev/null || true
     fi
-    _rebuild_opencode_image
+    _rebuild_opencode_image || return 1
     _report_upgrade_result "$sync_failed" "code + config + image"
 }
 
@@ -759,9 +873,10 @@ Commands:
     debug [ARGS]        Debugging tools (paths|config|agents, default: paths)
     doctor              Diagnose install, guard, SSH/GPG, websearch, theme and env file
     install [OPTS]      First-time install / repair PATH, config, completions, aliases
-    upgrade [--check|--yes|--no-build]  Full upgrade: git pull + sync + image rebuild
+    upgrade [--check [--json]|--yes|--no-build]  Full upgrade: git pull + sync + image rebuild
     build               Build the Docker image
-    update [--check|--yes|--no-build]   Full upgrade: git pull + sync + image rebuild
+    update [--check [--json]|--yes|--no-build]   Full upgrade: git pull + sync + image rebuild
+    rollback                            Restore the previous image and show how to restore the previous code
     version             Show wrapper, guard and OpenCode versions
     config [show|edit|path|sync]      Wrapper config (INI)
     config opencode [path|edit]       OpenCode config (opencode.json)
@@ -883,6 +998,7 @@ main() {
         build_image
         ;;
     install)
+        acquire_wrapper_lock || exit 1
         # shellcheck source=lib/install-lib.sh
         source "$REPO_ROOT/lib/install-lib.sh"
         run_install_main "$@"
@@ -897,16 +1013,23 @@ main() {
     update)
         update_opencode "$@"
         ;;
+    rollback)
+        rollback_wrapper
+        ;;
     version)
         check_docker
         show_version
         ;;
     config)
         # Local-only command: works without a running Docker daemon.
+        if [ "${1:-}" = sync ]; then
+            acquire_wrapper_lock || exit 1
+        fi
         show_config "$@"
         ;;
     clean)
         check_docker
+        acquire_wrapper_lock || exit 1
         clean_image
         ;;
     help | --help | -h)
@@ -921,5 +1044,7 @@ main() {
     esac
 }
 
-# Run main function
-main "$@"
+# Run main function. The braces make bash parse the whole command before
+# running it, so a self-update that rewrites this file cannot leave it reading
+# stale offsets afterwards.
+{ main "$@"; exit $?; }
