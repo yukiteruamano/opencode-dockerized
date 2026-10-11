@@ -6,7 +6,7 @@
 // ~/.config/opencode-dockerized/plugins/security-guard.js instead.
 // Only a Node.js builtin is imported ("node:fs") — no package.json needed.
 //
-// OPENCODE_DOCKERIZED_GUARD_VERSION=17
+// OPENCODE_DOCKERIZED_GUARD_VERSION=18
 //
 // Policy modes (env OPENCODE_DOCKERIZED_POLICY, set by the wrapper from
 // `setting.security_policy`; default "balanced"):
@@ -233,7 +233,7 @@ const normalizeLexical = (p) => {
 // Provider/MCP credentials and SSH keys that need an explicit shell block so the
 // agent cannot read/exfiltrate them via `cat`, `cp`, `curl`, etc.
 const SECRET_PATH_RE =
-  /(^|[\/\s'"=:(])auth\.json([\s'"\/):;,]|$)|(^|[\/\s'"=:(])credentials([\s'"\/.=:;,]|$)|(^|[\/\s'"=:(])\.npmrc([\s'"\/):;,]|$)|(^|[\/\s'"=:(])\.mcp-auth([\/\s'"=:;,]|$)|(^|[\/\s'"=:(])\.gitconfig([\s'"\/):;,]|$)|(^|[\/\s'"=:(])\.composio([\/\s'"=:;,]|$)|(^|[\/\s'"=:(])id_(rsa|dsa|ecdsa|ed25519|ed25519_sk|ecdsa_sk|eddsa)([\s'"\/):;,]|$)/i;
+  /(^|[\/\s'"=:(])auth\.json([\s'"\/):;,]|$)|(^|[\/\s'"=:(])\.?credentials([\s'"\/.=:;,]|$)|(^|[\/\s'"=:(])\.npmrc([\s'"\/):;,]|$)|(^|[\/\s'"=:(])\.mcp-auth([\/\s'"=:;,]|$)|(^|[\/\s'"=:(])\.gitconfig([\s'"\/):;,]|$)|(^|[\/\s'"=:(])\.composio([\/\s'"=:;,]|$)|(^|[\/\s'"=:(])\.claude\/(projects|sessions|session-env|file-history)([\/\s'"=:;,]|$)|(^|[\/\s'"=:(])\.claude\/history\.jsonl([\s'"):;,]|$)|(^|[\/\s'"=:(])id_(rsa|dsa|ecdsa|ed25519|ed25519_sk|ecdsa_sk|eddsa)([\s'"\/):;,]|$)/i;
 
 // Shell verbs capable of reading, encoding, copying or transmitting a file.
 // Key/certificate *generators* (openssl genrsa, ssh-keygen, gpg --gen-key) are
@@ -412,7 +412,7 @@ const DENY_BASH = [
 // credentials, SSH private keys, GnuPG private keys, host git/Composio config
 // that can carry tokens, and key-like file names (no extension).
 const DENY_READ =
-  /(^|\/)\.env(\.(?!example$)|$)|\.pem$|\.key$|(^|\/)auth\.json$|(^|\/)id_(rsa|dsa|ecdsa|ed25519|ed25519_sk|ecdsa_sk|eddsa)$|(^|\/)\.ssh(\/|$)|(^|\/)\.npmrc$|(^|\/)\.mcp-auth(\/|$)|(^|\/)credentials(\.|$)|(^|\/)private-keys-v1\.d(\/|$)|(^|\/)\.gitconfig$|(^|\/)\.composio(\/|$)|(^|\/)[\w.-]*(?:_key|-key|_priv)$|(^|\/)[\w.-]*key$/;
+  /(^|\/)\.env(\.(?!example$)|$)|\.pem$|\.key$|(^|\/)auth\.json$|(^|\/)id_(rsa|dsa|ecdsa|ed25519|ed25519_sk|ecdsa_sk|eddsa)$|(^|\/)\.ssh(\/|$)|(^|\/)\.npmrc$|(^|\/)\.mcp-auth(\/|$)|(^|\/)\.?credentials(\.|$)|(^|\/)\.claude\/(projects|sessions|session-env|file-history)(\/|$)|(^|\/)\.claude\/history\.jsonl$|(^|\/)private-keys-v1\.d(\/|$)|(^|\/)\.gitconfig$|(^|\/)\.composio(\/|$)|(^|\/)[\w.-]*(?:_key|-key|_priv)$|(^|\/)[\w.-]*key$/;
 
 // Actions whose values are scanned against the vendored pattern sets.
 const TOOL_ACTIONS = new Set([
