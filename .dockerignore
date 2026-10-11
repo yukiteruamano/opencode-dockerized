@@ -1,36 +1,6 @@
-# Git
-.git
-.gitignore
-
-# IDE
-.idea
-.vscode
-
-# Documentation (not needed in image)
-*.md
-LICENSE
-
-# Environment and config examples (not needed in image)
-.env
-examples/
-
-# Security layer sources and tests (installed on the host, not baked in)
-plugins/
-policies/
-tests/
-.github/
-
-# Shell scripts not used inside the container
-# Only entrypoint.sh is COPYed into the image
-opencode-dockerized.sh
-bin/
-lib/
-completions/
-run-simple.sh
-setup.sh
-install.sh
-
-# Docker
-.dockerignore
-.hadolint.yaml
-.shellcheckrc
+# Allowlist: nothing enters the build context unless it is re-included below.
+# The Dockerfile COPYs a single file; everything else (docs, tests, the wrapper,
+# secrets, editor files) stays out, whatever gets added to the repository later.
+# tests/dockerfile-lint.test.sh checks that every COPY source is listed here.
+*
+!entrypoint.sh
