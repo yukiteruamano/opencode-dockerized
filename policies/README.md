@@ -14,6 +14,17 @@ V2-only setup used here — so instead of depending on that package, the generat
 and our V2 `security-guard.js` hook evaluates them with the same first-match semantics
 (`new RegExp(pattern, flags ?? "i")`).
 
+## Local patches
+
+The files are verbatim copies except for these deliberate, documented changes
+(re-apply them when refreshing from upstream):
+
+- `prompt-injection-patterns.json` / `base64-payload-2` — upstream
+  `[A-Za-z0-9+/]{40,}={0,2}.*(…)` backtracks cubically (4000 characters take ~17 s
+  and freeze the synchronous hook). The replacement anchors on the start of a base64
+  run, captures it atomically (lookahead + backreference) and bounds the gap to the
+  exec word to 2000 characters, so matching is linear. Same detections otherwise.
+
 To refresh the rules, replace the JSON files here (keeping the
 `[{ "id", "pattern", "reason", "flags"? }]` shape) and bump `VERSION` (a plain
 integer). `lib/config-lib.sh` compares it with the installed copy under
