@@ -208,6 +208,10 @@ OCD_NPM_REGISTRY="file://$TMP/nothing" run_wrapper build --latest
 grep -q 'Could not resolve the newest OpenCode release' <<<"$OUT" || fail "an unreachable registry must be reported"
 if grep -q -- 'OPENCODE_VERSION=' "$DOCKER_STUB_LOG"; then fail "no version arg when the registry is unreachable"; fi
 
+# 3e2. `version` identifies the exact checkout (git describe), not just a number.
+DOCKER_STUB_SHA_LABEL="$want_dsha" run_wrapper version
+grep -qE 'opencode-dockerized 0\.15\.0 \([0-9a-f]{7,}' <<<"$OUT" || fail "version must show the wrapper release and git describe (got: $(head -1 <<<"$OUT"))"
+
 # 3f. A stale image (different Dockerfile hash, or no labels) is reported.
 DOCKER_STUB_SHA_LABEL="$want_dsha" run_wrapper run "$TMP/proj"
 if grep -qE 'different Dockerfile|no build labels' <<<"$OUT"; then fail "an up-to-date image must not warn"; fi

@@ -2,34 +2,56 @@ name: CI
 
 on:
   push:
+    branches: [master]
   pull_request:
+  # Weekly: upstream installers and base-image packages change without a commit
+  # here, and a pinned hash that no longer matches must be noticed early.
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Third-party actions are pinned to a commit SHA (tags are mutable); the comment
+# keeps the human-readable version, and Dependabot keeps both in step.
 jobs:
   shell:
-    name: Shell scripts
+    name: Shell scripts and wrapper tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Syntax check
         run: |
           bash -n bin/opencode-dockerized install.sh opencode-dockerized.sh setup.sh run-simple.sh
-          for f in lib/*.sh completions/*.sh; do
+          for f in lib/*.sh completions/*.sh scripts/*.sh tests/*.sh; do
             bash -n "$f"
           done
 
       - name: ShellCheck
-        uses: ludeeus/action-shellcheck@2.0.0
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38 # 2.0.0
         with:
           scandir: .
         env:
           SHELLCHECK_OPTS: -x -S warning
 
-      - name: Wrapper args test
-        run: bash tests/wrapper-args.test.sh
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+
+      - name: Wrapper tests (no Docker)
+        run: |
+          for t in tests/*.test.sh; do
+            echo "::group::$t"
+            bash "$t"
+            echo "::endgroup::"
+          done
 
       - name: Config sync round-trip (ephemeral HOME, no Docker)
         run: |
@@ -38,30 +60,117 @@ jobs:
           bash bin/opencode-dockerized config sync
           bash bin/opencode-dockerized config sync --check
 
-  dockerfile:
-    name: Dockerfile
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Hadolint
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: Dockerfile
-          config: .hadolint.yaml
-
   policy:
-    name: Security policy
+    name: Security guard (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 24 is the Node the image ships (see NODE_VERSION in the Dockerfile).
+        node: [20, 22, 24]
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          node-version: 22
+          fetch-depth: 0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node }}
 
       - name: Guard syntax
         run: node --check plugins/security-guard.js
 
-      - name: Policy regression tests
-        run: node tests/security-guard.test.mjs
+      - name: Guard and policy tests
+        run: |
+          for t in tests/*.test.mjs; do
+            echo "::group::$t"
+            node "$t"
+            echo "::endgroup::"
+          done
+
+      # A guard or rule-set change that keeps its old version would never reach
+      # existing installs (the wrapper refreshes on a changed marker/file hash).
+      - name: Version bumps accompany guard and policy changes
+        if: github.event_name == 'pull_request' && matrix.node == 24
+        run: bash scripts/check-version-bumps.sh "origin/${{ github.base_ref }}"
+
+  dockerfile:
+    name: Dockerfile lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Hadolint
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          dockerfile: Dockerfile
+          config: .hadolint.yaml
+
+  image:
+    name: Image build, smoke test and scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [dockerfile]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          load: true
+          tags: opencode-dockerized:ci
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            DOCKERFILE_SHA256=${{ hashFiles('Dockerfile') }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Proves the pinned installers and versions really produce a working image:
+      # a bad hash, a missing release or a broken install fails here, not on a
+      # user's machine after `update`.
+      - name: Smoke test
+        run: |
+          docker run --rm --entrypoint bash opencode-dockerized:ci -c '
+            set -e
+            opencode --version
+            node --version
+            pnpm --version
+            uv --version
+            docker --version
+            [ "$(id -u)" = 1000 ] || { echo "image must run as uid 1000" >&2; exit 1; }
+            ! command -v sudo >/dev/null || { echo "sudo must not exist" >&2; exit 1; }
+          '
+          want_node="$(sed -n 's/^ARG NODE_VERSION=//p' Dockerfile)"
+          have_node="$(docker run --rm --entrypoint node opencode-dockerized:ci --version)"
+          [ "v$want_node" = "$have_node" ] || { echo "Node $have_node != pinned v$want_node" >&2; exit 1; }
+          want_oc="$(sed -n 's/^ARG OPENCODE_VERSION=//p' Dockerfile)"
+          label="$(docker image inspect --format '{{ index .Config.Labels "dev.opencode-dockerized.opencode-version" }}' opencode-dockerized:ci)"
+          [ "$label" = "$want_oc" ] || { echo "label $label != pinned $want_oc" >&2; exit 1; }
+
+      - name: Vulnerability scan (HIGH and CRITICAL with a fix available)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: opencode-dockerized:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Software bill of materials
+        if: always()
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: opencode-dockerized:ci
+          format: cyclonedx
+          output: sbom.cdx.json
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          if-no-files-found: ignore

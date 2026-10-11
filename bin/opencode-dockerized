@@ -16,7 +16,7 @@ NPM_REGISTRY="${OCD_NPM_REGISTRY:-https://registry.npmjs.org}"
 
 # Wrapper release line, shown by the version command next to the OpenCode
 # version and the bundled security-guard version.
-WRAPPER_VERSION="0.14.0"
+WRAPPER_VERSION="0.15.0"
 
 # Keep temporary files in a private per-user dir unless overridden: a shared
 # /tmp name may be pre-created by another user, and relay sockets, server logs
@@ -1200,7 +1200,9 @@ EOF
 
 # Function to show version
 show_version() {
-    echo "opencode-dockerized $WRAPPER_VERSION (guard $(grep -oE 'OPENCODE_DOCKERIZED_GUARD_VERSION=[0-9]+' "$REPO_ROOT/plugins/security-guard.js" 2>/dev/null | head -1 || echo unknown))"
+    local describe
+    describe=$(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || true)
+    echo "opencode-dockerized $WRAPPER_VERSION${describe:+ ($describe)} (guard $(grep -oE 'OPENCODE_DOCKERIZED_GUARD_VERSION=[0-9]+' "$REPO_ROOT/plugins/security-guard.js" 2>/dev/null | head -1 || echo unknown))"
     check_image "$IMAGE_NAME" || exit 1
     check_image_drift
     docker run --rm --entrypoint bash "$IMAGE_NAME" -c "opencode --version"

@@ -1,0 +1,20 @@
+# Keeps the pinned inputs current through reviewable pull requests.
+#   github-actions: the SHA-pinned actions in .github/workflows
+#   docker:         the digest of the base image in the Dockerfile
+# The tool versions that live in ARG lines (nvm, Node, uv, pnpm, OpenCode, Docker
+# CLI) and their installer hashes are not covered by Dependabot: refresh them with
+# scripts/pins-report.sh and review the new installers before bumping a hash.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"

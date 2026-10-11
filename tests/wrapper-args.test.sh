@@ -143,13 +143,13 @@ done
 build_standard_volume_args "$PROJECT" false
 npm_default="$(printf '%s\n' "${VOLUME_ARGS[@]}")"
 if grep -qF -- "$HOME/.npmrc:" <<<"$npm_default"; then
-    fail "~/.npmrc must not be mounted unless setting.mount_npmrc=true"
+    fail "the npmrc file must not be mounted unless setting.mount_npmrc=true"
 fi
 MOUNT_NPMRC=true
 build_standard_volume_args "$PROJECT" false
 npm_on="$(printf '%s\n' "${VOLUME_ARGS[@]}")"
 grep -qx -- "$HOME/.npmrc:/home/coder/.npmrc:ro" <<<"$npm_on" ||
-    fail "setting.mount_npmrc=true must mount ~/.npmrc read-only"
+    fail "setting.mount_npmrc=true must mount the npmrc file read-only"
 MOUNT_NPMRC=false
 build_standard_volume_args "$PROJECT" false
 
@@ -321,10 +321,12 @@ if [ "$have_node" = true ]; then
     ssh_envs="$(printf '%s\n' "${DOCKER_ENV_ARGS[@]}")"
     grep -qxF -- "type=bind,source=$ssh_sock,target=$ssh_sock" <<<"$ssh_mounts" ||
         fail "SSH agent socket must be mounted (--mount, not -v)"
+    # shellcheck disable=SC2088  # the tilde is part of the message text
     grep -qx -- "$HOME/.ssh/config:/home/coder/.ssh/config:ro" <<<"$ssh_mounts" ||
-        fail "~/.ssh/config must be mounted read-only" # shellcheck disable=SC2088
+        fail "~/.ssh/config must be mounted read-only"
+    # shellcheck disable=SC2088  # the tilde is part of the message text
     grep -qx -- "$HOME/.ssh/known_hosts:/home/coder/.ssh/known_hosts:ro" <<<"$ssh_mounts" ||
-        fail "~/.ssh/known_hosts must be mounted read-only" # shellcheck disable=SC2088
+        fail "~/.ssh/known_hosts must be mounted read-only"
     if grep -qE '(^|/)id_|\.ssh:/home/coder/\.ssh(:|$)' <<<"$ssh_mounts"; then
         fail "SSH private material must never be mounted"
     fi

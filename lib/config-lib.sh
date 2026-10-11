@@ -1625,7 +1625,7 @@ build_common_docker_args() {
         -e "TERM=${TERM:-xterm-256color}"
         # The advertised scratch dir (the only writable path outside the project)
         # does not exist in the image: give it a size-capped tmpfs.
-        --tmpfs /tmp/opencode:rw,mode=1777,size=512m
+        --tmpfs "/tmp/opencode:rw,mode=1777,size=512m"
         --pids-limit "$PIDS_LIMIT"
         -e "LANG=${LANG:-C.UTF-8}"
     )

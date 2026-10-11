@@ -15,7 +15,9 @@ Shell script-based Docker wrapper for running [OpenCode](https://opencode.ai) in
 - `run-simple.sh` — Simplified alternative runner (delegates to `opencode-dockerized run`)
 - `plugins/security-guard.js` — Versioned OpenCode V2 hooks (source of truth; copied into the user config by `lib/config-lib.sh`)
 - `policies/` — Vendored `opencode-policy` pattern sets + local `allow-patterns.json` (see `policies/README.md`)
-- `tests/security-guard.test.mjs` — Security-policy regression tests
+- `tests/security-guard.test.mjs`, `tests/security-guard-adversarial.test.mjs`, `tests/policy-lint.test.mjs` — Guard regression, bypass and rule-set tests (shared harness in `tests/guard-harness.mjs`)
+- `tests/*.test.sh` — Wrapper contract tests against a throw-away HOME, a local git origin and a stub `docker`
+- `scripts/` — `check-version-bumps.sh` (CI) and `pins-report.sh`
 - `SECURITY.md`, `CONTRIBUTING.md` — Security model and contribution guide
 - `config.example` — Example user config (INI-style), in `examples/`
 - `.dockerignore` — Excludes non-essential files from Docker build context
@@ -54,6 +56,9 @@ cat Dockerfile | docker run --rm -i hadolint/hadolint:latest hadolint -   # Lint
 node --check plugins/security-guard.js  # Syntax-check the V2 hooks
 node tests/security-guard.test.mjs      # Security-policy regression tests (Node 22+)
 bash tests/wrapper-args.test.sh         # Wrapper mount/env contract test (no Docker)
+for t in tests/*.test.sh; do bash "$t"; done    # all wrapper tests (update, install, run, doctor, completions, Dockerfile lint…)
+for t in tests/*.test.mjs; do node "$t"; done   # guard, adversarial and policy-lint tests
+scripts/pins-report.sh                  # Which pinned Dockerfile inputs have a newer release
 
 # Docker operations
 docker build -t opencode-dockerized:latest .                    # Manual build
@@ -217,7 +222,7 @@ Secrets only travel via `setting.env_file` (dotenv file under `~/.config/opencod
 - Security policy is configurable (`setting.security_policy`, default `balanced`) and passed to the hook as `OPENCODE_DOCKERIZED_POLICY`
 - Sandbox permission rules are generated at `$CONFIG_DIR/opencode.json` (host-only) and passed inline via `OPENCODE_CONFIG_CONTENT`; `$CONFIG_DIR` itself is never mounted
 - The OpenCode config tree is mounted **read-only**; the security files are mirrored into it on the host by `ensure_opencode_dockerized_config`. A non-managed `AGENTS.md` is backed up to `AGENTS.md.user.bak` before the rules are installed
-- `plugins/security-guard.js` is the guard source of truth; bump `OPENCODE_DOCKERIZED_GUARD_VERSION` when changing its behavior so installs refresh (previous copy backed up to `.bak`)
+- `plugins/security-guard.js` is the guard source of truth; bump `OPENCODE_DOCKERIZED_GUARD_VERSION` when changing its behavior (CI enforces it on pull requests); installs are refreshed by file content, atomically, and the previous copy is kept as a timestamped `.bak.<stamp>` (three are retained)
 - Prefer `policies/allow-patterns.json` or a policy mode over editing the vendored `policies/*.json`
 - In `balanced` mode the guard drops broad, whole-string false positives (e.g. `history-1`, `dns-exfil-3`, `exec-builtin`, `fork-bomb-2`, `env-direct-2`) via `BALANCED_EXCLUDED_IDS`; `strict` keeps them all
 - Writes are allowed only inside the project directory and `/tmp/opencode` (the advertised scratch dir); the generated `opencode.json` allowlists `/tmp/opencode/*` for writes and the guard mirrors that root
