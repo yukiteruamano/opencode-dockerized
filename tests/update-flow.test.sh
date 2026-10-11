@@ -47,6 +47,10 @@ WRAPPER="$TMP/install/bin/opencode-dockerized"
 run() {
     OUT="$("$@" 2>&1)"
     RC=$?
+    # The ERR trap must stay quiet when the wrapper handles a result itself.
+    if grep -q 'unexpected failure' <<<"$OUT" && [ "$RC" -le 10 ]; then
+        fail "spurious 'unexpected failure' report (rc $RC)"
+    fi
 }
 
 push_upstream_commit() {

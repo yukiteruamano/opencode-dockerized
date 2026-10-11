@@ -178,6 +178,7 @@ setting.docker_socket=false
 setting.security_policy=balanced
 setting.memory=4g
 setting.cpus=2
+setting.pids_limit=4096
 setting.env_file=~/.config/opencode-dockerized/env
 setting.websearch_provider=exa
 setting.theme=catppuccin

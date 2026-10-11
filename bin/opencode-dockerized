@@ -175,6 +175,21 @@ print_warning() {
     echo -e "${YELLOW}⚠${NC} $1"
 }
 
+# Under `set -e` an unexpected failure ends the script silently. Name the
+# command and line so the user is never left guessing. Failures that the code
+# handles itself (`||`, `if`, `!`) do not trigger the ERR trap, and subshells
+# are skipped because their parent may be handling the failure.
+# Usage (trap): report_unexpected_failure <status> <line> <command>
+report_unexpected_failure() {
+    [ "$BASH_SUBSHELL" -eq 0 ] || return 0
+    # A function deliberately returning a status (e.g. the container's exit
+    # code, or 10 for "update available") already reported itself.
+    case "$3" in return* | exit*) return 0 ;; esac
+    print_error "$(basename "$0"): unexpected failure (exit $1) at line $2: $3" >&2
+}
+set -E
+trap 'report_unexpected_failure "$?" "$LINENO" "$BASH_COMMAND"' ERR
+
 # Function to check if Docker is running
 check_docker() {
     if ! docker info >/dev/null 2>&1; then
@@ -301,12 +316,18 @@ run_cli_command() {
     fi
 
     # Stop the per-session GnuPG relay when the container exits (also on error
-    # or Ctrl-C via the EXIT/INT/TERM trap).
-    trap 'stop_gpg_relay "$GPG_RELAY_SOCKET"' EXIT INT TERM
-    "${docker_cmd[@]}"
+    # or Ctrl-C). INT/TERM must exit: a trap that only cleans up would let the
+    # script carry on after the signal.
+    trap 'stop_gpg_relay "$GPG_RELAY_SOCKET"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    local container_rc=0
+    "${docker_cmd[@]}" || container_rc=$?
     stop_gpg_relay "$GPG_RELAY_SOCKET"
     GPG_RELAY_SOCKET=""
     trap - EXIT INT TERM
+    # The container's own exit code is the command's result (not a wrapper failure).
+    return "$container_rc"
 }
 
 # Function to run OpenCode authentication
@@ -391,18 +412,25 @@ run_opencode() {
         return 0
     fi
 
-    # Stop the per-session GnuPG relay when the container exits.
-    trap 'stop_gpg_relay "$GPG_RELAY_SOCKET"' EXIT INT TERM
-    if ! "${docker_cmd[@]}"; then
-        stop_gpg_relay "$GPG_RELAY_SOCKET"
-        GPG_RELAY_SOCKET=""
-        trap - EXIT INT TERM
-        print_error "OpenCode exited with an error"
-        exit 1
-    fi
+    # Stop the per-session GnuPG relay when the container exits. INT/TERM must
+    # exit (see run_cli_command).
+    trap 'stop_gpg_relay "$GPG_RELAY_SOCKET"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    local container_rc=0
+    "${docker_cmd[@]}" || container_rc=$?
     stop_gpg_relay "$GPG_RELAY_SOCKET"
     GPG_RELAY_SOCKET=""
     trap - EXIT INT TERM
+    case "$container_rc" in
+    0) ;;
+    # 130/143: the user interrupted the session; not a failure worth reporting.
+    130 | 143) exit "$container_rc" ;;
+    *)
+        print_error "OpenCode exited with code $container_rc"
+        exit "$container_rc"
+        ;;
+    esac
 }
 
 # Self-update helpers: `update` and `upgrade` both perform the full upgrade

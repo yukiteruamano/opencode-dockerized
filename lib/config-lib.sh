@@ -133,6 +133,7 @@ NETWORK="host"                  # Container network: host (default, simple) | br
 SECURITY_POLICY="balanced"      # Security policy mode: strict | balanced | off
 MEMORY=""                       # Optional container memory limit (docker --memory), e.g. 4g
 CPUS=""                         # Optional container CPU limit (docker --cpus), e.g. 2
+PIDS_LIMIT=4096                 # Max processes in the container (docker --pids-limit); stops fork bombs
 ENV_FILE=""                     # Optional dotenv file with secrets (docker --env-file), must live under CONFIG_DIR
 WEBSEARCH_PROVIDER=""           # Optional built-in websearch provider: exa | firecrawl | parallel | tavily | random
 THEME=""                        # Optional TUI theme name (built-in, e.g. catppuccin); empty = OpenCode default
@@ -1552,16 +1553,33 @@ build_common_docker_args() {
     esac
     DOCKER_COMMON_ARGS=(
         --rm
+        # PID 1 that reaps zombies and forwards signals (opencode is not an init).
+        --init
+        --label opencode-dockerized=1
         --network "$NETWORK"
         --user "$(id -u):$(id -g)"
         --group-add coder
         --security-opt no-new-privileges:true
         --cap-drop=ALL
         -e "TERM=${TERM:-xterm-256color}"
+        # The advertised scratch dir (the only writable path outside the project)
+        # does not exist in the image: give it a size-capped tmpfs.
+        --tmpfs /tmp/opencode:rw,mode=1777,size=512m
+        --pids-limit "$PIDS_LIMIT"
+        -e "LANG=${LANG:-C.UTF-8}"
     )
+    # Forward locale/timezone choices so commits and logs match the host.
+    local locale_var
+    for locale_var in LC_ALL TZ; do
+        [ -n "${!locale_var:-}" ] && DOCKER_COMMON_ARGS+=(-e "$locale_var=${!locale_var}")
+    done
+    # On a bridge network the host is reachable as host.docker.internal only
+    # when it is mapped explicitly (Linux does not provide it).
+    [ "$NETWORK" = "bridge" ] && DOCKER_COMMON_ARGS+=(--add-host host.docker.internal:host-gateway)
 
-    # Optional resource limits (setting.memory / setting.cpus).
-    [ -n "$MEMORY" ] && DOCKER_COMMON_ARGS+=(--memory "$MEMORY")
+    # Optional resource limits (setting.memory / setting.cpus). Pinning swap to
+    # the memory value keeps the limit real (no silent swap doubling).
+    [ -n "$MEMORY" ] && DOCKER_COMMON_ARGS+=(--memory "$MEMORY" --memory-swap "$MEMORY")
     [ -n "$CPUS" ] && DOCKER_COMMON_ARGS+=(--cpus "$CPUS")
 
     # Pass terminal identification variables so applications inside the container
@@ -1877,6 +1895,7 @@ load_config() {
     SECURITY_POLICY="balanced"
     MEMORY=""
     CPUS=""
+    PIDS_LIMIT=4096
     ENV_FILE=""
     WEBSEARCH_PROVIDER=""
     THEME=""
@@ -1919,7 +1938,7 @@ load_config() {
         memory)
             if [ -z "$value" ]; then
                 MEMORY=""
-            elif [[ "$value" =~ ^[0-9]+[bBkKmMgG]$ ]]; then
+            elif [[ "$value" =~ ^[0-9]+[bBkKmMgG]$ ]] && [[ "$value" =~ [1-9] ]]; then
                 MEMORY="$value"
             else
                 config_warning "Invalid memory '$value' (e.g. 4g); ignoring"
@@ -1932,6 +1951,13 @@ load_config() {
                 CPUS="$value"
             else
                 config_warning "Invalid cpus '$value' (e.g. 2); ignoring"
+            fi
+            ;;
+        pids_limit)
+            if [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+                PIDS_LIMIT="$value"
+            else
+                config_warning "Invalid pids_limit '$value' (positive integer); keeping 4096"
             fi
             ;;
         security_policy)
@@ -1999,6 +2025,8 @@ save_config() {
         echo "# Optional container resource limits (empty = no limit)"
         echo "setting.memory=$MEMORY"
         echo "setting.cpus=$CPUS"
+        echo "# Max processes in the container (default 4096)"
+        echo "setting.pids_limit=$PIDS_LIMIT"
         echo "# Secrets file (dotenv KEY=VALUE lines) loaded with docker --env-file."
         echo "# Must live under $CONFIG_DIR (never mounted). Empty = disabled."
         echo "setting.env_file=$ENV_FILE"

@@ -80,8 +80,10 @@
 # setting.security_policy=balanced
 
 # Optional container resource limits (docker --memory / --cpus). Empty = no limit.
-# setting.memory=4g
+# setting.memory=4g   (swap is pinned to the same value, so the limit is real)
 # setting.cpus=2
+# Max processes in the container (docker --pids-limit); default 4096 stops fork bombs.
+# setting.pids_limit=4096
 
 # Secrets file (dotenv KEY=VALUE lines) loaded with docker --env-file.
 # Must live under ~/.config/opencode-dockerized/ (never mounted; elsewhere is
