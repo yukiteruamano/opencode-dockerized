@@ -41,6 +41,9 @@ OC_CONFIG_DIR="$OCODE_HOME/.config/opencode"
 mkdir -p \
     "$HOME/.mcp-auth" \
     "$HOME/.npm" \
+    "$HOME/.claude/skills" \
+    "$HOME/.claude/projects" \
+    "$HOME/.agents/skills" \
     "$OC_CONFIG_DIR/plugins" \
     "$OC_CONFIG_DIR/agents" \
     "$OCODE_HOME/.local/share/opencode" \
@@ -50,6 +53,8 @@ mkdir -p \
     "$PROJECT"
 
 : >"$HOME/.gitconfig"
+: >"$HOME/.claude/CLAUDE.md"
+: >"$HOME/.claude/.credentials.json"
 printf '{\n  "permissions": [{"action": "shell", "resource": "*", "effect": "allow"}]\n}\n' >"$CONFIG_DIR/opencode.json"
 
 # shellcheck source=/dev/null
@@ -114,6 +119,24 @@ fi
 # MCP OAuth store must be read-write.
 grep -qx -- "$HOME/.mcp-auth:/home/coder/.mcp-auth:rw" <<<"$volumes" ||
     fail ".mcp-auth must be mounted read-write"
+
+# Skills and Claude-compat rules are mounted read-only, and only those paths:
+# the rest of ~/.claude (credentials, history, projects) must never be shared.
+for pair in \
+    "$HOME/.claude/skills:/home/coder/.claude/skills" \
+    "$HOME/.claude/CLAUDE.md:/home/coder/.claude/CLAUDE.md" \
+    "$HOME/.agents/skills:/home/coder/.agents/skills"; do
+    grep -qx -- "$pair:ro" <<<"$volumes" ||
+        fail "$pair must be mounted read-only"
+done
+if grep -qE -- '(\.claude|\.agents)[^ ]*:rw$' <<<"$volumes"; then
+    fail "nothing under .claude/.agents may be mounted read-write"
+fi
+for banned in "$HOME/.claude:" "$HOME/.agents:" "$HOME/.claude/.credentials.json" "$HOME/.claude/projects"; do
+    if grep -qF -- "$banned" <<<"$volumes"; then
+        fail "$banned must not be mounted (only skills/agents/commands/CLAUDE.md are shared)"
+    fi
+done
 
 # Caches and ~/.gitconfig are NOT mounted anymore (security).
 for banned in "$HOME/.npm" "$HOME/.gitconfig"; do
@@ -214,6 +237,19 @@ CUSTOM_MOUNT_KEYS=(bad)
 if (build_mount_args) >/dev/null 2>&1; then
     fail "a mount with a relative container path must be rejected"
 fi
+CUSTOM_MOUNTS=()
+CUSTOM_MOUNT_KEYS=()
+
+# Custom mounts default to read-only; only an explicit :rw makes them writable.
+mkdir -p "$TMP/mnt-default" "$TMP/mnt-rw"
+CUSTOM_MOUNTS=("$TMP/mnt-default:/home/coder/mnt-default" "$TMP/mnt-rw:/home/coder/mnt-rw:rw")
+CUSTOM_MOUNT_KEYS=(mnt_default mnt_rw)
+build_mount_args
+custom_mounts="$(printf '%s\n' "${DOCKER_MOUNT_ARGS[@]}")"
+grep -qx -- "$TMP/mnt-default:/home/coder/mnt-default:ro" <<<"$custom_mounts" ||
+    fail "a custom mount without a mode must default to read-only"
+grep -qx -- "$TMP/mnt-rw:/home/coder/mnt-rw:rw" <<<"$custom_mounts" ||
+    fail "an explicit :rw custom mount must be read-write"
 CUSTOM_MOUNTS=()
 CUSTOM_MOUNT_KEYS=()
 

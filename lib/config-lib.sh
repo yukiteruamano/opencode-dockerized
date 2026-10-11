@@ -434,6 +434,9 @@ ensure_opencode_dockerized_config() {
     { "action": "read", "resource": "*.key", "effect": "deny" },
     { "action": "read", "resource": "auth.json", "effect": "deny" },
     { "action": "read", "resource": "credentials*", "effect": "deny" },
+    { "action": "read", "resource": "*.credentials.json", "effect": "deny" },
+    { "action": "read", "resource": "*/.claude/projects/*", "effect": "deny" },
+    { "action": "read", "resource": "*/.claude/history.jsonl", "effect": "deny" },
     { "action": "read", "resource": "*.npmrc", "effect": "deny" },
     { "action": "read", "resource": ".mcp-auth/*", "effect": "deny" },
     { "action": "read", "resource": ".ssh/*", "effect": "deny" },
@@ -1620,6 +1623,15 @@ build_common_docker_args() {
     fi
 }
 
+# Append a read-only bind mount to VOLUME_ARGS when the host path exists.
+# Usage: add_ro_mount HOST_PATH CONTAINER_PATH
+add_ro_mount() {
+    local host_path="$1" container_path="$2"
+    if [ -e "$host_path" ]; then
+        VOLUME_ARGS+=(-v "$host_path:$container_path:ro")
+    fi
+}
+
 # Build standard volume mount arguments for OpenCode directories
 # Populates VOLUME_ARGS and CONTAINER_WORKDIR
 # The project is mounted at a path derived from the host path (with $HOME stripped)
@@ -1685,17 +1697,17 @@ build_standard_volume_args() {
         VOLUME_ARGS+=(-v "$HOME/.npmrc:/home/coder/.npmrc:ro")
     fi
 
-    # Claude Code compatibility directory (optional)
-    # Provides fallback CLAUDE.md rules and ~/.claude/skills/ when no opencode equivalents exist
-    if [ -d "$HOME/.claude" ]; then
-        VOLUME_ARGS+=(-v "$HOME/.claude:/home/coder/.claude:ro")
-    fi
+    # Claude Code compatibility (optional): only skills, agents, commands and the
+    # CLAUDE.md fallback rules, always read-only. The rest of ~/.claude
+    # (.credentials.json, history, projects/) is never shared with the container.
+    local compat_path
+    for compat_path in skills agents commands CLAUDE.md; do
+        add_ro_mount "$HOME/.claude/$compat_path" "/home/coder/.claude/$compat_path"
+    done
 
-    # Agent-compatible skills directory (optional)
+    # Agent-compatible skills (optional)
     # OpenCode reads skills from ~/.agents/skills/<name>/SKILL.md
-    if [ -d "$HOME/.agents" ]; then
-        VOLUME_ARGS+=(-v "$HOME/.agents:/home/coder/.agents:ro")
-    fi
+    add_ro_mount "$HOME/.agents/skills" "/home/coder/.agents/skills"
 
     # Docker socket (optional, for Docker-in-Docker operations). The container
     # runs as a non-root numeric UID, so access is granted with a supplementary

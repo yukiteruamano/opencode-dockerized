@@ -234,8 +234,8 @@ Secrets only travel via `setting.env_file` (dotenv file under `~/.config/opencod
 | `~/.config/opencode-dockerized/home/.local/state/opencode/` | `/home/coder/.local/state/opencode/` | rw | Selected model, prompt history, locks |
 | `~/.config/opencode-dockerized/home/.cache/opencode/` | `/home/coder/.cache/opencode/` | rw | Provider cache |
 | `~/.mcp-auth/` | `/home/coder/.mcp-auth/` | rw | MCP OAuth store (`mcp-remote`) |
-| `~/.claude/` | `/home/coder/.claude/` | ro | Claude Code compat: CLAUDE.md rules, skills/ |
-| `~/.agents/` | `/home/coder/.agents/` | ro | Agent-compatible skills (skills/<name>/SKILL.md) |
+| `~/.claude/{skills,agents,commands,CLAUDE.md}` | `/home/coder/.claude/…` | ro | Claude Code compat: CLAUDE.md rules, skills; mounted per path via `add_ro_mount`, never the whole `~/.claude` (login, history, projects) |
+| `~/.agents/skills/` | `/home/coder/.agents/skills/` | ro | Agent-compatible skills (<name>/SKILL.md) |
 | `~/.composio/` | `/home/coder/.composio/` | rw | Composio CLI binary + login (custom `mount.composio`) — treat `user_data.json`/`config.json` as credentials |
 | `~/.config/opencode-dockerized/home/.gnupg/` | `/home/coder/.gnupg/` | rw (opt-in) | Mirrored **public** GnuPG material (pubring/trustdb/gpg.conf) + agent socket, only when `setting.gpg_agent_support=true`; `private-keys-v1.d/` is never copied |
 | `/var/run/docker.sock` | `/var/run/docker.sock` | rw (opt-in) | Docker socket, only when `setting.docker_socket=true` |

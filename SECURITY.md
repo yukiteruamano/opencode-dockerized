@@ -16,8 +16,8 @@ the least access it needs to be useful.
 | Control | How |
 |---------|-----|
 | Non-root execution | Image has no `sudo` (no binary, no sudoers); the wrapper starts the container with `--user <host uid>:<host gid>` and `--cap-drop=ALL`, so no root process runs at any point and `entrypoint.sh` performs no privilege changes |
-| Project-only writes | Only the project directory and the self-contained state tree are mounted; a plugin hook denies edits whose absolute path is outside the project (resolving symlinks via `realpath`, so a link inside the project cannot be used to escape) |
-| Secret reads | Generated `permissions` deny rules plus the security hook refuse reads of `.env` (except `.env.example`), `*.pem`, `*.key`, `auth.json`, `credentials*`, `~/.npmrc`, `~/.mcp-auth/`, `~/.ssh/`, SSH keys (`id_rsa`, `id_eddsa`, `id_ecdsa`, `id_dsa`) and `private-keys-v1.d/` — both via the `read` tool and from shell commands |
+| Project-only writes | Only the project directory, the self-contained state tree and read-only skills (`~/.claude/{skills,agents,commands,CLAUDE.md}`, `~/.agents/skills`; never the rest of `~/.claude`) are mounted; a plugin hook denies edits whose absolute path is outside the project (resolving symlinks via `realpath`, so a link inside the project cannot be used to escape) |
+| Secret reads | Generated `permissions` deny rules plus the security hook refuse reads of `.env` (except `.env.example`), `*.pem`, `*.key`, `auth.json`, `credentials*`, Claude Code login/history/transcripts (`~/.claude/history.jsonl`, `~/.claude/projects/`), `~/.npmrc`, `~/.mcp-auth/`, `~/.ssh/`, SSH keys (`id_rsa`, `id_eddsa`, `id_ecdsa`, `id_dsa`) and `private-keys-v1.d/` — both via the `read` tool and from shell commands |
 | GnuPG agent forwarding (opt-in) | `setting.gpg_agent_support=true` mirrors only the public keyring (`pubring.kbx` / `public-keys.d`) and forwards the host `gpg-agent` socket (preferring the restricted `S.gpg-agent.extra`), mounted at a dedicated path and exposed through a symlink in the mirrored keyring (a nested bind mount could be shadowed by Docker); the host agent is started on demand unless `setting.gpg_autostart_agent=false` (after a `gpg-connect-agent` liveness probe, so a live agent is not relaunched); the mirrored config keeps `use-keyboxd` and sets `no-autostart`, and the container starts keyboxd at boot so gpg can read the mirrored keyboxd database; the full-control main socket is only used with `setting.gpg_allow_main_socket=true`; `private-keys-v1.d/` is never copied or mounted, and a custom mount of `~/.gnupg` is refused |
 | SSH agent forwarding (opt-in) | `setting.ssh_agent_support=true` forwards only the host `SSH_AUTH_SOCK` and mounts `~/.ssh/config`/`known_hosts` read-only; private keys (`id_*`, `*.pem`, `*.key`) are never mounted, and a custom mount of `~/.ssh` is refused |
 | Dangerous commands | Deny rules + hook backstops for `sudo`, `rm -rf /`, `mkfs`, `dd of=/dev/…`, `shutdown`/`reboot`; `git push` requires approval |
@@ -95,7 +95,7 @@ the least access it needs to be useful.
   its own provider credentials; keep unrelated host secrets out of the env file.
 - **Secret reads are heuristic.** Reads of `.env` (except `.env.example`),
   `*.pem`, `*.key`, key-like file names (including bare `*key`), `auth.json`,
-  `credentials*`, `~/.npmrc`, `~/.mcp-auth/`, `~/.ssh/`, `~/.gitconfig` and
+  `credentials*`, Claude Code login/history/transcripts (`~/.claude/history.jsonl`, `~/.claude/projects/`), `~/.npmrc`, `~/.mcp-auth/`, `~/.ssh/`, `~/.gitconfig` and
   `~/.composio/` are denied via the `read`/`grep`/`glob` actions and the shell
   backstops; an obfuscated command could still reach data that is not mounted at
   all. The bare `*key` heuristic also blocks unrelated names ending in "key"

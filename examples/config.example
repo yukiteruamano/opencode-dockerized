@@ -104,6 +104,8 @@
 # Syntax: mount.<name>=<host_path>:<container_path>[:<mode>]
 #
 # Mounts are read-only by default. Append :rw for read-write access.
+# Skills (~/.claude/{skills,agents,commands,CLAUDE.md}, ~/.agents/skills) are
+# mounted read-only automatically; no mount.* entry is needed for them.
 #
 # Common examples:
 #   mount.gitconfig=~/.gitconfig:/home/coder/.gitconfig

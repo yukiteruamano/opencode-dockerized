@@ -288,6 +288,8 @@ mapping is needed.
 | `~/.config/opencode-dockerized/home/.local/state/opencode/` | `/home/coder/.local/state/opencode/` | read-write | Selected model, prompt history, locks |
 | `~/.config/opencode-dockerized/home/.cache/opencode/` | `/home/coder/.cache/opencode/` | read-write | Provider package cache |
 | `~/.npmrc` | `/home/coder/.npmrc` | read-only | NPM config (optional) |
+| `~/.claude/{skills,agents,commands,CLAUDE.md}` | `/home/coder/.claude/…` | **read-only** | Claude Code compat: skills and fallback rules (each path only if it exists). The rest of `~/.claude` (login credentials, history, `projects/`) is never mounted |
+| `~/.agents/skills/` | `/home/coder/.agents/skills/` | **read-only** | Agent-compatible skills (`<name>/SKILL.md`) (optional) |
 | `~/.mcp-auth/` | `/home/coder/.mcp-auth/` | **read-write** | MCP OAuth store for `mcp-remote` servers (optional) |
 | `~/.composio/` | `/home/coder/.composio/` | read-write | Composio CLI binary + login (optional custom `mount.composio`) |
 | `~/.config/opencode-dockerized/home/.gnupg/` | `/home/coder/.gnupg/` | read-write | Mirrored **public** GnuPG material (pubring/trustdb/gpg.conf) + agent socket (only with `setting.gpg_agent_support=true`); `private-keys-v1.d/` is never copied |
