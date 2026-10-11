@@ -126,9 +126,28 @@ opencode-dockerized run ~/projects/my-app
 # Check version
 opencode-dockerized version
 
-# Update OpenCode
+# Update the wrapper, the security layer and OpenCode itself
 opencode-dockerized update
 ```
+
+#### Updates, rollback and reproducibility
+
+- `update` shows the incoming commits (and warns when they touch the guard, the
+  policies, `lib/` or the Dockerfile), merges exactly the revision it showed, then
+  re-runs itself with the new code, refreshes the security layer and rebuilds the
+  image with the newest OpenCode release from npm. The base image is always
+  pulled, system packages and the toolchain are refreshed at most weekly, and
+  `update --full` drops the Docker cache. Two runs never overlap (lock).
+- The previous image stays as `opencode-dockerized:previous` and the previous code
+  revision is recorded, so `rollback` can undo an upgrade that turned out badly.
+- Images are tagged by OpenCode version and wrapper commit and carry provenance
+  labels; `run` warns when the image was built from a different Dockerfile than
+  your checkout.
+- Set `OCD_VERIFY_SIGNATURES=true` to refuse an upstream head (update) or a clone
+  (`install.sh`) without a valid signature; `OCODE_REF=vX.Y.Z` installs a tag.
+- Everything the image installs is pinned (base image digest, Node, uv, pnpm,
+  OpenCode, Docker CLI) and the remote installers are checked against pinned
+  hashes; `scripts/pins-report.sh` shows what has newer releases.
 
 ### Global Installation
 
@@ -209,10 +228,11 @@ opencode-dockerized stats --days 7 # Usage statistics
 opencode-dockerized debug paths    # Resolved data/config/cache paths
 opencode-dockerized doctor         # Diagnose install, guard, SSH/GPG, websearch, theme and env file
 opencode-dockerized install        # Install / repair PATH, config, completions, aliases
-opencode-dockerized upgrade --check # Check for updates from GitHub
+opencode-dockerized upgrade --check # Updates for the wrapper and the OpenCode in the image (exit 0 current, 10 available, 1 error; --json for scripts)
 opencode-dockerized upgrade        # Full upgrade: git pull + sync + image rebuild
-opencode-dockerized update         # Full upgrade: git pull + sync + image rebuild
-opencode-dockerized version        # Show wrapper, guard and OpenCode versions
+opencode-dockerized update         # Full upgrade: git pull + sync + image rebuild (--full: no Docker cache)
+opencode-dockerized rollback       # Restore the previous image (and show how to restore the previous code)
+opencode-dockerized version        # Show wrapper (git describe), guard and OpenCode versions
 opencode-dockerized config show    # Show parsed configuration
 opencode-dockerized config edit    # Edit wrapper config in $EDITOR
 opencode-dockerized config path    # Print wrapper config file path
