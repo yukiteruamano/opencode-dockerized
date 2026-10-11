@@ -24,6 +24,7 @@ OCODE_HOME="${OCODE_HOME:-$CONFIG_DIR/home}"
 # lives on a normal filesystem so Docker can bind it (it cannot bind sockets
 # under the per-user /run/user tmpfs).
 GPG_RELAY_DIR="${GPG_RELAY_DIR:-$CONFIG_DIR/gnupg-relay}"
+SESSIONS_DIR="${SESSIONS_DIR:-$CONFIG_DIR/sessions}"
 
 # Self-contained install location (Doom-style). The git checkout lives here;
 # the binary is always <install>/bin/opencode-dockerized, reached via PATH.
@@ -1320,11 +1321,49 @@ ensure_gpg_mirror() {
         rmdir "$dest/S.gpg-agent" 2>/dev/null ||
             config_warning "Stray directory at $dest/S.gpg-agent; remove it on the host before mounting the agent socket"
     fi
-    rm -f "$dest/S.gpg-agent" 2>/dev/null || true
 
-    # Clear a stale keyboxd socket/lock from a previous run: the container starts
-    # a fresh keyboxd, and a dead socket file would otherwise confuse gpgconf.
-    rm -f "$dest/S.keyboxd" "$dest/S.keyboxd.lock" 2>/dev/null || true
+    # The mirror is shared by every session. Stale agent/keyboxd entries are only
+    # cleared when no other session is alive: deleting the socket of a running
+    # session would break its gpg.
+    if [ "$(live_sessions)" -eq 0 ]; then
+        rm -f "$dest/S.gpg-agent" 2>/dev/null || true
+        # Clear a stale keyboxd socket/lock from a previous run: the container
+        # starts a fresh keyboxd, and a dead socket file would otherwise confuse
+        # gpgconf.
+        rm -f "$dest/S.keyboxd" "$dest/S.keyboxd.lock" 2>/dev/null || true
+    fi
+}
+
+# Session bookkeeping: each wrapper that runs a container drops a marker named
+# after its PID, so shared state (the GnuPG mirror) is only reset when nobody
+# else is using it.
+# Usage: register_session | unregister_session | live_sessions
+register_session() {
+    mkdir -p "$SESSIONS_DIR" 2>/dev/null || return 0
+    echo "$$" >"$SESSIONS_DIR/$$" 2>/dev/null || true
+}
+
+unregister_session() {
+    rm -f "$SESSIONS_DIR/$$" 2>/dev/null || true
+}
+
+# Print the number of OTHER live sessions (dead markers are dropped on the way).
+live_sessions() {
+    local marker pid count=0
+    [ -d "$SESSIONS_DIR" ] || {
+        echo 0
+        return 0
+    }
+    for marker in "$SESSIONS_DIR"/*; do
+        [ -f "$marker" ] || continue
+        pid=$(cat "$marker" 2>/dev/null || true)
+        if [ -n "$pid" ] && [ "$pid" != "$$" ] && kill -0 "$pid" 2>/dev/null; then
+            count=$((count + 1))
+        elif [ "$pid" != "$$" ]; then
+            rm -f "$marker" 2>/dev/null || true
+        fi
+    done
+    echo "$count"
 }
 
 # True when GPG_RELAY_DIR is a safe, non-root location to manage relays in.

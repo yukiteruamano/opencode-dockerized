@@ -323,13 +323,15 @@ run_cli_command() {
     # Stop the per-session GnuPG relay when the container exits (also on error
     # or Ctrl-C). INT/TERM must exit: a trap that only cleans up would let the
     # script carry on after the signal.
-    trap 'stop_gpg_relay "$GPG_RELAY_SOCKET"' EXIT
+    register_session
+    trap 'stop_gpg_relay "$GPG_RELAY_SOCKET"; unregister_session' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     local container_rc=0
     "${docker_cmd[@]}" || container_rc=$?
     stop_gpg_relay "$GPG_RELAY_SOCKET"
     GPG_RELAY_SOCKET=""
+    unregister_session
     trap - EXIT INT TERM
     # The container's own exit code is the command's result (not a wrapper failure).
     return "$container_rc"
@@ -419,13 +421,15 @@ run_opencode() {
 
     # Stop the per-session GnuPG relay when the container exits. INT/TERM must
     # exit (see run_cli_command).
-    trap 'stop_gpg_relay "$GPG_RELAY_SOCKET"' EXIT
+    register_session
+    trap 'stop_gpg_relay "$GPG_RELAY_SOCKET"; unregister_session' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     local container_rc=0
     "${docker_cmd[@]}" || container_rc=$?
     stop_gpg_relay "$GPG_RELAY_SOCKET"
     GPG_RELAY_SOCKET=""
+    unregister_session
     trap - EXIT INT TERM
     case "$container_rc" in
     0) ;;

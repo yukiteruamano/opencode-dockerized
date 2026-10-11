@@ -360,6 +360,29 @@ ensure_gpg_mirror
 [ ! -e "$OCODE_HOME/.gnupg/S.keyboxd" ] ||
     fail "stale keyboxd socket must be cleared from the mirror"
 
+# ...but never while another live session shares the mirror: removing its
+# keyboxd socket would break that session's gpg.
+sleep 30 &
+other_session=$!
+mkdir -p "$CONFIG_DIR/sessions"
+echo "$other_session" >"$CONFIG_DIR/sessions/$other_session"
+: >"$OCODE_HOME/.gnupg/S.keyboxd"
+ensure_gpg_mirror
+[ -e "$OCODE_HOME/.gnupg/S.keyboxd" ] ||
+    fail "the keyboxd socket of a live session must survive another run's mirror refresh"
+kill "$other_session" 2>/dev/null
+wait "$other_session" 2>/dev/null
+ensure_gpg_mirror
+[ ! -e "$OCODE_HOME/.gnupg/S.keyboxd" ] ||
+    fail "once the other session is gone its stale socket must be cleared"
+rm -rf "$CONFIG_DIR/sessions"
+
+# register_session/live_sessions bookkeeping: this process never counts itself.
+register_session
+[ "$(live_sessions)" -eq 0 ] || fail "a lone session must see no other live session"
+unregister_session
+[ ! -e "$CONFIG_DIR/sessions/$$" ] || fail "unregister_session must remove the marker"
+
 # The image entrypoint must start keyboxd so gpg can read that DB.
 grep -q 'gpgconf --launch keyboxd' "$REPO_DIR/entrypoint.sh" ||
     fail "entrypoint must launch keyboxd for GnuPG forwarding"
