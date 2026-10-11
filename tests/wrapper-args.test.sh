@@ -706,9 +706,55 @@ if sync_security_layer --check >/dev/null 2>&1; then
     fail "--check must detect a stale guard copy"
 fi
 sync_security_layer >/dev/null 2>&1 || fail "sync must refresh a stale guard copy"
-[ -f "$CONFIG_DIR/plugins/security-guard.js.bak" ] ||
-    fail "sync must back up the stale guard copy"
+compgen -G "$CONFIG_DIR/plugins/security-guard.js.bak.*" >/dev/null ||
+    fail "sync must back up the stale guard copy with a timestamped name"
 sync_security_layer --check >/dev/null 2>&1 || fail "must be in sync after refresh"
+
+# Content drift without a version bump must be detected and repaired: the
+# marker alone proves nothing about the file's content.
+printf '\n// local edit\n' >>"$CONFIG_DIR/plugins/security-guard.js"
+if sync_security_layer --check >/dev/null 2>&1; then
+    fail "--check must detect a guard edited without a version bump"
+fi
+sync_security_layer >/dev/null 2>&1 || fail "sync must repair a guard edited in place"
+cmp -s "$REPO_DIR/plugins/security-guard.js" "$CONFIG_DIR/plugins/security-guard.js" ||
+    fail "sync must restore the repo guard content"
+printf '\n// tampered mirror\n' >>"$OC_CONFIG_DIR/plugins/security-guard.js"
+if sync_security_layer --check >/dev/null 2>&1; then
+    fail "--check must detect a tampered config-tree mirror"
+fi
+sync_security_layer >/dev/null 2>&1 || fail "sync must repair a tampered mirror"
+cmp -s "$REPO_DIR/plugins/security-guard.js" "$OC_CONFIG_DIR/plugins/security-guard.js" ||
+    fail "sync must restore the mirror content"
+
+# A run on an unchanged tree must not rewrite files (no churn under live sessions).
+inode_before="$(ls -i "$OC_CONFIG_DIR/plugins/security-guard.js")"
+sync_security_layer >/dev/null 2>&1 || fail "idempotent sync must succeed"
+[ "$inode_before" = "$(ls -i "$OC_CONFIG_DIR/plugins/security-guard.js")" ] ||
+    fail "sync must not rewrite an unchanged mirror file"
+
+# Backups are timestamped and rotated (at most 3 kept per file).
+for i in 1 2 3 4 5; do
+    printf '// stale %s\n' "$i" >"$CONFIG_DIR/plugins/security-guard.js"
+    touch -d "2020-01-0$i" "$CONFIG_DIR/plugins/security-guard.js.bak.2020010$i" 2>/dev/null ||
+        : >"$CONFIG_DIR/plugins/security-guard.js.bak.2020010$i"
+    sync_security_layer >/dev/null 2>&1
+    sleep 1
+done
+[ "$(compgen -G "$CONFIG_DIR/plugins/security-guard.js.bak.*" | wc -l)" -le 3 ] ||
+    fail "backups must be rotated to at most 3"
+
+# An install that cannot write must fail loudly, not leave a session unguarded.
+printf '\n// stale mirror\n' >>"$OC_CONFIG_DIR/plugins/security-guard.js"
+chmod a-w "$OC_CONFIG_DIR/plugins"
+if (ensure_opencode_dockerized_config) >/dev/null 2>&1; then
+    chmod u+w "$OC_CONFIG_DIR/plugins"
+    fail "ensure_opencode_dockerized_config must fail when the mirror cannot be written"
+fi
+chmod u+w "$OC_CONFIG_DIR/plugins"
+ensure_opencode_dockerized_config >/dev/null 2>&1 || fail "must recover once the directory is writable"
+cmp -s "$REPO_DIR/plugins/security-guard.js" "$OC_CONFIG_DIR/plugins/security-guard.js" ||
+    fail "mirror must match the repo guard after recovery"
 
 # Merge: an outdated opencode.json with user rules keeps the user rules,
 # refreshes the template (template wins conflicts) and stays valid JSON.

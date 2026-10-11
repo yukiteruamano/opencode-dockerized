@@ -229,7 +229,18 @@ check_config() {
     # Ensure OpenCode storage directories exist and the security layer is present
     # (also generates the opencode-dockerized defaults on first run)
     # According to docs: https://opencode.ai/docs/troubleshooting/#storage
-    ensure_opencode_dirs
+    require_security_layer
+}
+
+# Create the state dirs and install the security layer, or stop: a session must
+# never start silently without the guard (an unwritable config tree, a failed
+# copy). The details were already printed by ensure_opencode_dirs.
+require_security_layer() {
+    ensure_opencode_dirs || {
+        print_error "The security layer could not be installed; refusing to start without the guard."
+        print_info "Fix the errors above, then retry (or run '$(basename "$0") config sync')."
+        exit 1
+    }
 }
 
 # Run a one-off OpenCode CLI command inside the container.
@@ -251,7 +262,7 @@ run_cli_command() {
     fi
 
     check_image "$IMAGE_NAME" || exit 1
-    ensure_opencode_dirs
+    require_security_layer
 
     parse_config
     build_mount_args

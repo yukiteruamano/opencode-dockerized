@@ -193,6 +193,52 @@ validate_project_dir() {
     return 0
 }
 
+# Keep only the newest N timestamped backups (FILE.bak.<stamp>) of a file.
+# Usage: prune_backups FILE [N=3]
+prune_backups() {
+    local file="$1" keep="${2:-3}" old
+    # shellcheck disable=SC2012  # names are ours (FILE.bak.<digits>), ordering by mtime is the point
+    while IFS= read -r old; do
+        [ -n "$old" ] && rm -f "$old" 2>/dev/null
+    done < <(ls -1t "$file".bak.* 2>/dev/null | tail -n "+$((keep + 1))")
+    return 0
+}
+
+# Install SRC at DEST only when the content differs. Writes go through a temp
+# file in the same directory plus an atomic rename (a session starting at the
+# same moment never reads a truncated file), the previous file is kept as
+# DEST.bak.<timestamp> (rotated, see prune_backups) and the result is verified
+# with cmp. A no-op when the content already matches, so live sessions are not
+# disturbed. Returns 1 when the file could not be installed.
+# Usage: install_managed_file SRC DEST LABEL [keep_backup=true|false]
+install_managed_file() {
+    local src="$1" dest="$2" label="$3" keep_backup="${4:-true}" tmp
+    if [ ! -f "$src" ]; then
+        config_warning "$label: source not found at $src"
+        return 1
+    fi
+    if cmp -s "$src" "$dest" 2>/dev/null; then
+        return 0
+    fi
+    if [ -f "$dest" ] && [ "$keep_backup" = true ]; then
+        if cp "$dest" "$dest.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null; then
+            prune_backups "$dest" 3
+            config_warning "Backed up previous $label"
+        fi
+    fi
+    tmp=$(mktemp "$dest.XXXXXX" 2>/dev/null) || {
+        config_error "Could not install $label: $(dirname "$dest") is not writable"
+        return 1
+    }
+    if cp "$src" "$tmp" 2>/dev/null && chmod 0644 "$tmp" 2>/dev/null && mv -f "$tmp" "$dest" 2>/dev/null && cmp -s "$src" "$dest"; then
+        config_success "Installed $label at $dest"
+        return 0
+    fi
+    rm -f "$tmp" 2>/dev/null
+    config_error "Could not install $label at $dest"
+    return 1
+}
+
 # Ensure all required OpenCode directories exist on host, inside the
 # self-contained OCODE_HOME tree (see CONSTANTS). Fresh start only: existing
 # files are never overwritten, and the host XDG dirs are left untouched.
@@ -637,91 +683,43 @@ EOF
         config_success "Created security rules at $CONFIG_DIR/AGENTS.md"
     fi
 
+    # Failures installing the security layer are reported and returned: a
+    # session must never start silently without the guard.
+    local layer_rc=0
+
     # Install the security hooks from the versioned repo copy
     # (plugins/security-guard.js) so the guard can be linted and reviewed like
-    # the rest of the code. When the installed copy predates the current guard
-    # version (marker string below), it is backed up and refreshed — never
-    # silently overwritten.
+    # the rest of the code. Content, not the version marker, decides: a changed
+    # file is backed up (timestamped) and replaced atomically.
     local guard_src="$repo_dir/plugins/security-guard.js"
-    local installed_guard_ver repo_guard_ver
-    installed_guard_ver=$(grep -oE 'OPENCODE_DOCKERIZED_GUARD_VERSION=[0-9]+' "$CONFIG_DIR/plugins/security-guard.js" 2>/dev/null | head -1)
-    repo_guard_ver=$(grep -oE 'OPENCODE_DOCKERIZED_GUARD_VERSION=[0-9]+' "$guard_src" 2>/dev/null | head -1)
-    if [ ! -f "$CONFIG_DIR/plugins/security-guard.js" ] || [ "$installed_guard_ver" != "$repo_guard_ver" ]; then
-        if [ -f "$guard_src" ]; then
-            if [ -f "$CONFIG_DIR/plugins/security-guard.js" ]; then
-                cp "$CONFIG_DIR/plugins/security-guard.js" "$CONFIG_DIR/plugins/security-guard.js.bak" 2>/dev/null || true
-                config_warning "Backed up previous security-guard.js to security-guard.js.bak"
-            fi
-            if cp "$guard_src" "$CONFIG_DIR/plugins/security-guard.js" 2>/dev/null; then
-                config_success "Installed security hooks at $CONFIG_DIR/plugins/security-guard.js"
-            else
-                config_warning "Could not install security hooks (copy failed; base rules still active)"
-            fi
-        else
-            config_warning "Security hooks source not found at $guard_src (base rules still active)"
-        fi
-    fi
+    mkdir -p "$CONFIG_DIR/plugins" 2>/dev/null || true
+    install_managed_file "$guard_src" "$CONFIG_DIR/plugins/security-guard.js" "security hooks" || layer_rc=1
 
-    # Seed/refresh the ported opencode-policy pattern data. The vendored set is
-    # versioned (policies/VERSION): when the repo version differs from the
-    # installed one, or any rule file (or the marker) is missing, the copies are
-    # refreshed (existing files backed up first). The source lives next to this
-    # library in the repo (policies/); the copies are mounted read-only into the
-    # container (see build_standard_volume_args).
-    local policy_src policy_dest
+    # Seed/refresh the ported opencode-policy pattern data (policies/ in the
+    # repo; the copies are mirrored read-only into the container, see
+    # build_standard_volume_args). VERSION is kept as the human-readable marker.
+    local policy_src policy_dest pf
     policy_src="$repo_dir/policies"
     policy_dest="$CONFIG_DIR/plugins/policies"
     mkdir -p "$policy_dest" 2>/dev/null || true
 
     local -a policy_files=(unsafe-tool-patterns.json prompt-injection-patterns.json allow-patterns.json)
-    local src_ver inst_ver pf policy_refresh=false
-    src_ver=""
-    inst_ver=""
-    [ -f "$policy_src/VERSION" ] && src_ver=$(cat "$policy_src/VERSION" 2>/dev/null || true)
-    [ -f "$policy_dest/VERSION" ] && inst_ver=$(cat "$policy_dest/VERSION" 2>/dev/null || true)
-    [ ! -f "$policy_dest/VERSION" ] && policy_refresh=true
-    [ "$src_ver" != "$inst_ver" ] && policy_refresh=true
     for pf in "${policy_files[@]}"; do
-        [ -f "$policy_dest/$pf" ] || policy_refresh=true
+        install_managed_file "$policy_src/$pf" "$policy_dest/$pf" "policy patterns $pf" || layer_rc=1
     done
-
-    if [ "$policy_refresh" = true ]; then
-        for pf in "${policy_files[@]}"; do
-            if [ -f "$policy_dest/$pf" ] && [ -f "$policy_src/$pf" ]; then
-                cp "$policy_dest/$pf" "$policy_dest/$pf.bak" 2>/dev/null || true
-            fi
-        done
-        for pf in "${policy_files[@]}"; do
-            if [ -f "$policy_src/$pf" ]; then
-                if cp "$policy_src/$pf" "$policy_dest/$pf" 2>/dev/null; then
-                    config_success "Installed policy patterns at $policy_dest/$pf"
-                else
-                    config_warning "Could not install $pf (copy failed; base rules still active)"
-                fi
-            else
-                config_warning "Policy source not found at $policy_src/$pf (base rules still active)"
-            fi
-        done
-        if [ -f "$policy_src/VERSION" ]; then
-            cp "$policy_src/VERSION" "$policy_dest/VERSION" 2>/dev/null || true
-        fi
-    fi
+    install_managed_file "$policy_src/VERSION" "$policy_dest/VERSION" "policy VERSION marker" false || layer_rc=1
 
     # Mirror the security layer into the OpenCode config tree, which is bind
     # mounted read-only into the container. A single read-only directory mount is
     # used because Docker cannot create nested mountpoints under a read-only
-    # parent. These copies are wrapper-managed and overwritten on every run, so
-    # edit the sources in "$CONFIG_DIR" instead.
+    # parent. These copies are wrapper-managed: they follow the repo (guard) and
+    # the installed policy copies, so edit those sources, never the mirror.
     local oc_dir="$OCODE_HOME/.config/opencode"
     if [ -d "$oc_dir" ]; then
-        mkdir -p "$oc_dir/plugins/policies" 2>/dev/null || true
-        if [ -f "$guard_src" ]; then
-            cp "$guard_src" "$oc_dir/plugins/security-guard.js" 2>/dev/null || true
-        fi
-        for pf in unsafe-tool-patterns.json prompt-injection-patterns.json allow-patterns.json; do
-            if [ -f "$CONFIG_DIR/plugins/policies/$pf" ]; then
-                cp "$CONFIG_DIR/plugins/policies/$pf" "$oc_dir/plugins/policies/$pf" 2>/dev/null || true
-            fi
+        mkdir -p "$oc_dir/plugins/policies" 2>/dev/null || layer_rc=1
+        install_managed_file "$guard_src" "$oc_dir/plugins/security-guard.js" "config-tree guard" false || layer_rc=1
+        for pf in "${policy_files[@]}"; do
+            install_managed_file "$policy_dest/$pf" "$oc_dir/plugins/policies/$pf" "config-tree policy $pf" false || layer_rc=1
         done
         # Global rules: back up a user-authored AGENTS.md (not one of ours) once,
         # then keep the managed rules in place.
@@ -730,7 +728,7 @@ EOF
                 cp "$oc_dir/AGENTS.md" "$oc_dir/AGENTS.md.user.bak" 2>/dev/null || true
                 config_warning "Backed up your AGENTS.md to AGENTS.md.user.bak (replaced by the read-only security rules)"
             fi
-            cp "$CONFIG_DIR/AGENTS.md" "$oc_dir/AGENTS.md" 2>/dev/null || true
+            install_managed_file "$CONFIG_DIR/AGENTS.md" "$oc_dir/AGENTS.md" "config-tree AGENTS.md" false || layer_rc=1
         fi
     fi
 
@@ -745,6 +743,7 @@ EOF
             config_info "Removed legacy security-guard symlink from host config"
         fi
     fi
+    return "$layer_rc"
 }
 
 # Print the canonical install binary path (Doom-style: <install>/bin/opencode-dockerized).
@@ -854,23 +853,28 @@ check_security_layer() {
     local repo_dir
     repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 
+    # Content decides, not the version marker: an edited or truncated copy with
+    # the right marker is just as stale as an old one.
     local repo_guard inst_guard
     repo_guard=$(grep -oE 'OPENCODE_DOCKERIZED_GUARD_VERSION=[0-9]+' "$repo_dir/plugins/security-guard.js" 2>/dev/null | head -1)
     inst_guard=$(grep -oE 'OPENCODE_DOCKERIZED_GUARD_VERSION=[0-9]+' "$CONFIG_DIR/plugins/security-guard.js" 2>/dev/null | head -1)
-    if [ -n "$repo_guard" ] && [ "$repo_guard" = "$inst_guard" ]; then
+    if [ -n "$repo_guard" ] && cmp -s "$repo_dir/plugins/security-guard.js" "$CONFIG_DIR/plugins/security-guard.js"; then
         config_success "security-guard.js $repo_guard (in sync)"
     else
-        config_warning "security-guard.js stale (repo ${repo_guard:-missing} vs installed ${inst_guard:-missing})"
+        config_warning "security-guard.js stale (repo ${repo_guard:-missing} vs installed ${inst_guard:-missing}, or content differs)"
         stale=true
     fi
 
-    local src_ver inst_ver
+    local src_ver inst_ver pf policy_stale=false
     src_ver=$(cat "$repo_dir/policies/VERSION" 2>/dev/null || true)
     inst_ver=$(cat "$CONFIG_DIR/plugins/policies/VERSION" 2>/dev/null || true)
-    if [ -n "$src_ver" ] && [ "$src_ver" = "$inst_ver" ]; then
+    for pf in unsafe-tool-patterns.json prompt-injection-patterns.json allow-patterns.json VERSION; do
+        cmp -s "$repo_dir/policies/$pf" "$CONFIG_DIR/plugins/policies/$pf" || policy_stale=true
+    done
+    if [ -n "$src_ver" ] && [ "$policy_stale" = false ]; then
         config_success "policy patterns v$src_ver (in sync)"
     else
-        config_warning "policy patterns stale (repo ${src_ver:-missing} vs installed ${inst_ver:-missing})"
+        config_warning "policy patterns stale (repo ${src_ver:-missing} vs installed ${inst_ver:-missing}, or content differs)"
         stale=true
     fi
 
@@ -892,12 +896,19 @@ check_security_layer() {
 
     # The read-only config tree must carry the installed layer (single mount).
     local oc_dir="$OCODE_HOME/.config/opencode"
-    local mirror_guard
+    local mirror_guard mirror_stale=false
     mirror_guard=$(grep -oE 'OPENCODE_DOCKERIZED_GUARD_VERSION=[0-9]+' "$oc_dir/plugins/security-guard.js" 2>/dev/null | head -1)
-    if [ -n "$inst_guard" ] && [ "$mirror_guard" = "$inst_guard" ]; then
+    cmp -s "$repo_dir/plugins/security-guard.js" "$oc_dir/plugins/security-guard.js" || mirror_stale=true
+    for pf in unsafe-tool-patterns.json prompt-injection-patterns.json allow-patterns.json; do
+        cmp -s "$CONFIG_DIR/plugins/policies/$pf" "$oc_dir/plugins/policies/$pf" || mirror_stale=true
+    done
+    if [ -f "$CONFIG_DIR/AGENTS.md" ]; then
+        cmp -s "$CONFIG_DIR/AGENTS.md" "$oc_dir/AGENTS.md" || mirror_stale=true
+    fi
+    if [ -n "$inst_guard" ] && [ "$mirror_stale" = false ]; then
         config_success "config-tree mirror $mirror_guard (in sync)"
     else
-        config_warning "config-tree mirror stale (installed ${inst_guard:-missing} vs mirror ${mirror_guard:-missing})"
+        config_warning "config-tree mirror stale (installed ${inst_guard:-missing} vs mirror ${mirror_guard:-missing}, or content differs)"
         stale=true
     fi
 
