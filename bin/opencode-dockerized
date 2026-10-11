@@ -27,7 +27,11 @@ if ! { mkdir -p "$TMPDIR" 2>/dev/null && [ -O "$TMPDIR" ] && chmod 700 "$TMPDIR"
 fi
 
 # Seconds to wait for the in-container OpenCode server to become ready
+# (override with OCD_SERVER_TIMEOUT=<seconds>; invalid values keep the default).
 PRIVATE_SERVER_TIMEOUT=120
+if [[ "${OCD_SERVER_TIMEOUT:-}" =~ ^[1-9][0-9]*$ ]]; then
+    PRIVATE_SERVER_TIMEOUT="$OCD_SERVER_TIMEOUT"
+fi
 
 # Runs an opencode command against a private server inside the container.
 # V2's --standalone queries before providers finish loading (empty 'models')
@@ -44,8 +48,13 @@ opencode serve --hostname 127.0.0.1 --port 0 >"$log" 2>&1 &
 server_pid=$!
 trap "kill $server_pid 2>/dev/null" EXIT
 for _ in $(seq "$timeout"); do
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+        echo "OpenCode server exited before it was ready" >&2
+        cat "$log" >&2
+        exit 1
+    fi
     url=$(grep -oE "http://127\.0\.0\.1:[0-9]+" "$log" | head -n 1)
-    if [ -n "$url" ] && curl -sf -u "opencode:$OPENCODE_SERVER_PASSWORD" "$url$ready_path" | grep -q "$ready_pattern"; then
+    if [ -n "$url" ] && curl -sf --max-time 2 -u "opencode:$OPENCODE_SERVER_PASSWORD" "$url$ready_path" | grep -q "$ready_pattern"; then
         opencode "$@" --server "$url"
         exit
     fi
