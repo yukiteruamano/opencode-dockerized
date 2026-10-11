@@ -8,63 +8,11 @@
 //
 // Usage: node tests/security-guard.test.mjs
 
-import {
-  mkdtempSync,
-  mkdirSync,
-  writeFileSync,
-  symlinkSync,
-  copyFileSync,
-  rmSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { stageGuard, makeProject, loadGuard as loadGuardAt, cleanup, join } from "./guard-harness.mjs";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const repo = join(here, "..");
-
-// Stage the guard next to its ./policies data, exactly like the wrapper does.
-const stage = mkdtempSync(join(tmpdir(), "guard-"));
-mkdirSync(join(stage, "policies"), { recursive: true });
-copyFileSync(join(repo, "plugins/security-guard.js"), join(stage, "security-guard.js"));
-for (const f of [
-  "unsafe-tool-patterns.json",
-  "prompt-injection-patterns.json",
-  "allow-patterns.json",
-]) {
-  copyFileSync(join(repo, "policies", f), join(stage, "policies", f));
-}
-
-// Real project tree so symlink escapes can be exercised with the real filesystem.
-const root = mkdtempSync(join(tmpdir(), "proj-"));
-const PROJECT = join(root, "project");
-const OUTSIDE = join(root, "outside");
-mkdirSync(join(PROJECT, "src"), { recursive: true });
-mkdirSync(OUTSIDE, { recursive: true });
-writeFileSync(join(PROJECT, "src/a.ts"), "export const a = 1;\n");
-writeFileSync(join(OUTSIDE, ".env"), "API_KEY=leak\n");
-symlinkSync(join(OUTSIDE, ".env"), join(PROJECT, "link-to-env"));
-symlinkSync(OUTSIDE, join(PROJECT, "link-out"));
-
-async function loadGuard(mode) {
-  process.env.OPENCODE_DOCKERIZED_POLICY = mode;
-  const url = pathToFileURL(join(stage, "security-guard.js")).href + `?mode=${mode}`;
-  const mod = await import(url);
-  let evaluate;
-  await mod.default.setup({
-    location: { directory: PROJECT },
-    permission: {
-      hook: (name, fn) => {
-        if (name === "evaluate") evaluate = fn;
-      },
-    },
-  });
-  return (action, value) => {
-    const event = { effect: "allow", action, resources: [value] };
-    evaluate(event);
-    return event.effect === "deny" ? "deny" : "allow";
-  };
-}
+const stage = stageGuard();
+const { root, PROJECT } = makeProject();
+const loadGuard = (mode) => loadGuardAt(stage, PROJECT, mode);
 
 let failures = 0;
 const assert = (mode, action, value, got, want) => {
@@ -341,8 +289,7 @@ for (const mode of ["balanced", "strict", "off"]) {
   assert(mode, "bash", "cat .env.example && cat .env", chained, "deny");
 }
 
-rmSync(stage, { recursive: true, force: true });
-rmSync(root, { recursive: true, force: true });
+cleanup(stage, root);
 
 if (failures > 0) {
   console.log(`\n${failures} failure(s)`);
