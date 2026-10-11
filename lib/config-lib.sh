@@ -1353,6 +1353,11 @@ cleanup_stale_relays() {
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             continue
         fi
+        # A dir without a pid file may belong to a session that is starting right
+        # now (mkdir happens before the pid is written): give it a minute.
+        if [ -z "$pid" ] && [ -n "$(find "$d" -maxdepth 0 -mmin -1 2>/dev/null)" ]; then
+            continue
+        fi
         rm -rf "$d" 2>/dev/null || true
     done
 }

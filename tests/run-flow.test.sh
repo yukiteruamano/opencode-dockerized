@@ -103,6 +103,48 @@ done
 DOCKER_STUB_RC=7 run_wrapper exec "hello"
 [ "$RC" -eq 7 ] || fail "exec must propagate the container's code (want 7, got $RC)"
 
+# 3b. Temp files go to a private per-user dir (mode 700), not a shared /tmp name.
+cat >"$TMP/bin/docker" <<'STUB'
+#!/bin/bash
+echo "$*" >>"$DOCKER_STUB_LOG"
+[ "$1" = run ] && echo "TMPDIR=$TMPDIR" >>"$DOCKER_STUB_LOG"
+exit 0
+STUB
+mkdir -p "$TMP/xdg"
+chmod 755 "$TMP/xdg"
+: >"$DOCKER_STUB_LOG"
+OUT="$(env -u TMPDIR XDG_RUNTIME_DIR="$TMP/xdg" "$WRAPPER" run "$TMP/proj" 2>&1 </dev/null)"
+want="$TMP/xdg/opencode-$(id -u)"
+grep -qx "TMPDIR=$want" "$DOCKER_STUB_LOG" || fail "TMPDIR must default to \$XDG_RUNTIME_DIR/opencode-<uid> (log: $(grep TMPDIR "$DOCKER_STUB_LOG"))"
+[ "$(stat -c %a "$want" 2>/dev/null || stat -f %Lp "$want")" = 700 ] || fail "the private temp dir must be mode 700"
+# A pre-existing world-readable dir is tightened, not trusted as is.
+chmod 755 "$want"
+OUT="$(env -u TMPDIR XDG_RUNTIME_DIR="$TMP/xdg" "$WRAPPER" run "$TMP/proj" 2>&1 </dev/null)"
+[ "$(stat -c %a "$want" 2>/dev/null || stat -f %Lp "$want")" = 700 ] || fail "an existing temp dir must be re-tightened to 700"
+
+# 3c. `clean` removes dead relay dirs but never a live session's.
+RELAYS="$CONFIG_DIR/gnupg-relay"
+mkdir -p "$RELAYS/live" "$RELAYS/dead" "$RELAYS/fresh"
+sleep 30 &
+live_pid=$!
+echo "$live_pid" >"$RELAYS/live/pid"
+(exit 0) &
+dead_pid=$!
+wait "$dead_pid"
+echo "$dead_pid" >"$RELAYS/dead/pid"
+# `fresh` has no pid yet (a session is still starting): it must survive too.
+cat >"$TMP/bin/docker" <<'STUB'
+#!/bin/bash
+echo "$*" >>"$DOCKER_STUB_LOG"
+exit 0
+STUB
+run_wrapper clean
+kill "$live_pid" 2>/dev/null
+[ "$RC" -eq 0 ] || fail "clean must succeed (got $RC)"
+[ -d "$RELAYS/live" ] || fail "clean must not remove the relay of a live session"
+[ -d "$RELAYS/fresh" ] || fail "clean must not remove a relay dir that is still being created"
+[ ! -d "$RELAYS/dead" ] || fail "clean must remove the relay dir of a dead session"
+
 # 4. An unexpected failure under set -e names the command and line.
 cat >"$TMP/bin/docker" <<'STUB'
 #!/bin/bash

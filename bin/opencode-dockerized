@@ -15,11 +15,16 @@ IMAGE_NAME="opencode-dockerized:latest"
 # version and the bundled security-guard version.
 WRAPPER_VERSION="0.14.0"
 
-# Keep temporary files in the approved scratch dir unless overridden.
-# Bare `mktemp` honors TMPDIR, so relay sockets, server logs and merge temps
-# land there without touching every call site.
-export TMPDIR="${TMPDIR:-/tmp/opencode}"
-mkdir -p "$TMPDIR" 2>/dev/null || export TMPDIR="/tmp"
+# Keep temporary files in a private per-user dir unless overridden: a shared
+# /tmp name may be pre-created by another user, and relay sockets, server logs
+# and merge temps live here. Bare `mktemp` honors TMPDIR, so every call site
+# follows. The dir is tightened to 700 and must be ours, else a fresh one is used.
+export TMPDIR="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}/opencode-$(id -u)}"
+if ! { mkdir -p "$TMPDIR" 2>/dev/null && [ -O "$TMPDIR" ] && chmod 700 "$TMPDIR" 2>/dev/null; }; then
+    fallback_tmp="$(mktemp -d "${TMPDIR%/*}/opencode.XXXXXX" 2>/dev/null || mktemp -d /tmp/opencode.XXXXXX)"
+    export TMPDIR="$fallback_tmp"
+    unset fallback_tmp
+fi
 
 # Seconds to wait for the in-container OpenCode server to become ready
 PRIVATE_SERVER_TIMEOUT=120
@@ -807,10 +812,10 @@ exec_prompt() {
 
 # Function to clean up Docker image
 clean_image() {
-    # Drop any relay processes/dirs left by crashed sessions.
+    # Drop relay dirs left by crashed sessions; live sessions keep theirs.
     cleanup_stale_relays
     if relay_dir_ok; then
-        rm -rf "$GPG_RELAY_DIR" 2>/dev/null || true
+        rmdir "$GPG_RELAY_DIR" 2>/dev/null || true
     fi
     if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
         print_info "Removing Docker image '$IMAGE_NAME'..."
