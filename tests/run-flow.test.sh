@@ -145,6 +145,22 @@ kill "$live_pid" 2>/dev/null
 [ -d "$RELAYS/fresh" ] || fail "clean must not remove a relay dir that is still being created"
 [ ! -d "$RELAYS/dead" ] || fail "clean must remove the relay dir of a dead session"
 
+# 3d. doctor reports the host side as well as the container.
+run_wrapper doctor
+[ "$RC" -eq 0 ] || fail "doctor must pass on a healthy host with a healthy container (got $RC)"
+grep -q '== host: wrapper and security layer ==' <<<"$OUT" || fail "doctor must include the host-side check"
+grep -q 'security-guard.js .* (in sync)' <<<"$OUT" || fail "doctor must verify the guard on the host"
+printf '\n// drift\n' >>"$CONFIG_DIR/plugins/security-guard.js"
+cp "$REPO_DIR/plugins/security-guard.js" "$TMP/guard.orig"
+run_wrapper doctor
+# the run repairs drift before checking, so it must end healthy again
+[ "$RC" -eq 0 ] || fail "doctor must repair guard drift and then pass (got $RC)"
+cmp -s "$CONFIG_DIR/plugins/security-guard.js" "$REPO_DIR/plugins/security-guard.js" || fail "doctor must leave the installed guard in sync"
+printf '{ "apiKey": "sk-literal" }\n' >"$OCODE_HOME/.config/opencode/opencode.json"
+EXPECT_UNEXPECTED=true run_wrapper doctor
+[ "$RC" -ne 0 ] || fail "doctor must fail on an inline secret in the OpenCode config"
+printf '{"$schema": "https://opencode.ai/config.json"}\n' >"$OCODE_HOME/.config/opencode/opencode.json"
+
 # 4. An unexpected failure under set -e names the command and line.
 cat >"$TMP/bin/docker" <<'STUB'
 #!/bin/bash

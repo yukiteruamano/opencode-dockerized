@@ -73,12 +73,60 @@ exit 1
 DOCTOR_SCRIPT='
 status=0
 note() { printf "%s\n" "$1"; }
+# OCD_DOCTOR_ROOT is empty in a real container; the tests point it at a fake tree.
+root="${OCD_DOCTOR_ROOT:-}"
+ch="$root/home/coder"
 echo "== security guard =="
-if [ -f /home/coder/.config/opencode/plugins/security-guard.js ]; then
-    grep -m1 OPENCODE_DOCKERIZED_GUARD_VERSION /home/coder/.config/opencode/plugins/security-guard.js || true
+if [ -f "$ch/.config/opencode/plugins/security-guard.js" ]; then
+    grep -m1 OPENCODE_DOCKERIZED_GUARD_VERSION "$ch/.config/opencode/plugins/security-guard.js" || true
 else
     note "MISSING security-guard.js"; status=1
 fi
+echo "== mounts =="
+# Read-only mounts are the anchor of the sandbox: prove they really are.
+writable() { touch "$1/.doctor-probe" 2>/dev/null && { rm -f "$1/.doctor-probe"; return 0; }; return 1; }
+if writable "$ch/.config/opencode"; then
+    note "config dir: WRITABLE (expected read-only)"; status=1
+else
+    note "config dir: read-only"
+fi
+echo "== skills =="
+for kind in claude agents; do
+    dir="$ch/.$kind/skills"
+    if [ ! -d "$dir" ]; then
+        note "skills ($kind): not mounted"
+    elif writable "$dir"; then
+        note "skills ($kind): WRITABLE (expected read-only)"; status=1
+    else
+        n=$(find "$dir" -mindepth 2 -maxdepth 2 -name SKILL.md 2>/dev/null | wc -l)
+        note "skills ($kind): $n (read-only)"
+    fi
+done
+echo "== scratch =="
+if [ ! -d "$root/tmp/opencode" ]; then
+    note "scratch /tmp/opencode: MISSING"; status=1
+elif writable "$root/tmp/opencode"; then
+    note "scratch /tmp/opencode: writable"
+else
+    note "scratch /tmp/opencode: NOT writable"; status=1
+fi
+echo "== limits =="
+pids=""
+for f in "$root/sys/fs/cgroup/pids.max" "$root/sys/fs/cgroup/pids/pids.max"; do
+    [ -r "$f" ] && { pids=$(cat "$f"); break; }
+done
+if [ -z "$pids" ]; then
+    note "pids limit: unknown (no cgroup file)"
+elif [ "$pids" = max ]; then
+    note "pids limit: NONE (the wrapper sets --pids-limit)"; status=1
+else
+    note "pids limit: $pids"
+fi
+mem=""
+for f in "$root/sys/fs/cgroup/memory.max" "$root/sys/fs/cgroup/memory/memory.limit_in_bytes"; do
+    [ -r "$f" ] && { mem=$(cat "$f"); break; }
+done
+if [ -n "$mem" ] && [ "$mem" != max ]; then note "memory limit: $mem bytes"; else note "memory limit: none (setting.memory unset)"; fi
 echo "== ssh agent =="
 if [ "${OPENCODE_DOCKERIZED_SSH_AGENT:-false}" != true ]; then
     note "ssh agent forwarding: disabled in wrapper config (skipped)"
@@ -122,7 +170,7 @@ else
 fi
 fi
 echo "== config secrets =="
-oc=/home/coder/.config/opencode/opencode.json
+oc="$ch/.config/opencode/opencode.json"
 if [ -f "$oc" ] && grep -oE "\"(apiKey|api_key|token|secret|password|authorization)\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$oc" 2>/dev/null | grep -qvE "\{(env|file):"; then
     note "inline secrets: FOUND in opencode.json (migrate to {env:} references)"; status=1
 else
@@ -808,7 +856,20 @@ run_debug() {
 # Diagnose the security layer, SSH and GnuPG forwarding inside the container.
 # Project-independent: doctor needs no project mount (like auth).
 run_doctor() {
-    run_cli_command doctor "" false bash -c "$DOCTOR_SCRIPT"
+    # Host side first: the layer is repaired, then everything sync cannot fix
+    # (PATH, cli.json, inline secrets, env file permissions) is reported.
+    local host_rc=0 container_rc=0
+    require_security_layer
+    echo "== host: wrapper and security layer =="
+    parse_config
+    check_security_layer || host_rc=1
+    echo "== container =="
+    run_cli_command doctor "" false bash -c "$DOCTOR_SCRIPT" || container_rc=$?
+    if [ "$host_rc" -ne 0 ]; then
+        print_error "The host-side check found problems (see above); 'config sync' fixes the security layer."
+        return 1
+    fi
+    return "$container_rc"
 }
 
 # Function to run a non-interactive prompt and print the result
