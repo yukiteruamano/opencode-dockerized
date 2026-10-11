@@ -37,7 +37,7 @@ import {
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 
-const GUARD_VERSION_MARKER = "OPENCODE_DOCKERIZED_GUARD_VERSION=19";
+const GUARD_VERSION_MARKER = "OPENCODE_DOCKERIZED_GUARD_VERSION=20";
 const GUARD_VERSION = Number(GUARD_VERSION_MARKER.split("=")[1]);
 
 const POLICY_MODE = (
@@ -49,7 +49,7 @@ const HOME_DIR = process.env.HOME || "/home/coder";
 // Values longer than this are refused instead of scanned: the vendored regexes
 // contain `.*` chains whose worst case is quadratic, so an oversized command
 // could freeze this synchronous hook. Use the write tool for large payloads.
-const MAX_SCAN_LENGTH = 32 * 1024;
+const MAX_SCAN_LENGTH = 16 * 1024;
 
 // Audit trail (JSONL) in the read-write state dir. It records decisions, never
 // the command text: only its length and a short hash.

@@ -343,7 +343,7 @@
   },
   {
     "id": "background-many",
-    "pattern": "(\\s*&\\s*){3,}",
+    "pattern": "&\\s*&\\s*&",
     "reason": "BLOCKED: Too many background processes"
   },
   {

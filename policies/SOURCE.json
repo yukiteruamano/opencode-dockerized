@@ -1,0 +1,26 @@
+{
+  "policy_version": 4,
+  "upstream": {
+    "package": "opencode-policy",
+    "version": "0.1.4",
+    "repository": "https://github.com/tjvjk/opencode-policy",
+    "license": "MIT (see LICENSE.opencode-policy)"
+  },
+  "upstream_sha256": {
+    "unsafe-tool-patterns.json": "ff252a42948e6992b8abd1efac6891606fb728245ba9371689aefe57e6595789",
+    "prompt-injection-patterns.json": "f5568a537b3e3dbf4569acbc269e915dfccee048d4b2722d6be94b27a4948b69"
+  },
+  "local_files": ["allow-patterns.json"],
+  "local_patches": [
+    {
+      "file": "prompt-injection-patterns.json",
+      "id": "base64-payload-2",
+      "reason": "cubic backtracking (ReDoS): anchored, atomic and bounded replacement"
+    },
+    {
+      "file": "unsafe-tool-patterns.json",
+      "id": "background-many",
+      "reason": "nested quantifiers over whitespace: equivalent linear pattern"
+    }
+  ]
+}

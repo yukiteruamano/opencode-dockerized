@@ -280,9 +280,9 @@ for (const mode of ["balanced", "strict", "off"]) {
   if (mode !== "off") {
     const slow = [
       ["bash", "A".repeat(100000)],
-      ["bash", "A".repeat(30000)],
-      ["bash", "for ".repeat(7000)],
-      ["bash", ("A".repeat(41) + " ").repeat(700)],
+      ["bash", "A".repeat(15000)],
+      ["bash", "for ".repeat(3500)],
+      ["bash", ("A".repeat(41) + " ").repeat(340)],
     ];
     for (const [action, value] of slow) {
       const t0 = Date.now();

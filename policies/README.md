@@ -25,6 +25,14 @@ The files are verbatim copies except for these deliberate, documented changes
   run, captures it atomically (lookahead + backreference) and bounds the gap to the
   exec word to 2000 characters, so matching is linear. Same detections otherwise.
 
+- `unsafe-tool-patterns.json` / `background-many` — upstream `(\s*&\s*){3,}` has
+  nested quantifiers over whitespace (782 ms on 32 KiB of spaces). `&\s*&\s*&` matches
+  exactly the same strings (three `&` separated by optional whitespace) in linear time.
+
+`SOURCE.json` records the upstream package, the sha256 of each file before these
+patches and the patch list; `SHA256SUMS` pins the current files and is checked by
+`tests/policy-lint.test.mjs`, which also fuzzes every rule for slow matches.
+
 To refresh the rules, replace the JSON files here (keeping the
 `[{ "id", "pattern", "reason", "flags"? }]` shape) and bump `VERSION` (a plain
 integer). `lib/config-lib.sh` compares it with the installed copy under
