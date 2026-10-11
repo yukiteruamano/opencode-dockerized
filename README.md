@@ -287,7 +287,7 @@ mapping is needed.
 | `~/.config/opencode-dockerized/home/.local/share/opencode/` | `/home/coder/.local/share/opencode/` | read-write | Auth database (API keys, MCP OAuth), logs, sessions, storage |
 | `~/.config/opencode-dockerized/home/.local/state/opencode/` | `/home/coder/.local/state/opencode/` | read-write | Selected model, prompt history, locks |
 | `~/.config/opencode-dockerized/home/.cache/opencode/` | `/home/coder/.cache/opencode/` | read-write | Provider package cache |
-| `~/.npmrc` | `/home/coder/.npmrc` | read-only | NPM config (optional) |
+| `~/.npmrc` | `/home/coder/.npmrc` | read-only | NPM config, **opt-in** with `setting.mount_npmrc=true` (it can hold registry auth tokens) |
 | `~/.claude/{skills,agents,commands,CLAUDE.md}` | `/home/coder/.claude/…` | **read-only** | Claude Code compat: skills and fallback rules (each path only if it exists). The rest of `~/.claude` (login credentials, history, `projects/`) is never mounted |
 | `~/.agents/skills/` | `/home/coder/.agents/skills/` | **read-only** | Agent-compatible skills (`<name>/SKILL.md`) (optional) |
 | `~/.mcp-auth/` | `/home/coder/.mcp-auth/` | **read-write** | MCP OAuth store for `mcp-remote` servers (optional) |

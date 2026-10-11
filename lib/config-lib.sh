@@ -130,6 +130,7 @@ GPG_AUTOSTART_AGENT=true        # Launch the host gpg-agent when its socket is m
 GPG_RELAY=true                  # Relay the agent socket through a normal-fs socket
 GPG_RELAY_SOCKET=""             # Active relay socket for the current session
 DOCKER_SOCKET=false             # Boolean flag: mount the host Docker socket (opt-in, root-equivalent)
+MOUNT_NPMRC=false               # Boolean flag: mount ~/.npmrc read-only (opt-in: it may hold registry tokens)
 NETWORK="host"                  # Container network: host (default, simple) | bridge (more isolated)
 SECURITY_POLICY="balanced"      # Security policy mode: strict | balanced | off
 MEMORY=""                       # Optional container memory limit (docker --memory), e.g. 4g
@@ -1765,8 +1766,9 @@ build_standard_volume_args() {
         VOLUME_ARGS+=(-v "$HOME/.mcp-auth:/home/coder/.mcp-auth:rw")
     fi
 
-    # NPM configuration (optional)
-    if [ -f "$HOME/.npmrc" ]; then
+    # NPM configuration: opt-in, since it can carry registry auth tokens
+    # (setting.mount_npmrc=true).
+    if [ "$MOUNT_NPMRC" = true ] && [ -f "$HOME/.npmrc" ]; then
         VOLUME_ARGS+=(-v "$HOME/.npmrc:/home/coder/.npmrc:ro")
     fi
 
@@ -1935,6 +1937,7 @@ load_config() {
     GPG_AUTOSTART_AGENT=true
     GPG_RELAY=true
     DOCKER_SOCKET=false
+    MOUNT_NPMRC=false
     NETWORK="host"
     SECURITY_POLICY="balanced"
     MEMORY=""
@@ -1959,6 +1962,7 @@ load_config() {
         gpg_autostart_agent) [[ "$value" == "false" ]] && GPG_AUTOSTART_AGENT=false ;;
         gpg_relay) [[ "$value" == "false" ]] && GPG_RELAY=false ;;
         docker_socket) [[ "$value" == "true" ]] && DOCKER_SOCKET=true ;;
+        mount_npmrc) [[ "$value" == "true" ]] && MOUNT_NPMRC=true ;;
         network)
             case "$value" in
             "" | host | bridge) NETWORK="${value:-host}" ;;
@@ -2062,6 +2066,8 @@ save_config() {
         echo "setting.gpg_relay=$GPG_RELAY"
         echo "# Docker socket (opt-in; grants host Docker control — root-equivalent)"
         echo "setting.docker_socket=$DOCKER_SOCKET"
+        echo "# Mount ~/.npmrc read-only (opt-in: it can hold registry auth tokens)"
+        echo "setting.mount_npmrc=$MOUNT_NPMRC"
         echo "# Container network: host (default) | bridge (more isolated)"
         echo "setting.network=$NETWORK"
         echo "# Security policy mode: strict | balanced | off"
@@ -2177,15 +2183,16 @@ build_mount_args() {
             exit 1
         fi
 
-        # Validate mode is either not set or "rw"
+        # No mode means read-only. Otherwise only ro/rw, optionally with an
+        # SELinux label (z/Z), are accepted: a bare label or any other word would
+        # silently make the mount writable.
         if [ "$mode" = "$container_path" ]; then
-            # No mode specified, default to read-only
             DOCKER_MOUNT_ARGS+=(-v "$host_path:$container_path:ro")
-        elif [ "$mode" = "rw" ]; then
-            DOCKER_MOUNT_ARGS+=(-v "$host_path:$container_path:rw")
-        else
-            # Mode was specified, use it as-is
+        elif [[ "$mode" =~ ^(ro|rw)(,[zZ])?$ ]]; then
             DOCKER_MOUNT_ARGS+=(-v "$host_path:$container_path:$mode")
+        else
+            config_error "Invalid mount mode '$mode' for '$mount' (use ro, rw, optionally with ,z or ,Z)"
+            exit 1
         fi
     done
 

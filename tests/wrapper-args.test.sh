@@ -138,6 +138,21 @@ for banned in "$HOME/.claude:" "$HOME/.agents:" "$HOME/.claude/.credentials.json
     fi
 done
 
+# ~/.npmrc can carry registry auth tokens: it is opt-in (setting.mount_npmrc).
+: >"$HOME/.npmrc"
+build_standard_volume_args "$PROJECT" false
+npm_default="$(printf '%s\n' "${VOLUME_ARGS[@]}")"
+if grep -qF -- "$HOME/.npmrc:" <<<"$npm_default"; then
+    fail "~/.npmrc must not be mounted unless setting.mount_npmrc=true"
+fi
+MOUNT_NPMRC=true
+build_standard_volume_args "$PROJECT" false
+npm_on="$(printf '%s\n' "${VOLUME_ARGS[@]}")"
+grep -qx -- "$HOME/.npmrc:/home/coder/.npmrc:ro" <<<"$npm_on" ||
+    fail "setting.mount_npmrc=true must mount ~/.npmrc read-only"
+MOUNT_NPMRC=false
+build_standard_volume_args "$PROJECT" false
+
 # Caches and ~/.gitconfig are NOT mounted anymore (security).
 for banned in "$HOME/.npm" "$HOME/.gitconfig"; do
     if grep -qF -- "$banned:" <<<"$volumes"; then
@@ -237,6 +252,24 @@ CUSTOM_MOUNT_KEYS=(bad)
 if (build_mount_args) >/dev/null 2>&1; then
     fail "a mount with a relative container path must be rejected"
 fi
+CUSTOM_MOUNTS=()
+CUSTOM_MOUNT_KEYS=()
+
+# Only ro/rw (optionally with an SELinux z/Z label) are valid modes. A bare
+# label or any other word would silently make the mount read-write.
+mkdir -p "$TMP/mnt-mode"
+for good in ro rw ro,Z ro,z rw,Z; do
+    CUSTOM_MOUNTS=("$TMP/mnt-mode:/home/coder/mnt-mode:$good")
+    CUSTOM_MOUNT_KEYS=(mnt_mode)
+    (build_mount_args) >/dev/null 2>&1 || fail "mount mode '$good' must be accepted"
+done
+for bad in Z z bogus rw,x ro,rw shared; do
+    CUSTOM_MOUNTS=("$TMP/mnt-mode:/home/coder/mnt-mode:$bad")
+    CUSTOM_MOUNT_KEYS=(mnt_mode)
+    if (build_mount_args) >/dev/null 2>&1; then
+        fail "mount mode '$bad' must be rejected"
+    fi
+done
 CUSTOM_MOUNTS=()
 CUSTOM_MOUNT_KEYS=()
 
@@ -827,6 +860,10 @@ if [ -s "$TMP/load.out" ]; then
 fi
 [ "$MEMORY" = "2g" ] || fail "valid memory must load"
 [ "$CPUS" = "1.5" ] || fail "valid cpus must load"
+[ "$MOUNT_NPMRC" = false ] || fail "mount_npmrc must default to false"
+printf 'setting.mount_npmrc=true\n' >"$CONFIG_FILE"
+load_config >/dev/null 2>&1 || true
+[ "$MOUNT_NPMRC" = true ] || fail "setting.mount_npmrc=true must load"
 printf 'setting.memory=bogus\nsetting.cpus=9x\n' >"$CONFIG_FILE"
 load_config >/dev/null 2>&1 || true
 [ -z "$MEMORY" ] || fail "invalid memory must be ignored"

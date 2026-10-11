@@ -82,6 +82,10 @@
 # Optional container resource limits (docker --memory / --cpus). Empty = no limit.
 # setting.memory=4g   (swap is pinned to the same value, so the limit is real)
 # setting.cpus=2
+# Mount ~/.npmrc read-only (needed for private registries). Off by default: the file
+# can hold registry auth tokens, and a mounted copy is readable by the agent.
+# setting.mount_npmrc=true
+#
 # Max processes in the container (docker --pids-limit); default 4096 stops fork bombs.
 # setting.pids_limit=4096
 
@@ -105,7 +109,8 @@
 # ============================================
 # Syntax: mount.<name>=<host_path>:<container_path>[:<mode>]
 #
-# Mounts are read-only by default. Append :rw for read-write access.
+# Mounts are read-only by default. Append :rw for read-write access. Valid modes
+# are ro and rw, optionally with an SELinux label (ro,Z); anything else is refused.
 # Skills (~/.claude/{skills,agents,commands,CLAUDE.md}, ~/.agents/skills) are
 # mounted read-only automatically; no mount.* entry is needed for them.
 #
