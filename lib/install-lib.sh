@@ -7,23 +7,103 @@
 #
 # NOTE: Do not use "set -e" here — this is a library file sourced by callers.
 
-# Ensure the <install>/bin PATH export exists in an rc file.
-# Returns 0 when added, 1 when already present, 2 on error.
+# Record a failed install step: it is reported on stderr and makes
+# run_install_main exit non-zero at the end instead of "Install complete!".
+# Usage: install_fail <message>
+INSTALL_FAILED=false
+install_fail() {
+    echo "$1" >&2
+    INSTALL_FAILED=true
+}
+
+# PATH export for a bin dir, $HOME-relative when possible so the rc keeps
+# working if HOME is mounted elsewhere. $HOME/$PATH stay literal in the line.
+# Usage: path_export_line <bin_dir>
+path_export_line() {
+    local bin_dir="$1"
+    case "$bin_dir" in
+    "$HOME"/*) bin_dir="\$HOME/${bin_dir#"$HOME"/}" ;;
+    esac
+    printf 'export PATH="%s:$PATH"\n' "$bin_dir"
+}
+
+# Ensure the PATH export for THIS checkout's bin/ exists in an rc file, inside a
+# delimited block so it can be rewritten when the checkout moves and never
+# duplicates. Legacy installs (marker comment + the default-path export line)
+# are migrated into the block; any other line mentioning opencode-dockerized/bin
+# is the user's own and is left alone. The previous rc is kept as a timestamped
+# backup; the rc is rewritten in place (dotfile symlinks keep working).
+# Returns 0 when changed, 1 when already present, 2 on error.
 # Usage: ensure_path_in_rc <rcfile>
 ensure_path_in_rc() {
-    local rc_file="$1"
-    # Single quotes are intentional: $HOME/$PATH must stay unexpanded in the rc line.
+    local rc_file="$1" root path_line current tmp
+    local begin="# >>> opencode-dockerized >>>" end="# <<< opencode-dockerized <<<"
+    local legacy_marker="# Added by opencode-dockerized install"
+    # Single quotes are intentional: the legacy line is matched literally.
     # shellcheck disable=SC2016
-    local path_line='export PATH="$HOME/.local/share/opencode-dockerized/bin:$PATH"'
+    local legacy_line='export PATH="$HOME/.local/share/opencode-dockerized/bin:$PATH"'
+    root="$(install_root 2>/dev/null || true)"
+    [ -n "$root" ] || return 2
+    path_line="$(path_export_line "$root/bin")"
     [ -f "$rc_file" ] || : >"$rc_file" 2>/dev/null || return 2
-    if grep -qF -- 'opencode-dockerized/bin' "$rc_file" 2>/dev/null; then
+
+    if grep -qxF -- "$begin" "$rc_file" 2>/dev/null; then
+        current=$(awk -v b="$begin" -v e="$end" '$0==b{f=1;next} $0==e{f=0} f' "$rc_file")
+        [ "$current" = "$path_line" ] && return 1
+    elif ! grep -qxF -- "$legacy_line" "$rc_file" 2>/dev/null &&
+        grep -qF -- 'opencode-dockerized/bin' "$rc_file" 2>/dev/null; then
         return 1
     fi
+
+    [ -w "$rc_file" ] || return 2
+    tmp=$(mktemp "$rc_file.tmp.XXXXXX" 2>/dev/null) || return 2
+    awk -v b="$begin" -v e="$end" -v lm="$legacy_marker" -v ll="$legacy_line" '
+        $0==b {skip=1; next}
+        skip && $0==e {skip=0; next}
+        skip {next}
+        $0==lm || $0==ll {next}
+        {print}' "$rc_file" >"$tmp" || {
+        rm -f "$tmp"
+        return 2
+    }
     {
         echo ""
-        echo "# Added by opencode-dockerized install"
+        echo "$begin"
         echo "$path_line"
-    } >>"$rc_file" || return 2
+        echo "$end"
+    } >>"$tmp" || {
+        rm -f "$tmp"
+        return 2
+    }
+    if [ -s "$rc_file" ]; then
+        cp -p "$rc_file" "$rc_file.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || {
+            rm -f "$tmp"
+            return 2
+        }
+        prune_backups "$rc_file" 3
+    fi
+    cat "$tmp" >"$rc_file" 2>/dev/null || {
+        rm -f "$tmp"
+        return 2
+    }
+    rm -f "$tmp"
+    return 0
+}
+
+# Add the PATH block to an rc file and say what happened.
+# Returns 1 on error (also recorded with install_fail).
+# Usage: report_path_in_rc <rcfile>
+report_path_in_rc() {
+    local rc_file="$1" status=0
+    ensure_path_in_rc "$rc_file" || status=$?
+    case "$status" in
+    0) echo "Added opencode-dockerized/bin to PATH in $rc_file" ;;
+    1) ;;
+    *)
+        install_fail "Could not update PATH in $rc_file"
+        return 1
+        ;;
+    esac
     return 0
 }
 
@@ -174,9 +254,7 @@ ensure_global_command() {
     local rc
     for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
         [ -f "$rc" ] || continue
-        if ensure_path_in_rc "$rc"; then
-            echo "Added opencode-dockerized/bin to PATH in $rc"
-        fi
+        report_path_in_rc "$rc" || ok=false
     done
     if command -v opencode-dockerized >/dev/null 2>&1; then
         echo "Command on PATH: $(command -v opencode-dockerized)"
@@ -197,7 +275,10 @@ _install_bash_completion() {
             echo ""
             echo "# OpenCode Dockerized completion"
             echo "$completion_line"
-        } >>"$bash_rc"
+        } >>"$bash_rc" || {
+            install_fail "Could not update ~/.bashrc with the bash completion"
+            return 1
+        }
         echo "Added bash completion to ~/.bashrc"
         echo "  Run: source ~/.bashrc"
     fi
@@ -214,7 +295,10 @@ _install_zsh_completion() {
             echo ""
             echo "# OpenCode Dockerized completion"
             echo "$completion_line"
-        } >>"$zsh_rc"
+        } >>"$zsh_rc" || {
+            install_fail "Could not update ~/.zshrc with the zsh completion"
+            return 1
+        }
         echo "Added zsh completion to ~/.zshrc"
         echo "  Run: source ~/.zshrc"
     fi
@@ -225,7 +309,7 @@ _install_bash_aliases() {
     local rc=0
     ensure_aliases_in_rc "$HOME/.bashrc" || rc=$?
     if [ "$rc" -eq 2 ]; then
-        echo "Could not update aliases in ~/.bashrc"
+        install_fail "Could not update aliases in ~/.bashrc"
     elif [ "$rc" -eq 0 ]; then
         echo "Added aliases to ~/.bashrc"
         echo "  Run: source ~/.bashrc"
@@ -239,7 +323,7 @@ _install_zsh_aliases() {
     local rc=0
     ensure_aliases_in_rc "$HOME/.zshrc" || rc=$?
     if [ "$rc" -eq 2 ]; then
-        echo "Could not update aliases in ~/.zshrc"
+        install_fail "Could not update aliases in ~/.zshrc"
     elif [ "$rc" -eq 0 ]; then
         echo "Added aliases to ~/.zshrc"
         echo "  Run: source ~/.zshrc"
@@ -284,6 +368,7 @@ ensure_git_upstream() {
 run_install_main() {
     SETUP_YES=false
     SETUP_ONLY="config,completions,aliases,global"
+    INSTALL_FAILED=false
     while [ $# -gt 0 ]; do
         case "$1" in
         --yes) SETUP_YES=true ;;
@@ -363,7 +448,7 @@ run_install_main() {
     # shellcheck disable=SC2016
     [ -f "$OCODE_HOME/.config/opencode/opencode.json" ] || echo '{"$schema": "https://opencode.ai/config.json"}' >"$OCODE_HOME/.config/opencode/opencode.json" 2>/dev/null || true
     [ -f "$OCODE_HOME/.config/opencode/cli.json" ] || echo '{}' >"$OCODE_HOME/.config/opencode/cli.json" 2>/dev/null || true
-    ensure_opencode_dockerized_config
+    ensure_opencode_dockerized_config || install_fail "The security layer could not be installed (see above)."
 
     if wants_section config; then
         if [ "$SETUP_YES" = true ]; then
@@ -546,9 +631,7 @@ run_install_main() {
             local rc
             for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
                 [ -f "$rc" ] || continue
-                if ensure_path_in_rc "$rc"; then
-                    echo "Added opencode-dockerized/bin to PATH in $rc"
-                fi
+                report_path_in_rc "$rc" || true
             done
         else
             echo "Put this checkout's bin/ on PATH so 'opencode-dockerized' works anywhere."
@@ -568,8 +651,7 @@ run_install_main() {
                 local added_to_rc=false rc_file
                 for rc_file in "$HOME/.zshrc" "$HOME/.bashrc"; do
                     [ -f "$rc_file" ] || continue
-                    if ensure_path_in_rc "$rc_file"; then
-                        echo "Added opencode-dockerized/bin to PATH in $rc_file"
+                    if report_path_in_rc "$rc_file"; then
                         added_to_rc=true
                     fi
                 done
@@ -577,7 +659,7 @@ run_install_main() {
                     echo "  Restart your shell or run: source ~/.bashrc (or ~/.zshrc)"
                 else
                     echo "  Add this to your shell rc file:"
-                    echo "    $OCODE_BIN_PATH_LINE"
+                    echo "    $(path_export_line "$REPO_ROOT/bin")"
                 fi
                 echo ""
                 echo "  You can now run 'opencode-dockerized' from any directory:"
@@ -608,7 +690,14 @@ run_install_main() {
                 build_answer="${build_answer:-y}"
             fi
             if [[ "$build_answer" =~ ^[Yy]$ ]]; then
-                docker build -t "opencode-dockerized:latest" "$REPO_ROOT" || echo "Build failed; run 'opencode-dockerized build' later"
+                # Reuse the wrapper's build_image (one place knows the image name and
+                # build flags); fall back to a plain build when sourced elsewhere.
+                if declare -F build_image >/dev/null 2>&1; then
+                    build_image || install_fail "Image build failed; run 'opencode-dockerized build' to retry."
+                else
+                    docker build -t "opencode-dockerized:latest" "$REPO_ROOT" ||
+                        install_fail "Image build failed; run 'opencode-dockerized build' to retry."
+                fi
             else
                 echo "Skipping build (run 'opencode-dockerized build' later)."
             fi
@@ -616,6 +705,10 @@ run_install_main() {
     fi
 
     echo ""
+    if [ "$INSTALL_FAILED" = true ]; then
+        echo "Install finished with errors (see the messages above); fix them and run 'opencode-dockerized install' again." >&2
+        return 1
+    fi
     echo "Install complete!"
     echo ""
     echo "Next steps:"

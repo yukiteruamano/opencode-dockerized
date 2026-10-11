@@ -23,6 +23,7 @@ export HOME="$TMP/home"
 export CONFIG_DIR="$TMP/cfg"
 export OCODE_HOME="$CONFIG_DIR/home"
 export OPENCODE_DOCKERIZED_ALLOW_CONTAINER_SYNC=1
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid
 export GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
 mkdir -p "$HOME"
