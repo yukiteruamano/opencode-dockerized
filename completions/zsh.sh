@@ -20,6 +20,8 @@ _opencode_dockerized() {
         'upgrade:Full upgrade from GitHub (git pull + sync + image rebuild)'
         'build:Build the Docker image'
         'update:Full upgrade from GitHub (git pull + sync + image rebuild)'
+        'rollback:Restore the previous image and show how to restore the previous code'
+        'uninstall:Show how to remove the install (config is left untouched)'
         'version:Show OpenCode version in the container'
         'config:Show, edit, or print config file path'
         'clean:Remove the Docker image'
@@ -73,10 +75,12 @@ _opencode_dockerized() {
                     _describe -t config_cmds 'config subcommand' config_cmds
                     ;;
                 upgrade|update)
-                    _values 'self-update flag' --check --yes --no-build
+                    _values 'self-update flag' --check --json --yes --no-build
                     ;;
                 install)
-                    _values 'install flag' --yes --only
+                    _arguments \
+                        '--yes[Accept the recommended defaults]' \
+                        '--only[Run only these sections]:sections:_values -s , section config completions aliases global path build'
                     ;;
             esac
             ;;

@@ -933,7 +933,8 @@ Commands:
     upgrade [--check [--json]|--yes|--no-build]  Full upgrade: git pull + sync + image rebuild
     build               Build the Docker image
     update [--check [--json]|--yes|--no-build]   Full upgrade: git pull + sync + image rebuild
-    rollback                            Restore the previous image and show how to restore the previous code
+    rollback            Restore the previous image; show how to restore the previous code
+    uninstall           Show how to remove the install (config is left untouched)
     version             Show wrapper, guard and OpenCode versions
     config [show|edit|path|sync]      Wrapper config (INI)
     config opencode [path|edit]       OpenCode config (opencode.json)
@@ -942,6 +943,8 @@ Commands:
 
 Environment Variables:
     DRY_RUN=true        Print the Docker command without executing it
+    OCD_VERIFY_SIGNATURES=true  Refuse to pull/install an upstream head without a valid signature
+    OCD_SERVER_TIMEOUT=SECS     Seconds to wait for the in-container server (default 120)
 
 Examples:
     $0 run                          # Run in current directory

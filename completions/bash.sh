@@ -8,13 +8,19 @@ _opencode_dockerized() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    opts="run auth models exec mcp plugin stats debug doctor install upgrade build update version config clean help --help -h"
+    opts="run auth models exec mcp plugin stats debug doctor install upgrade build update rollback uninstall version config clean help --help -h"
 
     case "${prev}" in
         run|models)
             # Complete directory paths for run command
             mapfile -t COMPREPLY < <(compgen -d -- "${cur}")
             return 0
+            ;;
+        opencode)
+            if [ "${COMP_WORDS[1]}" = "config" ]; then
+                mapfile -t COMPREPLY < <(compgen -W "path edit" -- "${cur}")
+                return 0
+            fi
             ;;
         config)
             # Complete config subcommands
@@ -41,11 +47,25 @@ _opencode_dockerized() {
             return 0
             ;;
         upgrade|update)
-            mapfile -t COMPREPLY < <(compgen -W "--check --yes --no-build" -- "${cur}")
+            mapfile -t COMPREPLY < <(compgen -W "--check --json --yes --no-build" -- "${cur}")
             return 0
             ;;
         install)
             mapfile -t COMPREPLY < <(compgen -W "--yes --only" -- "${cur}")
+            return 0
+            ;;
+        --only)
+            # Comma-separated sections: complete the last one
+            local done_part="" last="${cur##*,}"
+            [[ "${cur}" == *,* ]] && done_part="${cur%,*},"
+            local -a sections=() candidates
+            local section
+            mapfile -t candidates < <(compgen -W "config completions aliases global path build" -- "${last}")
+            for section in "${candidates[@]}"; do
+                # Skip sections that were already chosen earlier in the list
+                [[ ",${done_part}" == *",${section},"* ]] || sections+=("${done_part}${section}")
+            done
+            COMPREPLY=("${sections[@]}")
             return 0
             ;;
         *)
