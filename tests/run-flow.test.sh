@@ -144,6 +144,10 @@ kill "$live_pid" 2>/dev/null
 [ -d "$RELAYS/live" ] || fail "clean must not remove the relay of a live session"
 [ -d "$RELAYS/fresh" ] || fail "clean must not remove a relay dir that is still being created"
 [ ! -d "$RELAYS/dead" ] || fail "clean must remove the relay dir of a dead session"
+grep -qx 'rmi opencode-dockerized:latest' "$DOCKER_STUB_LOG" || fail "clean must remove the image"
+grep -qx 'rmi opencode-dockerized:previous' "$DOCKER_STUB_LOG" || fail "clean must remove the :previous tag"
+grep -qx 'image prune -f --filter label=dev.opencode-dockerized.dockerfile-sha256' "$DOCKER_STUB_LOG" ||
+    fail "clean must prune only this project's dangling layers (label-scoped)"
 
 # 3d. doctor reports the host side as well as the container.
 run_wrapper doctor
@@ -161,18 +165,75 @@ EXPECT_UNEXPECTED=true run_wrapper doctor
 [ "$RC" -ne 0 ] || fail "doctor must fail on an inline secret in the OpenCode config"
 printf '{"$schema": "https://opencode.ai/config.json"}\n' >"$OCODE_HOME/.config/opencode/opencode.json"
 
-# 4. An unexpected failure under set -e names the command and line.
+# 3e. Image builds carry provenance, are tagged by OpenCode version and commit,
+# honour an image-name override, and `build --latest` resolves the newest release.
+cat >"$TMP/bin/docker" <<'STUB'
+#!/bin/bash
+echo "$*" >>"$DOCKER_STUB_LOG"
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$3" = --format ]; then
+    case "$4" in
+    *opencode-version*) echo "${DOCKER_STUB_VERSION_LABEL:-}" ;;
+    *dockerfile-sha256*) echo "${DOCKER_STUB_SHA_LABEL:-}" ;;
+    esac
+fi
+exit 0
+STUB
+export DOCKER_STUB_VERSION_LABEL=2.0.26
+want_dsha="$(sha256sum "$REPO_DIR/Dockerfile" | cut -d' ' -f1)"
+run_wrapper build
+[ "$RC" -eq 0 ] || fail "build must succeed against the stub (got $RC)"
+build_line="$(grep -m1 '^build ' "$DOCKER_STUB_LOG")"
+grep -qE -- '--build-arg GIT_SHA=[0-9a-f]{40}' <<<"$build_line" || fail "build must pass GIT_SHA"
+grep -q -- "--build-arg DOCKERFILE_SHA256=$want_dsha" <<<"$build_line" || fail "build must pass the Dockerfile hash"
+grep -qE -- '--build-arg BUILD_DATE=[0-9]{4}-' <<<"$build_line" || fail "build must pass BUILD_DATE"
+grep -q -- ' -t opencode-dockerized:latest ' <<<"$build_line" || fail "build must tag the default image name"
+grep -qx 'tag opencode-dockerized:latest opencode-dockerized:2.0.26' "$DOCKER_STUB_LOG" ||
+    fail "the image must also be tagged with its OpenCode version"
+grep -qE '^tag opencode-dockerized:latest opencode-dockerized:[0-9a-f]{7,}$' "$DOCKER_STUB_LOG" ||
+    fail "the image must also be tagged with the wrapper commit"
+if grep -q -- 'OPENCODE_VERSION=' <<<"$build_line"; then
+    fail "a plain build must keep the Dockerfile's pinned OpenCode version"
+fi
+
+OCD_IMAGE=my/img:dev run_wrapper build
+grep -q -- ' -t my/img:dev ' "$DOCKER_STUB_LOG" || fail "OCD_IMAGE must override the image name"
+grep -qx 'tag my/img:dev my/img:2.0.26' "$DOCKER_STUB_LOG" || fail "version tag must follow the overridden name"
+
+mkdir -p "$TMP/reg/@opencode/cli"
+printf '{"name":"@opencode/cli","version":"2.9.9","dependencies":{"x":{"version":"1.0.0"}}}' >"$TMP/reg/@opencode/cli/latest"
+OCD_NPM_REGISTRY="file://$TMP/reg" run_wrapper build --latest
+grep -q -- '--build-arg OPENCODE_VERSION=2.9.9' "$DOCKER_STUB_LOG" || fail "build --latest must pass the newest registry version"
+OCD_NPM_REGISTRY="file://$TMP/nothing" run_wrapper build --latest
+[ "$RC" -eq 0 ] || fail "an unreachable registry must not fail the build (got $RC)"
+grep -q 'Could not resolve the newest OpenCode release' <<<"$OUT" || fail "an unreachable registry must be reported"
+if grep -q -- 'OPENCODE_VERSION=' "$DOCKER_STUB_LOG"; then fail "no version arg when the registry is unreachable"; fi
+
+# 3f. A stale image (different Dockerfile hash, or no labels) is reported.
+DOCKER_STUB_SHA_LABEL="$want_dsha" run_wrapper run "$TMP/proj"
+if grep -qE 'different Dockerfile|no build labels' <<<"$OUT"; then fail "an up-to-date image must not warn"; fi
+DOCKER_STUB_SHA_LABEL="deadbeef" run_wrapper run "$TMP/proj"
+grep -q 'different Dockerfile' <<<"$OUT" || fail "a Dockerfile hash mismatch must warn"
+DOCKER_STUB_SHA_LABEL="" run_wrapper run "$TMP/proj"
+grep -q 'no build labels' <<<"$OUT" || fail "an image without labels must be reported"
+unset DOCKER_STUB_VERSION_LABEL
+
+# 4. A failing build says so explicitly...
 cat >"$TMP/bin/docker" <<'STUB'
 #!/bin/bash
 echo "$*" >>"$DOCKER_STUB_LOG"
 case "$1" in
-build) exit 1 ;;
+build | run) exit 1 ;;
 *) exit 0 ;;
 esac
 STUB
-EXPECT_UNEXPECTED=true run_wrapper build
+run_wrapper build
 [ "$RC" -ne 0 ] || fail "a failing docker build must fail the wrapper"
+grep -q 'Docker image build failed' <<<"$OUT" || fail "a failed build must be reported"
+
+# ...and a failure nothing handles is named (command and line) instead of silent.
+EXPECT_UNEXPECTED=true run_wrapper version
+[ "$RC" -ne 0 ] || fail "an unhandled docker failure must fail the wrapper"
 grep -q 'unexpected failure' <<<"$OUT" || fail "an unexpected failure must be explained, not silent"
-grep -q 'docker build' <<<"$OUT" || fail "the failing command must be named"
+grep -q 'docker run' <<<"$OUT" || fail "the failing command must be named"
 
 echo "run-flow test passed"

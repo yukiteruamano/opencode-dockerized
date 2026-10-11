@@ -63,6 +63,34 @@ run "$WRAPPER" upgrade --check
 [ "$RC" -eq 0 ] || fail "upgrade --check on an up-to-date checkout must exit 0 (got $RC)"
 grep -q 'Already up to date' <<<"$OUT" || fail "up-to-date message missing"
 
+# 1b. --check also compares the OpenCode release baked into the image with the
+# newest one on the registry (only when the image carries its version label).
+CHECK_STUB="$TMP/check-stub"
+mkdir -p "$CHECK_STUB" "$TMP/reg/@opencode/cli"
+cat >"$CHECK_STUB/docker" <<'STUB'
+#!/bin/bash
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$3" = --format ]; then
+    echo "${DOCKER_STUB_VERSION_LABEL:-}"
+fi
+exit 0
+STUB
+chmod +x "$CHECK_STUB/docker"
+printf '{"name":"@opencode/cli","version":"2.9.9"}' >"$TMP/reg/@opencode/cli/latest"
+check_with() {
+    PATH="$CHECK_STUB:$PATH" OCD_NPM_REGISTRY="file://$TMP/reg" DOCKER_STUB_VERSION_LABEL="$1" run "$WRAPPER" upgrade --check "${@:2}"
+}
+check_with 2.0.26
+[ "$RC" -eq 10 ] || fail "an older OpenCode in the image must report an update (exit 10, got $RC)"
+grep -q 'OpenCode: image 2.0.26, newest 2.9.9' <<<"$OUT" || fail "the OpenCode versions must be shown"
+check_with 2.9.9
+[ "$RC" -eq 0 ] || fail "an image on the newest OpenCode must be current (got $RC)"
+check_with 2.0.26 --json
+[ "$RC" -eq 10 ] || fail "--json must keep exit code 10 for an OpenCode update (got $RC)"
+grep -q '"opencode":{"image":"2.0.26","latest":"2.9.9","status":"available"}' <<<"$OUT" ||
+    fail "--json must carry the OpenCode comparison (got: $OUT)"
+check_with ""
+[ "$RC" -eq 0 ] || fail "an image without a version label must not trigger an OpenCode update (got $RC)"
+
 # 2. Up to date: update --no-build must still sync the security layer and finish.
 run "$WRAPPER" update --no-build
 [ "$RC" -eq 0 ] || fail "update --no-build on an up-to-date checkout must exit 0 (got $RC)"
@@ -141,6 +169,34 @@ run "$WRAPPER" update --no-build
 grep -q 'already running' <<<"$OUT" || fail "mkdir-lock refusal message missing"
 rmdir "$CONFIG_DIR/.lock.d"
 export PATH="$PATH_BACKUP"
+
+# 4g. The rebuild refreshes what a cached build never would: base image (--pull),
+# the weekly package/toolchain layers (APT_REFRESH), the newest OpenCode release,
+# and with --full the whole cache. The previous image is kept as :previous.
+STUB_BIN="$TMP/stub-bin"
+mkdir -p "$STUB_BIN" "$TMP/reg/@opencode/cli"
+export DOCKER_STUB_LOG="$TMP/docker.log"
+cat >"$STUB_BIN/docker" <<'STUB'
+#!/bin/bash
+echo "$*" >>"$DOCKER_STUB_LOG"
+exit 0
+STUB
+chmod +x "$STUB_BIN/docker"
+printf '{"name":"@opencode/cli","version":"2.9.9"}' >"$TMP/reg/@opencode/cli/latest"
+: >"$DOCKER_STUB_LOG"
+PATH="$STUB_BIN:$PATH" OCD_NPM_REGISTRY="file://$TMP/reg" run "$WRAPPER" update --full
+[ "$RC" -eq 0 ] || fail "update --full against a stub docker must succeed (got $RC)"
+build_line="$(grep -m1 '^build ' "$DOCKER_STUB_LOG")"
+for needle in ' --pull ' ' --no-cache ' '--build-arg APT_REFRESH=' '--build-arg OPENCODE_BUILD_TIME=' '--build-arg OPENCODE_VERSION=2.9.9'; do
+    grep -qF -- "$needle" <<<"$build_line" || fail "update --full build line lacks '$needle'"
+done
+grep -qx 'tag opencode-dockerized:latest opencode-dockerized:previous' "$DOCKER_STUB_LOG" ||
+    fail "the previous image must be tagged :previous before rebuilding"
+: >"$DOCKER_STUB_LOG"
+PATH="$STUB_BIN:$PATH" OCD_NPM_REGISTRY="file://$TMP/reg" run "$WRAPPER" update
+build_line="$(grep -m1 '^build ' "$DOCKER_STUB_LOG")"
+if grep -qF -- ' --no-cache ' <<<"$build_line"; then fail "a plain update must keep the Docker cache"; fi
+grep -qF -- ' --pull ' <<<"$build_line" || fail "a plain update must still pull the base image"
 
 # 5. Diverged: refuse, leave the checkout untouched, exit 1.
 push_upstream_commit two

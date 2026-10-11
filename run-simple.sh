@@ -6,7 +6,8 @@
 set -e
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-IMAGE_NAME="opencode-dockerized:latest"
+# Same override as the wrapper (OCD_IMAGE=registry/name:tag).
+IMAGE_NAME="${OCD_IMAGE:-opencode-dockerized:latest}"
 
 # Source the shared config module (provides colors, logging, config functions)
 # shellcheck source=lib/config-lib.sh
@@ -54,7 +55,7 @@ PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd -P)"
 # Build the image if it doesn't exist (the main runner expects it to exist)
 if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
     config_info "Docker image not found, building..."
-    docker build -t "$IMAGE_NAME" "$ROOT"
+    "$ROOT/bin/opencode-dockerized" build
 fi
 
 # Single code path: hand off to the main runner

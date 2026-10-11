@@ -196,6 +196,22 @@ validate_project_dir() {
     return 0
 }
 
+# SHA-256 of a file (sha256sum on Linux, shasum on macOS, openssl as a last
+# resort). Prints nothing and returns 1 when no tool is available.
+# Usage: file_sha256 FILE
+file_sha256() {
+    local out=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        out=$(sha256sum "$1" 2>/dev/null)
+    elif command -v shasum >/dev/null 2>&1; then
+        out=$(shasum -a 256 "$1" 2>/dev/null)
+    elif command -v openssl >/dev/null 2>&1; then
+        out=$(openssl dgst -sha256 -r "$1" 2>/dev/null)
+    fi
+    [ -n "$out" ] || return 1
+    echo "${out%% *}"
+}
+
 # Keep only the newest N timestamped backups (FILE.bak.<stamp>) of a file.
 # Usage: prune_backups FILE [N=3]
 prune_backups() {

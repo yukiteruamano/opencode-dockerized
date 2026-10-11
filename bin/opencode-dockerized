@@ -9,7 +9,10 @@ set -e
 # It is reached via PATH, never via a symlink in ~/.local/bin.
 BIN_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 REPO_ROOT="$(cd "$BIN_DIR/.." && pwd)"
-IMAGE_NAME="opencode-dockerized:latest"
+# Image name, overridable (OCD_IMAGE=registry/name:tag) for custom builds and tests.
+IMAGE_NAME="${OCD_IMAGE:-opencode-dockerized:latest}"
+# npm registry used to resolve the newest OpenCode release (override for mirrors).
+NPM_REGISTRY="${OCD_NPM_REGISTRY:-https://registry.npmjs.org}"
 
 # Wrapper release line, shown by the version command next to the OpenCode
 # version and the bundled security-guard version.
@@ -270,12 +273,90 @@ check_not_root() {
     fi
 }
 
+# Newest OpenCode CLI release published on the npm registry; prints nothing
+# when it cannot be resolved.
+latest_opencode_version() {
+    curl -fsS --max-time 10 "$NPM_REGISTRY/@opencode/cli/latest" 2>/dev/null |
+        grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9][^"]*"' | head -n 1 |
+        sed 's/.*"\([0-9][^"]*\)"$/\1/' || true
+}
+
+# Tag the freshly built image with its OpenCode version and the wrapper commit,
+# so a known-good image can be pinned or restored by name.
+tag_image_versions() {
+    local base="${IMAGE_NAME%:*}" version short_sha
+    version=$(docker image inspect --format '{{ index .Config.Labels "dev.opencode-dockerized.opencode-version" }}' "$IMAGE_NAME" 2>/dev/null || true)
+    case "$version" in
+    "" | "<no value>") ;;
+    *) docker tag "$IMAGE_NAME" "$base:$version" || true ;;
+    esac
+    short_sha=$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD 2>/dev/null || true)
+    [ -z "$short_sha" ] || docker tag "$IMAGE_NAME" "$base:$short_sha" || true
+}
+
+# Build the image with provenance build args (commit, Dockerfile hash, date).
+# Options: --latest resolves the newest OpenCode release first; any other
+# argument goes to `docker build` as-is.
+# Usage: build_image_with_args [--latest] [docker build args...]
+build_image_with_args() {
+    local latest=false version git_sha dockerfile_sha
+    local -a build_args=() extra=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --latest) latest=true ;;
+        *) extra+=("$1") ;;
+        esac
+        shift
+    done
+    if [ "$latest" = true ]; then
+        version=$(latest_opencode_version)
+        if [ -n "$version" ]; then
+            print_info "Newest OpenCode release: $version"
+            build_args+=(--build-arg "OPENCODE_VERSION=$version")
+        else
+            print_warning "Could not resolve the newest OpenCode release; building the pinned default."
+        fi
+    fi
+    git_sha=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)
+    dockerfile_sha=$(file_sha256 "$REPO_ROOT/Dockerfile" || true)
+    build_args+=(
+        --build-arg "GIT_SHA=${git_sha:-unknown}"
+        --build-arg "DOCKERFILE_SHA256=${dockerfile_sha:-unknown}"
+        --build-arg "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    )
+    docker build "${build_args[@]}" ${extra[@]+"${extra[@]}"} -t "$IMAGE_NAME" "$REPO_ROOT" || return 1
+    tag_image_versions
+}
+
+# Warn when the image was not built from this checkout's Dockerfile: the
+# entrypoint and tool versions baked into it may not match the wrapper.
+check_image_drift() {
+    local want have
+    want=$(file_sha256 "$REPO_ROOT/Dockerfile" 2>/dev/null || true)
+    [ -n "$want" ] || return 0
+    have=$(docker image inspect --format '{{ index .Config.Labels "dev.opencode-dockerized.dockerfile-sha256" }}' "$IMAGE_NAME" 2>/dev/null || true)
+    case "$have" in
+    "" | "<no value>")
+        print_warning "The image has no build labels (built by an older wrapper); run '$(basename "$0") build' to refresh it."
+        ;;
+    "$want") ;;
+    *)
+        print_warning "The image was built from a different Dockerfile than this checkout; run '$(basename "$0") build' (or 'update') to rebuild it."
+        ;;
+    esac
+    return 0
+}
+
 # Function to build the Docker image
+# Usage: build_image [--latest]
 build_image() {
     print_info "Building OpenCode Docker image..."
     # Regular build uses Docker layer cache normally.
     # Only the 'update' command passes OPENCODE_BUILD_TIME to bust the npm cache.
-    docker build -t "$IMAGE_NAME" "$REPO_ROOT"
+    if ! build_image_with_args "$@"; then
+        print_error "Docker image build failed (see the Docker output above)."
+        exit 1
+    fi
     print_success "Docker image built successfully"
 }
 
@@ -428,6 +509,7 @@ run_opencode() {
     validate_project_dir "$project_dir" || exit 1
 
     check_image "$IMAGE_NAME" || exit 1
+    check_image_drift
 
     # Generate unique container name based on project directory and random suffix
     local dir_name
@@ -601,7 +683,13 @@ _rebuild_opencode_image() {
         docker tag "$IMAGE_NAME" "$previous_tag" || true
     fi
     print_info "Rebuilding image with latest code..."
-    if ! docker build --build-arg "OPENCODE_BUILD_TIME=$(date +%s)" -t "$IMAGE_NAME" "$REPO_ROOT"; then
+    # --pull refreshes the base image; APT_REFRESH (ISO week) re-runs the system
+    # package layers at most weekly; --full also drops the cache entirely.
+    local -a rebuild_args=(--latest --pull
+        --build-arg "OPENCODE_BUILD_TIME=$(date +%s)"
+        --build-arg "APT_REFRESH=$(date +%G-%V)")
+    [ "${_UP_FULL:-false}" = true ] && rebuild_args+=(--no-cache)
+    if ! build_image_with_args "${rebuild_args[@]}"; then
         print_error "Image build failed; the previous image is kept as $previous_tag. Run '$(basename "$0") rollback' to restore it."
         return 1
     fi
@@ -614,7 +702,7 @@ _rebuild_opencode_image() {
 # Usage: _parse_self_update_flags <command-name> [flags...]
 _parse_self_update_flags() {
     local cmd="$1"; shift
-    _UP_CHECK=false; _UP_YES=false; _UP_NO_BUILD=false; _UP_JSON=false; _UP_POST_PULL=false
+    _UP_CHECK=false; _UP_YES=false; _UP_NO_BUILD=false; _UP_JSON=false; _UP_POST_PULL=false; _UP_FULL=false
     local arg
     for arg in "$@"; do
         case "$arg" in
@@ -622,22 +710,48 @@ _parse_self_update_flags() {
         --yes) _UP_YES=true ;;
         --no-build) _UP_NO_BUILD=true ;;
         --json) _UP_JSON=true ;;
+        --full) _UP_FULL=true ;;
         --post-pull) _UP_POST_PULL=true ;; # internal: set by the re-exec after a pull
         --help | -h)
-            echo "Usage: $0 $cmd [--check [--json]] [--yes] [--no-build]"
+            echo "Usage: $0 $cmd [--check [--json]] [--yes] [--no-build] [--full]"
             echo "  --check    only report whether an update is available"
             echo "  --yes      pull and rebuild without asking"
             echo "  --no-build pull + sync only, skip the image rebuild"
+            echo "  --full     rebuild without the Docker cache (refreshes every layer)"
             echo "Exit codes with --check: 0 up to date, 10 update available, 1 error"
             return 0
             ;;
         *)
-            print_error "Unknown $cmd option: $arg (use --check|--json|--yes|--no-build)"
+            print_error "Unknown $cmd option: $arg (use --check|--json|--yes|--no-build|--full)"
             return 1
             ;;
         esac
     done
     return 0
+}
+
+# Compare the OpenCode release baked into the image (its version label) with
+# the newest one on the registry. Sets _UP_OC_IMAGE/_UP_OC_LATEST/_UP_OC_STATUS
+# (current | available | unknown); the registry is only queried for an image
+# that carries the label. Returns UP_AVAILABLE when a newer release exists.
+_check_opencode_release() {
+    _UP_OC_IMAGE="" _UP_OC_LATEST="" _UP_OC_STATUS=unknown
+    command -v docker >/dev/null 2>&1 || return 0
+    _UP_OC_IMAGE=$(docker image inspect --format '{{ index .Config.Labels "dev.opencode-dockerized.opencode-version" }}' "$IMAGE_NAME" 2>/dev/null || true)
+    case "$_UP_OC_IMAGE" in
+    "" | "<no value>")
+        _UP_OC_IMAGE=""
+        return 0
+        ;;
+    esac
+    _UP_OC_LATEST=$(latest_opencode_version)
+    [ -n "$_UP_OC_LATEST" ] || return 0
+    if [ "$_UP_OC_IMAGE" = "$_UP_OC_LATEST" ]; then
+        _UP_OC_STATUS=current
+        return 0
+    fi
+    _UP_OC_STATUS=available
+    return "$UP_AVAILABLE"
 }
 
 # Machine-readable result of `--check --json`.
@@ -649,8 +763,9 @@ _print_check_json() {
     "$UP_AVAILABLE") status=available ;;
     *) status=error ;;
     esac
-    printf '{"status":"%s","behind":%s,"local":"%s","remote":"%s"}\n' \
-        "$status" "${_UP_BEHIND:-0}" "${_UP_LOCAL_REV:-}" "${_UP_REMOTE_REV:-}"
+    printf '{"status":"%s","behind":%s,"local":"%s","remote":"%s","opencode":{"image":"%s","latest":"%s","status":"%s"}}\n' \
+        "$status" "${_UP_BEHIND:-0}" "${_UP_LOCAL_REV:-}" "${_UP_REMOTE_REV:-}" \
+        "${_UP_OC_IMAGE:-}" "${_UP_OC_LATEST:-}" "${_UP_OC_STATUS:-unknown}"
 }
 
 # Serialise the commands that rewrite the checkout, the image or the config
@@ -711,11 +826,20 @@ full_upgrade() {
     _parse_self_update_flags "$cmd" "$@" || return $?
     local pull_rc=0
     if [ "$_UP_CHECK" = true ]; then
+        local oc_rc=0
         if [ "$_UP_JSON" = true ]; then
             _git_pull_wrapper true true >/dev/null 2>&1 || pull_rc=$?
+            _check_opencode_release || oc_rc=$?
+            # An OpenCode update alone also counts as "update available".
+            [ "$pull_rc" -eq "$UP_CURRENT" ] && [ "$oc_rc" -eq "$UP_AVAILABLE" ] && pull_rc=$UP_AVAILABLE
             _print_check_json "$pull_rc"
         else
             _git_pull_wrapper true true || pull_rc=$?
+            _check_opencode_release || oc_rc=$?
+            if [ "$_UP_OC_STATUS" != unknown ]; then
+                print_info "OpenCode: image $_UP_OC_IMAGE, newest $_UP_OC_LATEST ($_UP_OC_STATUS)"
+            fi
+            [ "$pull_rc" -eq "$UP_CURRENT" ] && [ "$oc_rc" -eq "$UP_AVAILABLE" ] && pull_rc=$UP_AVAILABLE
         fi
         [ "$pull_rc" -eq "$UP_CURRENT" ] && return 0
         return "$pull_rc"
@@ -891,9 +1015,21 @@ clean_image() {
     if relay_dir_ok; then
         rmdir "$GPG_RELAY_DIR" 2>/dev/null || true
     fi
-    if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-        print_info "Removing Docker image '$IMAGE_NAME'..."
-        docker rmi "$IMAGE_NAME"
+    local tag removed=false
+    for tag in "$IMAGE_NAME" "${IMAGE_NAME%:*}:previous"; do
+        if docker image inspect "$tag" >/dev/null 2>&1; then
+            print_info "Removing Docker image '$tag'..."
+            if docker rmi "$tag" >/dev/null; then
+                removed=true
+            else
+                print_warning "Could not remove '$tag' (is a container still using it?)"
+            fi
+        fi
+    done
+    # Layers that earlier builds left dangling. Scoped by this project's label,
+    # so other projects' images are never touched.
+    docker image prune -f --filter "label=dev.opencode-dockerized.dockerfile-sha256" >/dev/null 2>&1 || true
+    if [ "$removed" = true ]; then
         print_success "Docker image removed"
     else
         print_info "Docker image '$IMAGE_NAME' does not exist"
@@ -1066,6 +1202,7 @@ EOF
 show_version() {
     echo "opencode-dockerized $WRAPPER_VERSION (guard $(grep -oE 'OPENCODE_DOCKERIZED_GUARD_VERSION=[0-9]+' "$REPO_ROOT/plugins/security-guard.js" 2>/dev/null | head -1 || echo unknown))"
     check_image "$IMAGE_NAME" || exit 1
+    check_image_drift
     docker run --rm --entrypoint bash "$IMAGE_NAME" -c "opencode --version"
 }
 
@@ -1116,7 +1253,7 @@ main() {
         ;;
     build)
         check_docker
-        build_image
+        build_image "$@"
         ;;
     install)
         acquire_wrapper_lock || exit 1
