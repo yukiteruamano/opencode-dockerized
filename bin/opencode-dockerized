@@ -399,7 +399,13 @@ run_opencode() {
 # only in prompting defaults: `upgrade` asks before pulling when interactive,
 # `update` pulls without asking (preserves its historic one-shot behavior).
 # Both accept [--check] (report only) [--yes] (no prompt) [--no-build].
+# Exit codes: 0 updated, 1 failed/declined, 2 already up to date, 10 update
+# available (--check only). Callers must capture them with `|| rc=$?`:
+# a bare `cmd; rc=$?` never reaches the assignment under `set -e`.
 # Usage: _git_pull_wrapper <yes:true|false> <check_only:true|false>
+UP_FAILED=1
+UP_CURRENT=2
+UP_AVAILABLE=10
 _git_pull_wrapper() {
     local yes="$1" check_only="$2"
     if [ ! -d "$REPO_ROOT/.git" ]; then
@@ -424,7 +430,7 @@ _git_pull_wrapper() {
     base=$(git -C "$REPO_ROOT" merge-base HEAD '@{u}')
     if [ "$local_rev" = "$remote_rev" ]; then
         print_success "Already up to date."
-        return 2
+        return "$UP_CURRENT"
     fi
     if [ "$local_rev" != "$base" ]; then
         print_error "Local checkout diverged from upstream; resolve manually with git (no --force pull attempted)."
@@ -435,7 +441,7 @@ _git_pull_wrapper() {
     n=$(git -C "$REPO_ROOT" rev-list --count HEAD..'@{u}')
     print_info "Update available: $n commit(s) behind upstream."
     if [ "$check_only" = true ]; then
-        return 1
+        return "$UP_AVAILABLE"
     fi
     if [ "$yes" != true ] && [ -t 0 ]; then
         local ans
@@ -481,6 +487,7 @@ _parse_self_update_flags() {
             echo "  --check    only report whether an update is available"
             echo "  --yes      pull and rebuild without asking"
             echo "  --no-build pull + sync only, skip the image rebuild"
+            echo "Exit codes with --check: 0 up to date, 10 update available, 1 error"
             return 0
             ;;
         *)
@@ -497,31 +504,30 @@ _parse_self_update_flags() {
 full_upgrade() {
     local cmd="$1"; shift
     _parse_self_update_flags "$cmd" "$@" || return $?
-    if [ "$_UP_CHECK" = true ]; then
-        _git_pull_wrapper true true
-        local check_rc=$?
-        if [ "$check_rc" -eq 2 ]; then
-            return 0
-        fi
-        return 1
-    fi
     local pull_rc=0
+    if [ "$_UP_CHECK" = true ]; then
+        _git_pull_wrapper true true || pull_rc=$?
+        [ "$pull_rc" -eq "$UP_CURRENT" ] && return 0
+        return "$pull_rc"
+    fi
     # `update` never prompts (historic one-shot); `upgrade` prompts when tty.
     if [ "$cmd" = "update" ]; then
-        _git_pull_wrapper true false; pull_rc=$?
+        _git_pull_wrapper true false || pull_rc=$?
     else
-        _git_pull_wrapper "$_UP_YES" false; pull_rc=$?
+        _git_pull_wrapper "$_UP_YES" false || pull_rc=$?
     fi
-    if [ "$pull_rc" -eq 1 ]; then
+    # Already up to date still refreshes the security layer and the image.
+    if [ "$pull_rc" -eq "$UP_FAILED" ]; then
         return 1
     fi
     print_success "Refreshing security layer..."
+    local sync_failed=false
     parse_config || true
-    sync_security_layer || true
+    sync_security_layer || sync_failed=true
     if [ "$_UP_NO_BUILD" = true ]; then
         print_info "Skipping image rebuild (--no-build)."
-        print_success "Upgrade complete (code + config synced, image untouched)."
-        return 0
+        _report_upgrade_result "$sync_failed" "code + config synced, image untouched"
+        return $?
     fi
     check_docker || return 1
     if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
@@ -531,7 +537,17 @@ full_upgrade() {
         docker run --rm --entrypoint bash "$IMAGE_NAME" -c "opencode --version" 2>/dev/null || true
     fi
     _rebuild_opencode_image
-    print_success "Upgrade complete (code + config + image)."
+    _report_upgrade_result "$sync_failed" "code + config + image"
+}
+
+# Final upgrade verdict: a failed security-layer sync must not read as success.
+# Usage: _report_upgrade_result <sync_failed:true|false> <summary>
+_report_upgrade_result() {
+    if [ "$1" = true ]; then
+        print_error "UPGRADE INCOMPLETE: the security layer is still stale; run 'config sync' and check the output above."
+        return 1
+    fi
+    print_success "Upgrade complete ($2)."
 }
 
 # Self-update the wrapper checkout from GitHub (Doom-style `doom upgrade`).
