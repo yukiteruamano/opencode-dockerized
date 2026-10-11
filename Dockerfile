@@ -17,7 +17,7 @@ ARG NVM_INSTALL_SHA256=48a0eee9a60e07422dce0eb5774754c83889570ca1ee2566c516acbe8
 ARG NODE_VERSION=24.21.0
 ARG UV_VERSION=0.13.0
 ARG UV_INSTALL_SHA256=283cbef4bdaca819bd896b0dacb8a085c4c05dbc880642aa5001d97bc4db74ba
-ARG PNPM_VERSION=12.10.1
+ARG PNPM_VERSION=12.11.2
 ARG PNPM_INSTALL_SHA256=a5cb30faa96ded2937d60f80041e9d47b5280b224fbdcd9d3b136000a8edabf8
 # OpenCode CLI release. `opencode-dockerized update` resolves the newest release
 # from the npm registry and passes it here; a plain build uses this pin.
