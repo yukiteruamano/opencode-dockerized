@@ -2,7 +2,7 @@
 # rebuilt/moved tag cannot change the image under us. To refresh: resolve the new
 # digest of debian:trixie-slim (docker buildx imagetools inspect) and update it.
 # Note: We only install Docker CLI to use host's Docker daemon via mounted socket
-FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
 
 # Fail fast inside RUN pipelines (curl | sh, | tee, …)
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
