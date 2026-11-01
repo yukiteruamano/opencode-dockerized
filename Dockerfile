@@ -2,7 +2,7 @@
 # rebuilt/moved tag cannot change the image under us. To refresh: resolve the new
 # digest of debian:trixie-slim (docker buildx imagetools inspect) and update it.
 # Note: We only install Docker CLI to use host's Docker daemon via mounted socket
-FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
 
 # Fail fast inside RUN pipelines (curl | sh, | tee, …)
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -14,14 +14,14 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG NVM_VERSION=v0.40.8
 ARG NVM_INSTALL_SHA256=48a0eee9a60e07422dce0eb5774754c83889570ca1ee2566c516acbe8af03a9e
 # Node.js LTS ("Krypton", 24.x) installed through nvm
-ARG NODE_VERSION=24.22.1
-ARG UV_VERSION=0.13.5
-ARG UV_INSTALL_SHA256=1c6e7f025499664633ac2dce43a210800510e9ef0625c52e034a8afdf8bf177a
-ARG PNPM_VERSION=12.15.0
-ARG PNPM_INSTALL_SHA256=a5cb30faa96ded2937d60f80041e9d47b5280b224fbdcd9d3b136000a8edabf8
+ARG NODE_VERSION=24.22.2
+ARG UV_VERSION=0.13.6
+ARG UV_INSTALL_SHA256=f7a56e7afaec49a3bcbc3ac3cdbe917e7c6ce30e0d815308a12e531aa5ef23b7
+ARG PNPM_VERSION=12.16.1
+ARG PNPM_INSTALL_SHA256=53d3ad6ef67d49d6951f3326bd3180e5c504c8f695bcdf73bb61ec7a4d4c9407
 # OpenCode CLI release. `opencode-dockerized update` resolves the newest release
 # from the npm registry and passes it here; a plain build uses this pin.
-ARG OPENCODE_VERSION=2.1.3
+ARG OPENCODE_VERSION=2.2.5
 # Docker CLI packages from Docker's apt repository (versions exist for amd64 and
 # arm64 alike) and the fingerprint the repository key must have.
 ARG DOCKER_CLI_VERSION=5:29.9.2-1~debian.13~trixie
@@ -113,18 +113,18 @@ RUN curl -fsSL "https://astral.sh/uv/${UV_VERSION}/install.sh" -o /tmp/uv-instal
     sh /tmp/uv-install.sh && \
     rm -f /tmp/uv-install.sh
 
-# Install pnpm via the official standalone installer (native binary, no Node needed)
-# The script installs to $PNPM_HOME (default: ~/.local/share/pnpm) and appends a
-# PATH snippet to ~/.bashrc; we wire PATH via ENV below so it works non-interactively.
-# PNPM_VERSION pins the installed release (override with --build-arg PNPM_VERSION=x.y.z).
-# SHELL/ENV must be set explicitly in Docker builds (documented by pnpm.io) because
-# the installer cannot infer the shell and otherwise fails with ERR_PNPM_UNKNOWN_SHELL.
+# Install pnpm via the official standalone installer (native binary, no Node needed).
+# The installer resolves PNPM_VERSION (an exact version, a major or a dist-tag) from
+# the npm registry, verifies the release archive against its npm integrity and
+# signature, and unpacks it into $PNPM_HOME (default: ~/.local/share/pnpm). It edits
+# the shell config through `pnpm setup`, so SHELL is passed for its detection; PATH is
+# wired via ENV below, so pnpm resolves non-interactively either way.
 # See: https://pnpm.io/installation (sections "POSIX systems", "In a Docker container",
 # "Installing a specific version")
 ENV PNPM_HOME="/home/coder/.local/share/pnpm"
 RUN curl -fsSL https://get.pnpm.io/install.sh -o /tmp/pnpm-install.sh && \
     echo "${PNPM_INSTALL_SHA256}  /tmp/pnpm-install.sh" | sha256sum -c - && \
-    env PNPM_VERSION="${PNPM_VERSION}" ENV="$HOME/.bashrc" SHELL="$(which bash)" sh /tmp/pnpm-install.sh && \
+    env PNPM_VERSION="${PNPM_VERSION}" SHELL="$(which bash)" sh /tmp/pnpm-install.sh && \
     rm -f /tmp/pnpm-install.sh && \
     "$PNPM_HOME/bin/pnpm" --version
 
