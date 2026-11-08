@@ -46,6 +46,11 @@ export function makeProject() {
   writeFileSync(join(OUTSIDE, ".env"), "API_KEY=leak\n");
   symlinkSync(join(OUTSIDE, ".env"), join(PROJECT, "link-to-env"));
   symlinkSync(OUTSIDE, join(PROJECT, "link-out"));
+  // A dangling link: its target does not exist yet, so only a write would
+  // create it (outside the project).
+  symlinkSync(join(OUTSIDE, "created-later.txt"), join(PROJECT, "dangling-out"));
+  mkdirSync(join(PROJECT, ".git/hooks"), { recursive: true });
+  mkdirSync(join(PROJECT, ".git/modules/sub/hooks"), { recursive: true });
   return { root, PROJECT, OUTSIDE };
 }
 

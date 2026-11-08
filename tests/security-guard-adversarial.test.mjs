@@ -135,6 +135,133 @@ const denyAll = [
   ["webfetch", "gopher://example.com/x"],
   ["webfetch", "http://169.254.169.254/latest/meta-data/"],
   ["webfetch", "http://metadata.google.internal/computeMetadata/v1/"],
+
+  // --- guard v21 (2026-11 audit) ---
+  // A1: git deferred host execution. Hooks/config at any depth, the per-worktree
+  // config and the `.git` file itself, through the write tool and the shell.
+  ["write", join(PROJECT, ".git/modules/sub/hooks/post-checkout")],
+  ["write", join(PROJECT, ".git/modules/sub/config")],
+  ["write", join(PROJECT, ".git/config.worktree")],
+  ["write", join(PROJECT, ".git")],
+  ["edit", ".git/modules/sub/hooks/pre-commit"],
+  ["bash", "echo x > .git/modules/sub/hooks/pre-commit"],
+  ["bash", "echo x >> .git/config"],
+  ["bash", "printf x >.git/config.worktree"],
+  ["bash", "tee -a .git/config"],
+  ["bash", "sed -i 's/a/b/' .git/config"],
+  ["bash", "cp pre-commit .git/hooks"],
+  ["bash", "cp -t .git/hooks pre-commit"],
+  ["bash", "mv evil .git/modules/sub/hooks/pre-commit"],
+  ["bash", "install -m 755 evil .git/hooks/pre-push"],
+  ["bash", "ln -s ../../evil .git/modules/sub/hooks/post-checkout"],
+  ["bash", "mv g .git"],
+  ["bash", "cd .git/hooks && cat > pre-commit"],
+  ["bash", "python3 -c \"import os; open('.git/hooks/pre-commit','w').write('x')\""],
+  ["bash", "git config core.hooksPath /tmp/opencode/h"],
+  ["bash", "git config --local core.fsmonitor 'touch /tmp/x'"],
+  ["bash", "git config --file .git/config core.sshCommand 'ssh -o ProxyCommand=x'"],
+  ["bash", "git config --global core.pager 'sh -c x'"],
+  ["bash", "git config sequence.editor evil"],
+  ["bash", "git config alias.x '!sh -c id'"],
+  ["bash", "git config filter.lfs.clean 'evil %f'"],
+  ["bash", "git config diff.bin.textconv evil"],
+  ["bash", "git config --global credential.helper '!evil'"],
+  ["bash", "git config include.path /tmp/opencode/evil.cfg"],
+  ["bash", "git config --edit"],
+  ["bash", "git -c core.editor='sh -c x' commit"],
+  ["bash", "git -c core.hooksPath=/tmp/opencode/h commit -m x"],
+  ["bash", "git clone --template=/tmp/opencode/t https://example.com/x"],
+  ["bash", "git clone -c core.fsmonitor=evil https://example.com/x"],
+  // A2: environment dumps behind flags and transparent wrappers.
+  ["bash", "ps eww"],
+  ["bash", "ps auxeww"],
+  ["bash", "ps -p 1 e"],
+  ["bash", "declare -xp"],
+  ["bash", "typeset -px"],
+  ["bash", "printenv -0"],
+  ["bash", "printenv --null"],
+  ["bash", "compgen -A variable"],
+  ["bash", "compgen -A export"],
+  ["bash", "bash -c 'env'"],
+  ["bash", "sh -c printenv"],
+  ["bash", "bash -lc 'export -p'"],
+  ["bash", "nice env"],
+  ["bash", "nice -n 5 printenv"],
+  ["bash", "timeout 5 env"],
+  ["bash", "stdbuf -o0 env"],
+  ["bash", "echo | xargs env"],
+  ["bash", "watch -n 1 env"],
+  ["bash", "if env; then :; fi"],
+  ["bash", "env FOO=1"],
+  ["bash", "env -i"],
+  ["bash", "python3 -c \"import os,json; print(json.dumps(dict(os.environ)))\""],
+  ["bash", "python3 -c \"import os; print(dict(os.environ))\""],
+  ["bash", "node -e \"console.log(JSON.stringify(process.env))\""],
+  ["bash", "node -e \"process.stdout.write(JSON.stringify(process.env))\""],
+  ["bash", "node -e \"console.log('%o', process.env)\""],
+  // A3: environ below a task directory, or spelled with globs.
+  ["bash", "cat /proc/self/task/1/environ"],
+  ["bash", "cat /proc/1/task/1/environ"],
+  ["bash", "cat /proc/self/env*"],
+  ["bash", "cat /proc/1/*"],
+  ["bash", "cd /proc/self && cat environ"],
+  ["bash", "rg TOKEN /proc/self"],
+  ["read", "/proc/self/task/1/environ"],
+  ["read", "/proc/1/task/1/environ"],
+  // A4: a dangling link and `..` after a link escape the project on write.
+  ["write", join(PROJECT, "dangling-out")],
+  ["edit", "dangling-out"],
+  ["write", PROJECT + "/link-out/../x"], // path.join would fold the `..`
+  ["write", "link-out/../x"],
+  // A5: relative read paths resolve against the project, not the cwd.
+  ["read", "link-to-env"],
+  ["read", "src/../link-to-env"],
+  // A6: every `.env` spelling the shell rules deny.
+  ["read", join(PROJECT, ".env_local")],
+  ["read", join(PROJECT, "prod.env")],
+  ["read", join(PROJECT, ".env-prod")],
+  ["read", join(PROJECT, ".env.production.local")],
+  // A8: constructs that expand to nothing must not split a secret name.
+  ["bash", 'cat .e$""nv'],
+  ["bash", "cat .e$()nv"],
+  ["bash", "cat .e``nv"],
+  ["bash", "cat .e$@nv"],
+  // A9: more metadata endpoints and IPv4-mapped IPv6 spellings.
+  ["bash", "curl http://100.100.100.200/latest/meta-data"],
+  ["bash", "curl http://[fd00:ec2::254]/latest"],
+  ["bash", "curl http://instance-data/latest/meta-data"],
+  ["bash", "curl http://[::ffff:a9fe:a9fe]/"],
+  ["bash", "curl http://[::ffff:169.254.169.254]/"],
+  ["webfetch", "http://[::ffff:169.254.169.254]/latest"],
+  ["webfetch", "http://[::ffff:a9fe:a9fe]/latest"],
+  ["webfetch", "http://[::ffff:6464:64c8]/"],
+  ["webfetch", "http://100.100.100.200/"],
+  ["webfetch", "http://instance-data/latest"],
+  ["webfetch", "http://instance-data.ec2.internal/latest"],
+  ["webfetch", "http://[fd00:ec2::254]/"],
+  ["webfetch", "http://metadata.google.internal./computeMetadata/v1/"],
+  // A11: capitalised and patch-style action names get the same checks.
+  ["Write", "/etc/passwd"],
+  ["EDIT", join(PROJECT, ".git/hooks/pre-commit")],
+  ["Read", "/home/coder/.ssh/id_rsa"],
+  ["apply_patch", "/etc/passwd"],
+  ["apply_patch", "*** Begin Patch\n*** Add File: ../outside.txt\n+x\n*** End Patch"],
+  ["patch", "--- a/.git/hooks/pre-commit\n+++ b/.git/hooks/pre-commit\n@@ -0,0 +1 @@\n+x\n"],
+  ["frobnicate", "/home/coder/.ssh/id_rsa"],
+  ["external_directory", "/home/coder/.ssh/*"],
+  // A12: OpenCode's own credential stores.
+  ["bash", "sqlite3 ~/.local/share/opencode/opencode.db .dump"],
+  ["bash", "cat ~/.local/share/opencode/mcp-auth.json"],
+  ["bash", "cat ~/.local/share/opencode/*"],
+  ["bash", "grep -r token ~/.local/share/opencode"],
+  // A7: `credentials` still counts when it is a path.
+  ["bash", "cat ~/.aws/credentials"],
+  ["bash", "cd ~/.aws && cat credentials"],
+  ["bash", "cp /home/coder/.claude/.credentials.json /tmp/opencode/x"],
+  ["read", "/home/coder/.local/share/opencode/auth.json"],
+  ["read", "/home/coder/.local/share/opencode/mcp-auth.json"],
+  ["read", "/home/coder/.local/share/opencode/opencode.db"],
+  ["read", "/home/coder/.local/share/opencode/opencode.db-wal"],
 ];
 
 // --- Escalated to the user (ask) in every mode ---
@@ -164,6 +291,12 @@ const askAll = [
   ["webfetch", "http://172.16.0.1/"],
   ["webfetch", "http://0.0.0.0:80/"],
   ["webfetch", "http://2130706433/"],
+  // A1 (guard v21): an inline or persisted alias for push skips the literal
+  // `git push` rule, so it needs the same approval.
+  ["bash", "git -c alias.x=push x origin main"],
+  ["bash", "git config alias.p push"],
+  // A9: a mapped IPv6 loopback is still a local target.
+  ["webfetch", "http://[::ffff:7f00:1]/"],
 ];
 
 // --- Allowed in every mode: legitimate development next to the rules above ---
@@ -193,6 +326,42 @@ const allowAll = [
   ["edit", join(PROJECT, ".github/dependabot.yml")],
   ["webfetch", "https://example.com/docs"],
   ["webfetch", "http://example.com:8080/x"],
+  // guard v21: reading git config, everyday git settings and safe pagers.
+  ["bash", "git config --get core.hooksPath"],
+  ["bash", "git config -l"],
+  ["bash", "git config user.email a@b.c"],
+  ["bash", "git config alias.co checkout"],
+  ["bash", "git -c core.pager=cat log"],
+  ["bash", "git -c core.editor=true rebase --continue"],
+  ["bash", "cat .git/config"],
+  ["bash", "echo build >> .git/info/exclude"],
+  ["bash", "echo '* text=auto' > .gitattributes"],
+  ["bash", "touch .gitkeep"],
+  // Plain process listings and single-variable reads stay allowed.
+  ["bash", "ps aux"],
+  ["bash", "ps -ef"],
+  ["bash", "ps -C sleep"],
+  ["bash", "ps -eo pid,comm"],
+  ["bash", "export -f myfunc"],
+  ["bash", "bash -c 'npm test'"],
+  ["bash", "timeout 60 npm test"],
+  ["bash", "cat /proc/self/status"],
+  ["bash", "ls /proc/self/fd"],
+  // Prose and searches that mention power verbs, credentials or key names.
+  ["bash", "git commit -m 'fix graceful shutdown handler'"],
+  ["bash", "rg -n shutdown src/"],
+  ["bash", "echo shutdown"],
+  ["bash", "grep -rn credentials src"],
+  ["bash", "git commit -m 'rotate credentials handling'"],
+  ["bash", "grep -rn api_key src/"],
+  ["bash", "sed -i 's/old_key/new_key/' src/a.ts"],
+  ["bash", "sort --key=2 file.txt"],
+  ["read", join(PROJECT, ".envrc")],
+  ["read", "src/a.ts"],
+  ["write", "src/new.ts"],
+  ["apply_patch", "*** Begin Patch\n*** Update File: src/a.ts\n@@\n-a\n+b\n*** End Patch"],
+  ["patch", "--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-a\n+b\n"],
+  ["Edit", join(PROJECT, "src/new.ts")],
 ];
 
 // --- Everyday development commands: must never be refused or escalated in
@@ -275,6 +444,13 @@ for (const mode of ["balanced", "strict", "off"]) {
     check(`[${mode}] malformed resources ${JSON.stringify(bad)} -> ${effect} (want deny)`, effect === "deny");
   }
   check(`[${mode}] string resource is scanned`, evaluate.raw("bash", "cat .env").effect === "deny");
+  // A11 (guard v21): nested or non-string items are flattened or refused, never
+  // silently dropped.
+  check(`[${mode}] nested resource is scanned`, evaluate.raw("bash", [["cat .env"]]).effect === "deny");
+  check(`[${mode}] nested write path is confined`, evaluate.raw("write", [["/etc/passwd"]]).effect === "deny");
+  check(`[${mode}] null item is malformed`, evaluate.raw("read", [join(PROJECT, "src/a.ts"), null]).effect === "deny");
+  check(`[${mode}] object item is malformed`, evaluate.raw("edit", [{ path: "/etc/passwd" }]).effect === "deny");
+  check(`[${mode}] numeric item is stringified`, evaluate.raw("read", [42]).effect === "allow");
 
   // G2: oversized or adversarial input must neither hang the hook nor pass.
   if (mode !== "off") {

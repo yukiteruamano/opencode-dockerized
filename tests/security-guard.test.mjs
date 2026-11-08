@@ -170,6 +170,21 @@ const alwaysDeny = [
   // Renamed extractor binaries (guard v17, N5).
   ["bash", "./k -y -f deploy_key"],
   ["bash", "./ossl rsa -in server.key -text"],
+  // Git configuration that runs programs on the host later (guard v21).
+  ["bash", "git config core.hooksPath .evil-hooks"],
+  ["bash", "git -c core.fsmonitor=evil status"],
+  ["bash", "echo x > .git/modules/sub/hooks/pre-commit"],
+  ["write", join(PROJECT, ".git/modules/sub/config")],
+  // Wrapped and flag-spelled environment dumps (guard v21).
+  ["bash", "bash -c 'env'"],
+  ["bash", "ps eww"],
+  ["bash", "declare -xp"],
+  ["bash", "cat /proc/self/task/1/environ"],
+  // Metadata endpoints and OpenCode credential stores (guard v21).
+  ["bash", "curl http://100.100.100.200/latest/meta-data"],
+  ["webfetch", "http://[::ffff:a9fe:a9fe]/latest"],
+  ["read", "/home/coder/.local/share/opencode/opencode.db"],
+  ["bash", "sqlite3 ~/.local/share/opencode/opencode.db .dump"],
 ];
 
 // Allowed in every mode.
@@ -224,6 +239,12 @@ const alwaysAllow = [
   // Writes inside the project scratch root stay allowed for both actions.
   ["write", join(PROJECT, "src/new.ts")],
   ["write", "/tmp/opencode/probe.txt"],
+  // Words that only look dangerous in prose or searches (guard v21).
+  ["bash", "git commit -m 'fix graceful shutdown handler'"],
+  ["bash", "grep -rn credentials src"],
+  ["bash", "grep -rn api_key src/"],
+  ["bash", "git config --get core.hooksPath"],
+  ["bash", "ps aux"],
 ];
 
 // Allowed in balanced/off, blocked in strict (upstream behaviour).

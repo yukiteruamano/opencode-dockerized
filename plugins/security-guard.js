@@ -28,8 +28,10 @@
 
 import {
   appendFileSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   statSync,
@@ -37,7 +39,7 @@ import {
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 
-const GUARD_VERSION_MARKER = "OPENCODE_DOCKERIZED_GUARD_VERSION=20";
+const GUARD_VERSION_MARKER = "OPENCODE_DOCKERIZED_GUARD_VERSION=21";
 const GUARD_VERSION = Number(GUARD_VERSION_MARKER.split("=")[1]);
 
 const POLICY_MODE = (
@@ -302,6 +304,11 @@ const expandBraces = (word) => {
 const normalizeShell = (cmd) => {
   let out = cmd
     .replace(/\$'((?:[^'\\]|\\[\s\S])*)'/g, (_m, body) => decodeAnsiC(body))
+    // Constructs that expand to nothing glue the surrounding characters back
+    // together: `.e$""nv`, `.e$()nv`, `.e``nv` and `.e$@nv` are all `.env`.
+    // A locale string `$"…"` is its plain double-quoted body.
+    .replace(/\$"/g, '"')
+    .replace(/\$\(\s*\)|``|\$\{[@*1-9]\}|\$[@*1-9]/g, "")
     .replace(
       /\$\{IFS[^}]*\}|\$IFS(?![A-Za-z0-9_])(?:\$\{?\d\}?|\$\d)?/gi,
       " ",
@@ -335,14 +342,109 @@ const normalizeLexical = (p) => {
   return (absolute ? "/" : "") + stack.join("/");
 };
 
+// Kernel-style resolution of an absolute path: components are walked left to
+// right and every symlink is followed, including a dangling one (whose target
+// does not exist yet but would be created by a write). A `..` after a symlink
+// climbs from the link's real target, not lexically. The missing tail is
+// appended as written. Returns undefined on a symlink loop or a read error so
+// callers can fail closed.
+const physicalPath = (path) => {
+  let pending = path.split("/");
+  let current = "/";
+  let missing = false;
+  let hops = 0;
+  while (pending.length > 0) {
+    const part = pending.shift();
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      current = dirname(current);
+      continue;
+    }
+    const next = current === "/" ? "/" + part : current + "/" + part;
+    if (missing) {
+      current = next;
+      continue;
+    }
+    let stats;
+    try {
+      stats = lstatSync(next);
+    } catch (e) {
+      missing = true;
+      current = next;
+      continue;
+    }
+    if (!stats.isSymbolicLink()) {
+      current = next;
+      continue;
+    }
+    if (++hops > 40) return undefined;
+    let target;
+    try {
+      target = readlinkSync(next);
+    } catch (e) {
+      return undefined;
+    }
+    if (target.startsWith("/")) current = "/";
+    pending = [...target.split("/"), ...pending];
+  }
+  return current;
+};
+
+// Ordered regex parts that must all match, left to right, inside one command
+// segment (no newline, pipe, `;` or `&` between them by default). Equivalent to
+// joining the parts with `[^\n|;&]*`, but linear: each part is searched once
+// from where the previous one ended (lookbehinds still see the whole segment),
+// instead of the quadratic backtracking such a gap causes on a 16 KB command
+// that repeats the first part. `unless` vetoes a segment when it matches the
+// text after the first part.
+const SEGMENT_SEPARATORS = /[\n|;&]/;
+const inSegment = (parts, { flags = "", split = SEGMENT_SEPARATORS, unless } = {}) => {
+  const res = parts.map((p) => new RegExp(typeof p === "string" ? p : p.source, flags + "g"));
+  const veto = unless && new RegExp(typeof unless === "string" ? unless : unless.source, flags);
+  return {
+    test(value) {
+      for (const segment of value.split(split)) {
+        let at = 0;
+        let matched = true;
+        for (const [i, re] of res.entries()) {
+          re.lastIndex = at;
+          const m = re.exec(segment);
+          if (!m) {
+            matched = false;
+            break;
+          }
+          at = m.index + m[0].length;
+          if (i === 0 && veto && veto.test(segment.slice(at))) {
+            matched = false;
+            break;
+          }
+        }
+        if (matched) return true;
+      }
+      return false;
+    },
+  };
+};
+
 // Secret file names/paths referenced from a shell command (any tool).
 // Provider/MCP credentials, SSH keys and other credential stores that need an
 // explicit shell block so the agent cannot read/exfiltrate them via `cat`,
-// `cp`, `curl`, etc.
+// `cp`, `curl`, etc. The bare word `credentials` only counts when it is
+// path-like (`/credentials`, `~/.aws/credentials`, `.credentials*`,
+// `credentials.json`), so searching code or writing commit messages that
+// mention credentials stays allowed.
 const SECRET_PATH_RE = new RegExp(
   [
     String.raw`(^|[\/\s'"=:(])auth\.json([\s'"\/):;,]|$)`,
-    String.raw`(^|[\/\s'"=:(])\.?credentials([\s'"\/.=:;,]|$)`,
+    String.raw`(^|[\/\s'"=:(])mcp-auth\.json([\s'"\/):;,]|$)`,
+    String.raw`(^|[\/\s'"=:(])opencode\.db(?:-wal|-shm|-journal)?([\s'"\/):;,]|$)`,
+    // OpenCode's own data dir as a whole (recursive greps, archives).
+    String.raw`\.local\/share\/opencode\/?([\s'"):;,]|$)`,
+    String.raw`(^|[\/\s'"=:(])\.credentials([\s'"\/.=:;,]|$)`,
+    String.raw`(^|[\s'"=:(])credentials\.json([\s'"\/):;,]|$)`,
+    String.raw`[\/~]credentials([\s'"\/.=:;,)]|$)`,
+    // The AWS config dir itself (`cd ~/.aws && cat credentials`).
+    String.raw`(^|[\/\s'"=:(])\.aws\/?([\s'"):;,]|$)`,
     String.raw`(^|[\/\s'"=:(])\.npmrc([\s'"\/):;,]|$)`,
     String.raw`(^|[\/\s'"=:(])\.netrc([\s'"\/):;,]|$)`,
     String.raw`(^|[\/\s'"=:(])\.pgpass([\s'"\/):;,]|$)`,
@@ -376,8 +478,7 @@ const LEAK_VERB =
   "diff|cmp|xargs|dd";
 
 // Match a leak verb followed (within the same command segment) by a secret path.
-const leakOf = (token) =>
-  new RegExp(`\\b(?:${LEAK_VERB})\\b[^\\n|;&]*${token}`, "i");
+const leakOf = (token) => inSegment([`\\b(?:${LEAK_VERB})\\b`, token], { flags: "i" });
 
 // File-reading/transmitting verbs, excluding search/print-of-pattern tools
 // (grep, sed, awk, …). Used for the bare `*key` heuristic so that grepping for
@@ -386,8 +487,15 @@ const READ_VERB =
   "cat|tac|less|more|head|tail|cp|mv|install|scp|rsync|tar|zip|gzip|bzip2|xz|" +
   "base64|base32|xxd|od|hexdump|strings|dd|python[0-9.]*|node|deno|bun|perl|ruby|php";
 
-const leakReadOf = (token) =>
-  new RegExp(`\\b(?:${READ_VERB})\\b[^\\n|;&]*${token}`, "i");
+const leakReadOf = (token, verbs = READ_VERB) =>
+  inSegment([`\\b(?:${verbs})\\b`, token], { flags: "i" });
+
+// Readers for key-like file names: the plain readers plus the line tools that
+// take file operands only (no pattern argument), so `sort deploy_key` is a
+// leak while `grep -rn api_key src/` and `sed -i 's/old_key/new_key/' f` are
+// searches and edits of ordinary files.
+const KEY_READ_VERB =
+  READ_VERB + "|sort|nl|rev|split|comm|join|paste|pr|fmt|expand|unexpand|fold|csplit|diff|cmp";
 
 // Shell commands that name `*.env` are denied regardless of the program used, so
 // indirect readers the vendored patterns miss are covered: `sort .env`,
@@ -401,57 +509,67 @@ const DENY_SECRET_PATH = [/(^|[\s'"=:(/@,<>\-])\.env(?!\.example\b)/i];
 // Key-like file names not covered by the `.key`/`.pem` extension rule, e.g.
 // `deploy_key`, `prod-key`, `vault_priv`. The `id_*` SSH keys are already in
 // SECRET_PATH_RE; the negative lookahead keeps public `*.pub` files readable.
+// The name must start a word (lookbehind) and not be an option (`--key=2`):
+// the leading boundary also keeps the match linear on long words.
 const KEY_FILE =
-  "(?:[\\w.-]*(?:_key|-key|_priv)|id_(?:rsa|dsa|ecdsa|ed25519|eddsa))(?![A-Za-z0-9])(?!\\.pub\\b)";
+  "(?<![\\w.-])(?!-)(?:[\\w.-]*(?:_key|-key|_priv)|id_(?:rsa|dsa|ecdsa|ed25519|eddsa))(?![A-Za-z0-9])(?!\\.pub\\b)";
 
 // A bare file name ending in `key` (e.g. `mykey`, `deploykey`) is treated as a
 // private key for file-reading verbs. The trailing boundary keeps public
 // artifacts such as `public-keys.d`, `authorized_keys` and `*.pub` readable.
-const BARE_KEY = "(?:[\\w.-]*key)(?![A-Za-z0-9])(?!\\.pub\\b)";
+const BARE_KEY = "(?<![\\w.-])(?!-)(?:[\\w.-]*key)(?![A-Za-z0-9])(?!\\.pub\\b)";
 
 // Key-like tokens shared by the git-plumbing and renamed-extractor rules below:
 // private extensions, extensionless key names and bare `*key`.
 const KEY_TOKEN = `(?:\\.pem\\b(?!\\.pub\\b)|\\.key\\b(?!\\.pub\\b)|${KEY_FILE}|${BARE_KEY})`;
 
+// Cloud metadata endpoints: AWS/GCP/Azure/OpenStack link-local address, the
+// Alibaba address, the AWS IPv6 endpoint, the `instance-data` alias and their
+// IPv4-mapped / NAT64 IPv6 spellings (`::ffff:a9fe:a9fe`).
+const METADATA_HOST_RE =
+  /169\.254\.169\.254|100\.100\.100\.200|\bfd00:0{0,2}ec2(?::0{1,4}){0,5}::?0{0,2}254\b|ffff:(?:0{1,4}:)?(?:a9fe:a9fe|6464:64c8)\b|64:ff9b::(?:a9fe:a9fe|6464:64c8)\b|(?:\/\/|@|\s|^)instance-data(?:\.ec2\.internal)?\.?(?=[:\/\s]|$)|\bmetadata\.google\.internal\b|\b1684301000\b|\b0x646464c8\b/i;
+
 const DENY_BASH = [
   /\bsudo\b/,
   /\brm\s+(-[a-zA-Z]+\s+)*-[a-zA-Z]*[rf][a-zA-Z]*\s+\/(\s|$)/, // rm -rf /
-  /\brm\s+.*\s+\/\s*$/, // rm ... /
+  // rm ... / (the last line ends with a bare slash after an `rm`).
+  {
+    test: (value) => {
+      const last = value.slice(value.lastIndexOf("\n") + 1);
+      const m = /\brm\s/.exec(last);
+      return m !== null && /\s\/\s*$/.test(last.slice(m.index + 3));
+    },
+  },
   // `rm -rf /*` and `/..` traversals (`/tmp/../`, `/tmp/opencode/../../`)
   // resolve to `/` but miss the bare-slash rules. `rm -rf dist/*` (no leading
   // slash) stays allowed. Equivalent spellings (`//`, `~`, `$HOME`, `/usr`) are
   // handled by destructiveTarget() below.
-  /\brm\s+[^\n|;&]*\s\/\*([\s;|&]|$)/,
-  /\brm\s+[^\n|;&]*\/\.\.(\/|$)/,
+  inSegment([/\brm(?=\s)/, /\s\/\*(?=[\s;|&]|$)/]),
+  inSegment([/\brm(?=\s)/, /\/\.\.(?:\/|$)/]),
   /\bmkfs(\.\w+)?\b/,
-  /\bdd\b[^|;&]*\bof=\/(dev\/)?[a-z]/, // dd of=/dev/...
-  /\b(shutdown|reboot|halt|poweroff)\b/,
+  inSegment([/\bdd\b/, /\bof=\/(?:dev\/)?[a-z]/], { split: /[|;&]/ }), // dd of=/dev/...
   /\bchmod\s+(-[a-zA-Z]+\s+)*0?777\s+\/(\s|$)/,
   // chmod traversals/globs and any chown of `/`.
-  /\bchmod\s+[^\n|;&]*\s\/\*([\s;|&]|$)/,
-  /\bchmod\s+[^\n|;&]*\/\.\.(\/|$)/,
-  /\bchown\s+[^\n|;&]*\s\/([\s;|&*]|$)/,
-  /\bchown\s+[^\n|;&]*\/\.\.(\/|$)/,
+  inSegment([/\bchmod(?=\s)/, /\s\/\*(?=[\s;|&]|$)/]),
+  inSegment([/\bchmod(?=\s)/, /\/\.\.(?:\/|$)/]),
+  inSegment([/\bchown(?=\s)/, /\s\/(?=[\s;|&*]|$)/]),
+  inSegment([/\bchown(?=\s)/, /\/\.\.(?:\/|$)/]),
   />\s*\/dev\/(sd|nvme|hd)/,
   // Mode-independent backstops. The vendored patterns cover these in
-  // balanced/strict, but `off` disables them entirely.
-  /\/proc\/[^/\s]*\/environ\b/,
-  /169\.254\.169\.254/,
+  // balanced/strict, but `off` disables them entirely. Any depth below a pid
+  // (`/proc/<pid>/task/<tid>/environ`); globs are handled by procEnviron().
+  /\/proc\/(?:[^\s\/]*\/){1,8}environ\b/,
+  METADATA_HOST_RE,
   // Encoded metadata-IP forms. Decimal, dotted/packed hex and octal all reach
   // the same host; the trailing-dot form is already caught by the literal above.
   /\b2852039166\b|\b0x[aA]9[fF][eE][aA]9[fF][eE]\b|0x[aA]9\s*\.\s*0x[fF][eE]\s*\.\s*0x[aA]9\s*\.\s*0x[fF][eE]\b|\b0251\.0376\.0251\.0376\b|::ffff:(a9fe:a9fe|169\.254\.169\.254)/i,
-  /\bdocker\b[^\n|;&]*-v\s+\/:/,
-  /\bdocker\b[^\n|;&]*--privileged\b/,
+  inSegment([/\bdocker\b/, /-v\s+\/:/]),
+  inSegment([/\bdocker\b/, /--privileged\b/]),
   // Long-form root mounts. `--volume /:/host` and `--mount …,source=/,…` escape
   // like `-v /:/…`; named volumes (`data:/data`) and host subdirectories stay
   // allowed.
-  /\bdocker\b[^\n|;&]*--volume\s+\/:\//,
-  /\bdocker\b[^\n|;&]*--mount\b[^\n|;&]*\bsource\s*=\s*\/([\s,]|$)/,
-  // Hooks run on the host at the next commit, outside the sandbox: refuse
-  // writing into .git/hooks (redirects, tee, and a hooks path as the
-  // destination of cp/mv/install/ln). Reading hooks stays allowed.
-  /(?:>>?|\btee\b|\bsed\s+-i\b|\btruncate\b)[^\n|;&]*\.git\/hooks\//,
-  /\b(?:cp|mv|install|ln)\b[^\n|;&]*\s\S*\.git\/hooks\/\S*\s*(?:$|[;&|])/,
+  inSegment([/\bdocker\b/, /--volume\s+\/:\//]),
+  inSegment([/\bdocker\b/, /--mount\b/, /\bsource\s*=\s*\/(?:[\s,]|$)/]),
   // Secret files: block any command that references them (cat/grep/curl/...),
   // not only the `read` tool. Covers provider/MCP credentials and SSH keys.
   SECRET_PATH_RE,
@@ -462,48 +580,54 @@ const DENY_BASH = [
   // missing) plus input redirection and sourcing, which have no verb.
   leakOf("\\.pem\\b(?!\\.pub\\b)"),
   leakOf("\\.key\\b(?!\\.pub\\b)"),
-  leakOf(KEY_FILE),
+  leakReadOf(KEY_FILE, KEY_READ_VERB),
   leakReadOf(BARE_KEY),
   /(^|[;&|]\s*)(?:source|\.)\s+[^\s'"|;&<>]*\.(?:pem|key)\b(?!\.pub\b)/i,
   /<\s*[^\s'"|;&]*\.(?:pem|key)\b(?!\.pub\b)/i,
   // `openssl` reading a private key (-in/-inkey/-text, or asn1parse). Generation
   // commands (genrsa/genpkey/req/keygen) stay allowed.
-  /\bopenssl\s+(?:rsa|pkey|ec|dsa|pkcs8|pkcs12|asn1parse)\b[^\n|;&]*(?:-inkey\b|-in\b|-text\b)/i,
+  inSegment([/\bopenssl\s+(?:rsa|pkey|ec|dsa|pkcs8|pkcs12|asn1parse)\b/, /(?:-inkey\b|-in\b|-text\b)/], {
+    flags: "i",
+  }),
   // Extract a public key from a private key file. Case-sensitive: `-Y sign`
   // (used by git SSH signing) must stay allowed.
-  /\bssh-keygen\b[^\n|;&]*-y\b[^\n|;&]*-f\b/,
+  inSegment([/\bssh-keygen\b/, /-y\b/, /-f\b/]),
   // git subcommands that print committed content over key material.
   // `show`/`cat-file` use `rev:path` form (so key-named branches stay usable);
   // `log` only dumps with `-p`/`--patch` (`--oneline` is metadata); `diff` dumps
   // unless `--stat`. `git show HEAD:README.md` and `git log --oneline` stay
   // allowed.
-  new RegExp(`\\bgit\\b\\s+(?:show|cat-file)\\b[^\\n|;&]*:[^\\s;|&]*${KEY_TOKEN}`),
-  new RegExp(`\\bgit\\b\\s+grep\\b[^\\n|;&]*${KEY_TOKEN}`),
-  new RegExp(`\\bgit\\b\\s+archive\\b[^\\n|;&]*${KEY_TOKEN}`),
-  new RegExp(`\\bgit\\b\\s+log\\b[^\\n|;&]*(?:-p\\b|--patch\\b)[^\\n|;&]*${KEY_TOKEN}`),
-  new RegExp(`\\bgit\\b\\s+diff\\b(?![^\\n|;&]*--stat\\b)[^\\n|;&]*${KEY_TOKEN}`),
+  inSegment([/\bgit\s+(?:show|cat-file)\b/, `:[^\\s;|&:]*${KEY_TOKEN}`]),
+  inSegment([/\bgit\s+grep\b/, KEY_TOKEN]),
+  inSegment([/\bgit\s+archive\b/, KEY_TOKEN]),
+  inSegment([/\bgit\s+log\b/, /(?:-p\b|--patch\b)/, KEY_TOKEN]),
+  inSegment([/\bgit\s+diff\b/, KEY_TOKEN], { unless: /--stat\b/ }),
   // Renamed extractor binaries (`./k -y -f deploy_key`). Token-gated (a key-like
   // `-f`/`-in` target) so local tools with `-y`/`-f` flags over ordinary files
   // stay allowed. Plain renamed readers without extraction flags remain a
   // documented heuristic residual.
-  new RegExp(
-    `(?:^|[;|&\\s])(?:\\bssh-keygen\\b|[^\\s;|&]+\\/[\\w.-]+)[^\\n|;&]*-y\\b[^\\n|;&]*-f\\b[^\\n|;&]*${KEY_TOKEN}`,
-  ),
-  new RegExp(
-    `(?:^|[;|&\\s])(?:\\bopenssl\\b|[^\\s;|&]+\\/[\\w.-]+)\\s+(?:rsa|pkey|ec|dsa|pkcs8|pkcs12|asn1parse)\\b[^\\n|;&]*(?:-inkey\\b|-in\\b|-text\\b)[^\\n|;&]*${KEY_TOKEN}`,
-    "i",
+  inSegment([/(?:^|[;|&\s])(?:\bssh-keygen\b|[^\s;|&]+\/[\w.-]+)/, /-y\b/, /-f\b/, KEY_TOKEN]),
+  inSegment(
+    [
+      /(?:^|[;|&\s])(?:\bopenssl\b|[^\s;|&]+\/[\w.-]+)\s+(?:rsa|pkey|ec|dsa|pkcs8|pkcs12|asn1parse)\b/,
+      /(?:-inkey\b|-in\b|-text\b)/,
+      KEY_TOKEN,
+    ],
+    { flags: "i" },
   ),
   // GnuPG private material and secret-key export (defense in depth; the private
   // keys are never copied into the container anyway).
   /\bprivate-keys-v1\.d\b/,
-  /\bgpg\b[^\n|;&]*--export-secret(-keys|-subkeys)?\b/i,
+  inSegment([/\bgpg\b/, /--export-secret(?:-keys|-subkeys)?\b/], { flags: "i" }),
   // Bare environment dumps (no arguments or assignments): `env`, `printenv`,
   // `set`, `export`, `declare` and `typeset` alone print the whole
   // environment, including provider keys from the env file. With arguments or
   // assignments (`printenv PATH`, `env FOO=1 cmd`, `set -e`, `export FOO=1`,
   // `declare -A map`) they stay allowed. The verb may sit behind wrapper words
   // (`command`, `exec`, `time`, `busybox`, a leading backslash or an absolute
-  // path), inside a subshell or a command substitution.
+  // path), inside a subshell or a command substitution. envDump() below covers
+  // the remaining wrappers (`bash -c`, `nice`, `timeout`, `xargs`, …) and flag
+  // spellings (`declare -xp`, `printenv -0`, `ps eww`, `compgen -A variable`).
   /(^|[;|&(`\n]|\$\()\s*(?:(?:command|exec|builtin|nohup|time)\s+)*\\?(?:\/(?:[\w.-]+\/)*)?(?:busybox\s+)?\b(env|printenv|set|export|declare|typeset)\b\s*([;|&)`\n]|$)/i,
   // `env` with only NUL/unset switches still prints the environment.
   /(^|[;|&(`\n]|\$\()\s*(?:\/(?:[\w.-]+\/)*)?env\s+(?:-0|--null|-u\s*\w+|--unset=\w+)(?:\s+(?:-0|--null|-u\s*\w+|--unset=\w+))*\s*([;|&)`\n]|$)/i,
@@ -521,37 +645,412 @@ const DENY_BASH = [
   // allowed; `printenv SECRET`, `printenv OPENCODE_API_KEY`, `printenv *_TOKEN`,
   // etc. are denied in every mode. `echo $VAR` expansion stays allowed by
   // design (blocking it would break ordinary scripting; see BALANCED_EXCLUDED_IDS).
-  /\bprintenv\b\s+[^\n|;&]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTH|API[_-]?KEY)\b/i,
+  inSegment([/\bprintenv\b/, /(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTH|API[_-]?KEY)\b/], {
+    flags: "i",
+  }),
   // Full environment dumps via interpreters. Bulk reads
   // (`console.log(process.env)`, `print(os.environ)`, `puts ENV`,
-  // `print_r($_ENV)`) are denied in every mode; scoped member access
-  // (`process.env.PATH`, `os.environ.get("X")`, `ENV["X"]`, `$ENV{X}`)
+  // `print_r($_ENV)`), including copies wrapped in a serializer or container
+  // (`JSON.stringify(process.env)`, `print(dict(os.environ))`,
+  // `json.dumps({**os.environ})`), are denied in every mode; scoped member
+  // access (`process.env.PATH`, `os.environ.get("X")`, `ENV["X"]`, `$ENV{X}`)
   // stays allowed for normal config reads. Staged copies (`x =
   // {...process.env}` printed later) remain a documented residual.
   /\bconsole\s*\.\s*(?:log|dir|debug|info)\s*\(\s*process\s*\.\s*env\s*\)/,
-  /\bnode\b[^\n|;&]*-(?:p\b|print\b)[^\n|;&]*\bprocess\s*\.\s*env\b(?!\s*(\.\s*[A-Za-z_$][\w$]*|\[\s*["']))/,
+  inSegment([/\bnode\b/, /-(?:p\b|print\b)/, /\bprocess\s*\.\s*env\b(?!\s*(?:\.\s*[A-Za-z_$][\w$]*|\[|\?\.))/]),
+  /\b(?:console\s*\.\s*\w+|JSON\s*\.\s*stringify|(?:util\s*\.\s*)?inspect|process\s*\.\s*std(?:out|err)\s*\.\s*write)\s*\(\s*(?:[^(),\n]{0,120},\s*)?(?:[\w.]+\s*\(\s*){0,3}(?:\{\s*)?(?:\.\.\.\s*)?process\s*\.\s*env\b(?!\s*(?:\.\s*[A-Za-z_$]|\?\.|\[))/,
   /\bprint\s*\(\s*os\s*\.\s*environ(?:\s*\.\s*(?:copy|items|keys|values)\s*\(\s*\))?\s*\)/,
   /\bpprint\s*\(\s*os\s*\.\s*environ\s*\)/,
+  /\b(?:p?print|json\s*\.\s*dumps?|repr|str|(?:sys\s*\.\s*)?std(?:out|err)\s*\.\s*write|yaml\s*\.\s*(?:safe_)?dump)\s*\(\s*(?:[^(),\n]{0,120},\s*)?(?:[\w.]+\s*\(\s*){0,3}(?:\{\s*)?(?:\*{1,2}\s*)?os\s*\.\s*environ\b(?!\s*(?:\[|\.\s*(?:get|setdefault|pop|__getitem__)\s*\())/,
   /\bputs\s+ENV\b(?!\s*(\[|\.\s*(?:fetch|key\?|slice|dig|values_at)\s*\())|\bp\s+ENV\b(?!\s*(\[|\.\s*(?:fetch|key\?|slice|dig|values_at)\s*\())|\bENV\s*\.\s*(?:inspect|to_h|to_hash)\b/,
-  /(?:\bprint\b|\bsay\b|\bwarn\b|\bprintf\b)[^\n;&]*%ENV\b/,
+  inSegment([/(?:\bprint\b|\bsay\b|\bwarn\b|\bprintf\b)/, /%ENV\b/], { split: /[\n;&]/ }),
   /(?:\bprint_r\b|\bvar_dump\b|\bvar_export\b)\s*\(\s*(?:getenv\s*\(\s*\)|\$_ENV\b(?!\s*\[)|\$_SERVER\b(?!\s*\[))/,
   /\bconsole\s*\.\s*(?:log|dir)\s*\(\s*Deno\s*\.\s*env\s*\.\s*toObject\s*\(\s*\)\s*\)/,
   // Forwarded SSH agent is a signing oracle: forbid manipulating the host agent
   // (delete/lock identities, or remove a specific one with -e). Signing and
   // listing stay allowed.
-  /\bssh-add\b[^\n|;&]*-[DdxXe]\b/,
+  inSegment([/\bssh-add\b/, /-[DdxXe]\b/]),
   // Do not let the container stop or reconfigure the host gpg-agent.
-  /\bgpgconf\b[^\n|;&]*--(?:kill|reload)\b/i,
+  inSegment([/\bgpgconf\b/, /--(?:kill|reload)\b/], { flags: "i" }),
 ];
 
 // `git push` / `git reset --hard` behind option words or wrappers
 // (`git -C . push`, `command git push`, `env git push`) miss the literal-prefix
-// permission rule, so they are escalated to the user here.
-const GIT_OPTION = String.raw`(?:\s+(?:-[A-Za-z]\s+\S+|--[\w-]+(?:=\S+)?|-\S+))*`;
+// permission rule, so they are escalated to the user here. At most eight
+// option words (each with an optional value) keep the match linear.
+const GIT_OPTION = String.raw`(?:\s+-\S+(?:\s+(?!-)\S+)?){0,8}`;
 const GIT_ASK = [
   new RegExp(String.raw`\bgit\b${GIT_OPTION}\s+push\b`),
-  new RegExp(String.raw`\bgit\b${GIT_OPTION}\s+reset\b[^\n|;&]*--hard\b`),
+  inSegment([new RegExp(String.raw`\bgit\b${GIT_OPTION}\s+reset\b`), /--hard\b/]),
 ];
+
+// --- Simple-command analysis ------------------------------------------------
+// The checks below look at what actually runs: the normalized command is cut
+// into simple commands (separators, subshells, substitutions) and transparent
+// wrappers are peeled off, so `bash -c 'env'`, `nice env`, `timeout 5 env`,
+// `xargs env` and `if env; then` all reach the same verdict as `env`.
+
+const PREFIX_WORDS = new Set(["!", "{", "}", "then", "do", "else", "elif", "if", "while", "until"]);
+// Wrappers that run their operands as a command, with the options that take
+// a separate argument.
+const WRAPPER_OPTIONS = {
+  command: /^-$/,
+  builtin: /^-$/,
+  exec: /^-a$/,
+  nohup: /^-$/,
+  time: /^-[fo]$/,
+  eval: /^-$/,
+  busybox: /^-$/,
+  setsid: /^-$/,
+  unbuffer: /^-$/,
+  nice: /^-n$/,
+  ionice: /^-[cnt]$/,
+  timeout: /^-[sk]$/,
+  stdbuf: /^-[ioe]$/,
+  watch: /^-[nq]$|^--interval$/,
+  xargs: /^-[nIadLPsE]$/,
+  strace: /^-[oepsEuabPI]$/,
+  env: /^-[uCS]$/,
+};
+const SHELL_NAMES = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash"]);
+const REDIRECT_WORD = /^(?:\d*(?:>>?|<<?<?|>&|<&)|&>>?)(.*)$/;
+
+const baseName = (word) => word.replace(/^\\/, "").replace(/^.*\//, "");
+
+// Peel wrappers off one simple command. Returns the words of the command that
+// actually runs, `["env"]` for an `env` that runs nothing (it prints the
+// environment), or [] for a lookup such as `command -v env`.
+const unwrapCommand = (input) => {
+  let words = input;
+  for (let rounds = 0; rounds < 32 && words.length > 0; rounds++) {
+    const head = words[0].replace(/^\\/, "");
+    const verb = baseName(head);
+    if (PREFIX_WORDS.has(head) || /^[A-Za-z_]\w*=/.test(head)) {
+      words = words.slice(1);
+      continue;
+    }
+    if (verb === "command" && words.length > 1 && /^-[a-zA-Z]*[vV]/.test(words[1])) return [];
+    if (Object.hasOwn(WRAPPER_OPTIONS, verb)) {
+      let i = 1;
+      while (i < words.length && /^-./.test(words[i])) {
+        const opt = words[i++];
+        if (opt === "--") break;
+        if (WRAPPER_OPTIONS[verb].test(opt)) i++;
+      }
+      if (verb === "timeout" && i < words.length) i++; // the duration
+      if (verb === "env") {
+        while (i < words.length && /^[A-Za-z_]\w*=/.test(words[i])) i++;
+        if (i >= words.length) return ["env"];
+      }
+      words = words.slice(i);
+      continue;
+    }
+    if (SHELL_NAMES.has(verb)) {
+      // `sh -c 'cmd'`: quotes are gone after normalization, so the command
+      // string is simply the words after the options.
+      let i = 1;
+      let inline = false;
+      while (i < words.length && /^[-+]./.test(words[i])) {
+        const opt = words[i++];
+        if (opt === "--") break;
+        if (/^-[a-zA-Z]*c/.test(opt)) inline = true;
+        if (/^[-+]O$|^[-+]o$/.test(opt)) i++;
+      }
+      if (!inline) return words;
+      words = words.slice(i);
+      continue;
+    }
+    return words;
+  }
+  return words;
+};
+
+// Cut a normalized command into simple commands. Each entry keeps the segment
+// text (for redirections) and the unwrapped words without redirections.
+const simpleCommands = (normalized) => {
+  const out = [];
+  for (const text of normalized.split(/[;&|\n()`]|\$\(/)) {
+    const raw = text.trim().split(/\s+/).filter(Boolean);
+    const words = [];
+    for (let i = 0; i < raw.length; i++) {
+      const r = REDIRECT_WORD.exec(raw[i]);
+      if (r) {
+        if (r[1] === "") i++; // the target is the next word
+        continue;
+      }
+      words.push(raw[i]);
+    }
+    out.push({ text, words: unwrapCommand(words) });
+  }
+  return out;
+};
+
+// `ps` options whose next word is an argument (process names such as `sleep`
+// must not be read as BSD flags).
+const PS_ARG_OPTIONS = new Set([
+  "-C", "-G", "-g", "-o", "-O", "-p", "-q", "-s", "-t", "-u", "-U",
+  "--sort", "--format", "--pid", "--ppid", "--user", "--User", "--group", "--Group",
+  "--sid", "--tty", "--cols", "--columns", "--rows", "--lines", "--width",
+]);
+
+// `ps` with the BSD `e` flag (`ps eww`, `ps auxe`) prints every process's
+// environment. Dash options (`-e`, `-ef`) select processes and stay allowed.
+const psShowsEnvironment = (args) => {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (PS_ARG_OPTIONS.has(a)) {
+      i++;
+      continue;
+    }
+    if (a.startsWith("-")) {
+      if (/^-[A-Za-z]*[CGgoOpqstuU]$/.test(a) && a.length > 2) i++;
+      continue;
+    }
+    if (!/^[A-Za-z]+$/.test(a)) continue;
+    if (a.includes("e")) return true;
+    if (/[oOpUtk]$/.test(a)) i++;
+  }
+  return false;
+};
+
+const isOption = (word) => /^[-+]./.test(word);
+
+// Commands that print the whole environment (or every variable).
+const envDump = (words) => {
+  if (words.length === 0) return false;
+  const verb = baseName(words[0]);
+  const args = words.slice(1);
+  const names = args.filter((a) => !isOption(a));
+  const flags = args.filter(isOption).join(" ");
+  switch (verb) {
+    case "env":
+      return true; // unwrapCommand only returns `env` when it runs nothing
+    case "printenv":
+      return names.length === 0;
+    case "set":
+      return args.length === 0;
+    case "export":
+    case "declare":
+    case "typeset":
+      return names.length === 0 || /(?:^|\s)-[a-zA-Z]*p/.test(flags);
+    case "compgen":
+      return (
+        /(?:^|\s)-[a-zA-Z]*[ev]/.test(flags) ||
+        args.some((a, i) => a === "-A" && /^(?:variable|export)$/.test(args[i + 1] ?? ""))
+      );
+    case "ps":
+      return psShowsEnvironment(args);
+    default:
+      return false;
+  }
+};
+
+// Power management at command position only, so prose such as
+// `git commit -m 'fix graceful shutdown handler'` or `rg shutdown src/` is not
+// mistaken for a reboot.
+const POWER_VERBS = new Set(["shutdown", "reboot", "halt", "poweroff"]);
+const powerCommand = (words) => {
+  if (words.length === 0) return false;
+  const verb = baseName(words[0]);
+  if (POWER_VERBS.has(verb)) return true;
+  if (verb === "systemctl" || verb === "loginctl") {
+    return words.slice(1).some((w) => /^(?:reboot|poweroff|halt|kexec)$/.test(w));
+  }
+  if (verb === "init" || verb === "telinit") return words.slice(1).some((w) => /^[06]$/.test(w));
+  return false;
+};
+
+// --- git configuration that runs commands -----------------------------------
+// Repository config and hooks run on the host the next time the user runs git
+// there, outside the sandbox. Setting any key that names a program is refused
+// in every mode, whether persisted (`git config`, `git clone -c`) or inline
+// (`git -c`); reading (`--get`, `-l`) stays allowed.
+const GIT_EXEC_KEYS = [
+  /^core\.(?:hookspath|fsmonitor|sshcommand|askpass|gitproxy|alternaterefscommand|editor|pager)$/,
+  /^(?:.+\.)?editor$/,
+  /^pager\..+$/,
+  /^filter\..+\.(?:clean|smudge|process)$/,
+  /^diff\.(?:.+\.(?:textconv|command)|external)$/,
+  /^(?:merge|difftool|mergetool)\..+\.(?:driver|cmd)$/,
+  /^credential\.(?:.+\.)?helper$/,
+  /^gpg\.(?:.+\.)?(?:program|defaultkeycommand)$/,
+  /^include\.path$|^includeif\..+\.path$/,
+  /^init\.templatedir$/,
+  /^remote\..+\.(?:uploadpack|receivepack|vcs)$/,
+  /^protocol\.ext\.allow$/,
+  /^uploadpack\.packobjectshook$/,
+  /^sendemail\.(?:.+\.)?(?:smtpserver|tocmd|cccmd|headercmd)$/,
+  /^(?:web\.browser|browser\..+\.(?:cmd|path)|man\..+\.(?:cmd|path))$/,
+];
+// Editors and pagers that cannot smuggle a command (`git -c core.pager=cat log`
+// and `git -c core.editor=true rebase --continue` are everyday idioms).
+const SAFE_EDITOR_PAGER = /^(?:|cat|true|false|:|less|more|vi|vim|nvim|nano|emacs)$/;
+
+// Verdict for setting `key` to `value`: "deny", "ask" or undefined.
+const gitConfigVerdict = (key, value) => {
+  const k = key.toLowerCase();
+  if (/^alias\./.test(k) || /^submodule\..+\.update$/.test(k)) {
+    if (/^\s*!/.test(value)) return "deny";
+    // An alias for push/reset would skip the approval below.
+    if (/^alias\./.test(k) && /^\s*(?:push\b|reset\b.*--hard\b)/.test(value)) return "ask";
+    return undefined;
+  }
+  if (!GIT_EXEC_KEYS.some((re) => re.test(k))) return undefined;
+  if (/(?:^|\.)(?:editor|pager)$|^pager\./.test(k) && SAFE_EDITOR_PAGER.test(value.trim())) {
+    return undefined;
+  }
+  return "deny";
+};
+
+const gitConfigPair = (spec) => {
+  const eq = spec.indexOf("=");
+  return eq < 0 ? gitConfigVerdict(spec, "true") : gitConfigVerdict(spec.slice(0, eq), spec.slice(eq + 1));
+};
+
+const GIT_CONFIG_READ =
+  /^(?:--get(?:-all|-regexp|-urlmatch|-color|-colorbool)?|-l|--list|--unset(?:-all)?|--remove-section|--rename-section|-h|--help)$/;
+const GIT_CONFIG_OPTION_ARG = new Set(["-f", "--file", "--blob", "--type", "--default", "--comment", "--value", "--url"]);
+
+// `git config [options] key value` (and `git config set key value`).
+const gitConfigCommand = (args) => {
+  const positional = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "-e" || a === "--edit") return "deny";
+    if (GIT_CONFIG_READ.test(a)) return undefined;
+    if (GIT_CONFIG_OPTION_ARG.has(a)) {
+      i++;
+      continue;
+    }
+    if (a.startsWith("-")) continue;
+    positional.push(a);
+  }
+  if (/^(?:get|list|unset|rename-section|remove-section)$/.test(positional[0] ?? "")) return undefined;
+  if (positional[0] === "edit") return "deny";
+  if (positional[0] === "set") positional.shift();
+  if (positional.length < 2) return undefined; // a bare key only reads it
+  return gitConfigVerdict(positional[0], positional.slice(1).join(" "));
+};
+
+const GIT_GLOBAL_OPTION_ARG = new Set([
+  "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--list-cmds", "--attr-source",
+]);
+
+const strongest = (verdicts) =>
+  verdicts.includes("deny") ? "deny" : verdicts.includes("ask") ? "ask" : undefined;
+
+// Verdict for one unwrapped git invocation: "deny", "ask" or undefined.
+const gitVerdict = (words) => {
+  if (words.length === 0 || baseName(words[0]) !== "git") return undefined;
+  const verdicts = [];
+  let i = 1;
+  for (; i < words.length && words[i].startsWith("-"); i++) {
+    const opt = words[i];
+    if (opt === "-c") verdicts.push(gitConfigPair(words[++i] ?? ""));
+    else if (opt.startsWith("--config-env")) {
+      // The value comes from an environment variable: assume the worst.
+      const spec = opt.includes("=") ? opt.slice(opt.indexOf("=") + 1) : words[++i] ?? "";
+      verdicts.push(gitConfigVerdict(spec.replace(/=.*$/, ""), "!"));
+    } else if (GIT_GLOBAL_OPTION_ARG.has(opt)) i++;
+  }
+  const sub = words[i];
+  const args = words.slice(i + 1);
+  if (sub === "config") verdicts.push(gitConfigCommand(args));
+  if (/^(?:clone|init|submodule)$/.test(sub ?? "")) {
+    // A template directory copies its hooks into the new repository, and
+    // `clone -c` writes the new repository's config.
+    if (args.some((a) => /^--template(?:=|$)/.test(a))) verdicts.push("deny");
+    for (let j = 0; j < args.length; j++) {
+      if (args[j] === "-c" || args[j] === "--config") verdicts.push(gitConfigPair(args[j + 1] ?? ""));
+      else if (args[j].startsWith("--config=")) verdicts.push(gitConfigPair(args[j].slice(9)));
+    }
+  }
+  if (sub === "push" || (sub === "reset" && args.includes("--hard"))) verdicts.push("ask");
+  return strongest(verdicts);
+};
+
+// A path into git's control files: hooks (any depth, so submodule hooks under
+// `.git/modules/<sub>/hooks/` count), `config`/`config.worktree`, or the `.git`
+// entry itself (a `.git` file redirects the git directory).
+const GIT_CONTROL = String.raw`\.git(?:\/(?:[^\s;|&<>\/]*\/){0,16}(?:hooks|config(?:\.worktree)?)(?![\w.-])|\/?(?![^\s;|&<>)]))`;
+const GIT_CONTROL_RE = new RegExp(GIT_CONTROL, "i");
+// Copy/move destinations anywhere inside `.git` except `.git/info/`.
+const GIT_DIR_TARGET_RE = /(?:^|\/)[^\/]*\.git(?:\/(?!info\/)|$)/i;
+const COPY_VERBS = new Set(["cp", "mv", "install", "ln", "rsync"]);
+const SHELL_GIT_WRITES = [
+  // Redirections into a hook or the config (`>`, `>>`, `>|`, `&>`).
+  new RegExp(String.raw`>\|?\s*[^\s;|&<>]*${GIT_CONTROL}`, "i"),
+  inSegment([/\b(?:tee|truncate|touch)\b/, GIT_CONTROL], { flags: "i" }),
+  inSegment([/\bsed\b/, /\s(?:-[a-zA-Z]*i|--in-place)/, GIT_CONTROL], { flags: "i" }),
+  inSegment([/\bdd\b/, new RegExp(String.raw`\bof=[^\s;|&<>]*${GIT_CONTROL}`)], { flags: "i" }),
+  // Interpreters writing the files (`python -c "open('.git/hooks/x','w')"`):
+  // `;` inside the quoted program does not end the command here.
+  inSegment([/\b(?:python[0-9.]*|node|deno|bun|perl|ruby|php)\b/, GIT_CONTROL], {
+    flags: "i",
+    split: /\n|&&|\|\|/,
+  }),
+];
+
+// Copy/move/link destinations inside `.git` (the last operand or `-t DIR`).
+const copyTarget = (words) => {
+  if (words.length === 0 || !COPY_VERBS.has(baseName(words[0]))) return undefined;
+  const operands = [];
+  for (let i = 1; i < words.length; i++) {
+    const w = words[i];
+    if (w === "-t" || w === "--target-directory") return words[i + 1];
+    if (w.startsWith("--target-directory=")) return w.slice(19);
+    if (/^-t./.test(w)) return w.slice(2);
+    if (!w.startsWith("-")) operands.push(w);
+  }
+  return operands.length >= 2 ? operands[operands.length - 1] : undefined;
+};
+
+const WRITE_VERBS = new Set(["cp", "mv", "install", "ln", "rsync", "tee", "touch", "truncate", "sed", "dd", "chmod"]);
+
+// Shell writes that would plant something git runs later on the host.
+const gitControlWrite = (normalized, commands) => {
+  if (SHELL_GIT_WRITES.some((rule) => rule.test(normalized))) return true;
+  let insideGitDir = false;
+  for (const { text, words } of commands) {
+    const target = copyTarget(words);
+    if (target !== undefined && (GIT_CONTROL_RE.test(target) || GIT_DIR_TARGET_RE.test(target))) return true;
+    if (words.length === 0) continue;
+    const verb = baseName(words[0]);
+    if (verb === "cd" || verb === "pushd") {
+      insideGitDir = words.slice(1).some((w) => /(?:^|\/)[^\/]*\.git(?:\/|$)/i.test(w));
+      continue;
+    }
+    // `cd .git/hooks && cat > pre-commit`: relative writes from inside `.git`.
+    if (insideGitDir && (/>/.test(text) || WRITE_VERBS.has(verb))) return true;
+  }
+  return false;
+};
+
+// `/proc/<pid>/environ` spelled with globs (`/proc/self/env*`,
+// `/proc/*/environ`, `/proc/1/*`), or read relative to a `cd /proc/<pid>`.
+const globMatches = (pattern, name) => {
+  if (!/[*?[]/.test(pattern)) return pattern === name;
+  try {
+    return globToRegExp(pattern).test(name);
+  } catch (e) {
+    return false;
+  }
+};
+const PROC_RECURSIVE = inSegment([
+  /\b(?:rg|grep|egrep|fgrep|ag|ack|tar|zip|rsync|cp)\b/,
+  /(?:^|\s)\/proc\/[^\s\/]+(?:\/task\/[^\s\/]+)?\/?(?=\s|$)/,
+]);
+const procEnviron = (normalized) => {
+  for (const m of normalized.matchAll(/\/proc\/[^\s;|&<>()`'"]*/g)) {
+    const parts = m[0].split("/").filter(Boolean);
+    if (parts.length > 2 && globMatches(parts[parts.length - 1], "environ")) return true;
+  }
+  if (PROC_RECURSIVE.test(normalized)) return true;
+  if (/\b(?:cd|pushd)\s+\/proc\//.test(normalized)) {
+    return normalized.split(/[\s;&|<>()`]+/).some((w) => globMatches(w, "environ"));
+  }
+  return false;
+};
 
 // Dotfile secrets a glob such as `.e*` or `.[e]nv` can expand to. A wildcard
 // first never matches a dotfile in the shell, so only globs that start with a
@@ -569,6 +1068,8 @@ const GLOB_SECRET_NAMES = [
   ".credentials.json",
   ".vault-token",
   "auth.json",
+  "mcp-auth.json",
+  "opencode.db",
   "id_rsa",
   "id_ed25519",
   "id_ecdsa",
@@ -598,13 +1099,20 @@ const globToRegExp = (glob) => {
 
 const LEAK_VERB_RE = new RegExp(`\\b(?:${LEAK_VERB})\\b`, "i");
 
+// Directories that only hold credentials: any glob inside them is a leak
+// (`cat ~/.local/share/opencode/*` reads auth.json and the session database).
+const SECRET_DIR_RE =
+  /(?:^|\/)(?:\.local\/share\/opencode|\.ssh|\.mcp-auth|\.composio|\.gnupg\/private-keys-v1\.d)$/;
+
 // A leak verb applied to a glob that can expand to a secret dotfile.
 const globLeaks = (normalized) => {
   for (const segment of normalized.split(/[;&|\n]+/)) {
     if (!LEAK_VERB_RE.test(segment)) continue;
     for (const word of segment.split(/\s+/)) {
       if (word.startsWith("-") || !/[*?[]/.test(word)) continue;
-      const base = word.slice(word.lastIndexOf("/") + 1);
+      const slash = word.lastIndexOf("/");
+      const base = word.slice(slash + 1);
+      if (slash > 0 && SECRET_DIR_RE.test(word.slice(0, slash))) return true;
       let re;
       try {
         re = globToRegExp(base);
@@ -768,15 +1276,27 @@ const urlVerdict = (value) => {
     return "deny";
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") return "deny";
-  const host = url.hostname.toLowerCase();
+  let host = url.hostname.toLowerCase().replace(/\.$/, "");
+  // IPv4-mapped, IPv4-compatible and NAT64 IPv6 literals reach the embedded
+  // IPv4 address (the URL parser serializes them as hex: `[::ffff:a9fe:a9fe]`).
+  const mapped = /^\[(?:::ffff:(?:0:)?|::|64:ff9b::)([0-9a-f]{1,4}):([0-9a-f]{1,4})\]$/.exec(host);
+  if (mapped) {
+    const hi = parseInt(mapped[1], 16);
+    const lo = parseInt(mapped[2], 16);
+    host = [hi >> 8, hi & 255, lo >> 8, lo & 255].join(".");
+  }
   if (
     /^169\.254\./.test(host) ||
+    host === "100.100.100.200" ||
     host === "metadata" ||
     host === "metadata.google.internal" ||
-    /^\[fd00:ec2::254\]$/.test(host)
+    host === "instance-data" ||
+    host === "instance-data.ec2.internal" ||
+    /^\[fd00:0{0,2}ec2(?::0{1,4}){0,5}::?0{0,2}254\]$/.test(host)
   ) {
     return "deny";
   }
+  if (mapped) return "ask";
   if (
     host === "localhost" ||
     host.endsWith(".localhost") ||
@@ -796,16 +1316,20 @@ const urlVerdict = (value) => {
 };
 
 // `*.env.example` templates stay readable (the generated config also allows
-// them); a bare `.env`/`.env.local`/... is still denied. Also denies provider/MCP
+// them); `.env`, `.env.local`, `.env_local`, `.env-prod` and `prod.env` are
+// denied, like the shell rules. Also denies provider/MCP and OpenCode
+// credentials (auth.json, mcp-auth.json, the opencode.db session store),
 // credentials, SSH private keys, GnuPG private keys, host git/Composio config
 // that can carry tokens, other credential stores, and key-like file names (no
 // extension). Case-insensitive: bind mounts from macOS/Windows hosts are not.
 const DENY_READ = new RegExp(
   [
-    String.raw`(^|\/)\.env(\.(?!example$)|$)`,
+    String.raw`(^|\/)[^\/]*\.env(?:[._-](?!example$)[^\/]*)?$`,
     String.raw`\.pem$`,
     String.raw`\.key$`,
     String.raw`(^|\/)auth\.json$`,
+    String.raw`(^|\/)mcp-auth\.json$`,
+    String.raw`(^|\/)opencode\.db(?:-wal|-shm|-journal)?$`,
     String.raw`(^|\/)id_(rsa|dsa|ecdsa|ed25519|ed25519_sk|ecdsa_sk|eddsa)$`,
     String.raw`(^|\/)\.ssh(\/|$)`,
     String.raw`(^|\/)\.npmrc$`,
@@ -825,15 +1349,17 @@ const DENY_READ = new RegExp(
     String.raw`(^|\/)\.composio(\/|$)`,
     String.raw`\.(?:p12|pfx|jks|kdbx|keystore)$`,
     String.raw`\.tfstate(?:\.backup)?$`,
-    String.raw`^\/proc\/[^\/]+\/(?:environ|mem|maps)$`,
+    String.raw`^\/proc\/(?:[^\/]+\/)+(?:environ|mem|maps)$`,
     String.raw`(^|\/)[\w.-]*(?:_key|-key|_priv)$`,
     String.raw`(^|\/)[\w.-]*key$`,
   ].join("|"),
   "i",
 );
 
-// Files that run later, outside the sandbox (git hooks, repository config).
-const DENY_WRITE = /(^|\/)\.git\/(hooks\/|config$)/;
+// Files that run later, outside the sandbox: git hooks and repository config at
+// any depth (submodules keep theirs under `.git/modules/<sub>/`), the
+// per-worktree config, and a `.git` file (which redirects the git directory).
+const DENY_WRITE = /(^|\/)[^\/]*\.git\/(?:[^\/]*\/){0,16}(?:hooks\/|config(?:\.worktree)?$)|(^|\/)\.git$/i;
 // Files that configure the agent, CI or the editor deserve a human decision.
 const ASK_WRITE =
   /(^|\/)\.github\/workflows\/|(^|\/)opencode\.jsonc?$|(^|\/)\.mcp\.json$|(^|\/)\.opencode\/|(^|\/)\.envrc$|(^|\/)\.vscode\/|(^|\/)\.husky\//;
@@ -861,20 +1387,73 @@ const KNOWN_ACTIONS = new Set([
   ...READ_ACTIONS,
   "external_directory",
 ]);
+// Action names are matched case-insensitively (`Write`, `EDIT`), and the
+// file-changing tools other runtimes or plugins report get the write checks.
+const ACTION_ALIASES = new Map([
+  ["apply_patch", "edit"],
+  ["applypatch", "edit"],
+  ["patch", "edit"],
+  ["multi_edit", "multiedit"],
+  ["notebookedit", "edit"],
+  ["notebook_edit", "edit"],
+  ["str_replace", "edit"],
+  ["str_replace_editor", "edit"],
+  ["create", "write"],
+  ["view", "read"],
+  ["ls", "list"],
+]);
+const PATCH_ACTIONS = new Set(["apply_patch", "applypatch", "patch"]);
+
+const canonicalAction = (raw) => {
+  if (typeof raw !== "string") return raw;
+  const lower = raw.trim().toLowerCase();
+  return ACTION_ALIASES.get(lower) ?? lower;
+};
+
+// A patch action may carry the patch text instead of paths: check the files
+// it touches (apply_patch `*** Add/Update/Delete File:`/`*** Move to:` and
+// unified-diff `---`/`+++`/`rename to` headers).
+const PATCH_TARGET_RE =
+  /^(?:\*\*\* (?:Add|Update|Delete) File:|\*\*\* Move to:|\+\+\+|---|rename to|copy to)[ \t]+(.+?)[ \t]*$/gm;
+const patchTargets = (value) => {
+  if (!value.includes("\n")) return [value];
+  const out = [];
+  for (const m of value.matchAll(PATCH_TARGET_RE)) {
+    const target = m[1].replace(/\t.*$/, "");
+    if (target === "/dev/null") continue;
+    out.push(/^[ab]\//.test(target) && !target.startsWith("/") ? target.slice(2) : target);
+  }
+  return out;
+};
 
 // Extra writable locations beyond the project root(s). The runtime advertises
 // `/tmp/opencode` as an approved scratch directory, so writes there are allowed
 // in every mode (the project directory itself is the other writable location).
 const EXTRA_WRITE_ROOTS = ["/tmp/opencode"];
 
-// Event resources are normally an array of strings. A bare string is accepted;
-// anything else is malformed and handled fail-closed by the caller.
+// Event resources are normally an array of strings. A bare string is accepted,
+// nested arrays are flattened and scalars stringified, so no item escapes the
+// checks; anything else (objects, null items) is malformed and handled
+// fail-closed by the caller.
 const toResources = (raw) => {
   if (raw === undefined || raw === null) return [];
   if (typeof raw === "string") return [raw];
-  if (Array.isArray(raw)) return raw.filter((r) => typeof r === "string");
-  return undefined;
+  if (!Array.isArray(raw)) return undefined;
+  const out = [];
+  const visit = (item, depth) => {
+    if (typeof item === "string") out.push(item);
+    else if (typeof item === "number" || typeof item === "boolean" || typeof item === "bigint") {
+      out.push(String(item));
+    } else if (Array.isArray(item) && depth < 8) return item.every((x) => visit(x, depth + 1));
+    else return false;
+    return true;
+  };
+  return raw.every((item) => visit(item, 0)) ? out : undefined;
 };
+
+// A resource that names a file (absolute, home-relative or explicitly
+// relative), as opposed to a pattern or free text.
+const PATH_LIKE = /^(?:\/|~\/|\.\.?\/)[^\n]*$/;
 
 const noted = new Set();
 
@@ -895,6 +1474,18 @@ export default {
       ctx.location && ctx.location.project && ctx.location.project.canonical,
       ...EXTRA_WRITE_ROOTS,
     ].filter((r) => typeof r === "string" && r.startsWith("/") && r !== "/");
+    // A root reached through a symlink is compared by its real location too.
+    const realRoots = roots.map((r) => tryRealpath(r)).filter((r) => r !== undefined && r !== "/");
+    const isInsideRoots = (p) =>
+      [...roots, ...realRoots].some((r) => p === r || p.startsWith(r + "/"));
+
+    // Relative tool paths resolve against the project directory (the
+    // runtime's session directory), never against this process's cwd.
+    const toAbsolute = (path) => {
+      if (path.startsWith("/")) return path;
+      if (path === "~" || path.startsWith("~/")) return HOME_DIR + path.slice(1);
+      return (roots[0] ?? "") + "/" + path;
+    };
 
     audit({
       event: "start",
@@ -945,18 +1536,33 @@ export default {
       return false;
     };
 
+    // A read target is refused when its literal, resolved or real path is a
+    // secret.
+    const deniedRead = (path) => {
+      const absolute = toAbsolute(path);
+      const real = tryRealpath(absolute);
+      return (
+        DENY_READ.test(path) ||
+        DENY_READ.test(normalizeLexical(absolute)) ||
+        (real !== undefined && DENY_READ.test(real))
+      );
+    };
+
     const evaluateEvent = (event) => {
       if (event.effect === "deny") return;
-      const action = event.action;
-      const resources = toResources(event.resources);
+      const rawAction = typeof event.action === "string" ? event.action.trim().toLowerCase() : event.action;
+      const action = canonicalAction(event.action);
+      let resources = toResources(event.resources);
       const deny = (rule, message) => decide(event, resources ?? [], "deny", rule, message);
+      const guarded = TOOL_ACTIONS.has(action) || READ_ACTIONS.has(action);
 
       if (resources === undefined) {
-        if (TOOL_ACTIONS.has(action) || READ_ACTIONS.has(action)) {
+        if (guarded) {
           deny("builtin:malformed-event", "Blocked by opencode-dockerized security policy: malformed event");
         }
         return;
       }
+      if (PATCH_ACTIONS.has(rawAction)) resources = resources.flatMap(patchTargets);
       if (!KNOWN_ACTIONS.has(action) && typeof action === "string" && !noted.has(action)) {
         noted.add(action);
         audit({ event: "unmapped-action", action });
@@ -972,7 +1578,7 @@ export default {
       }
 
       const total = resources.reduce((n, r) => n + r.length, 0);
-      if ((TOOL_ACTIONS.has(action) || READ_ACTIONS.has(action)) && total > MAX_SCAN_LENGTH) {
+      if (guarded && total > MAX_SCAN_LENGTH) {
         deny(
           "builtin:too-large",
           `Blocked by opencode-dockerized security policy: value too large to evaluate safely (${total} > ${MAX_SCAN_LENGTH} characters); write large payloads to a file with the write tool.`,
@@ -1016,6 +1622,10 @@ export default {
           deny("builtin:secret-glob", message);
           return;
         }
+        if (procEnviron(normalized)) {
+          deny("builtin:proc-environ", message);
+          return;
+        }
         if (destructiveTarget(normalized)) {
           deny("builtin:destructive-target", message);
           return;
@@ -1024,7 +1634,29 @@ export default {
           deny("builtin:egress", message);
           return;
         }
-        if (event.effect === "allow" && GIT_ASK.some((p) => p.test(normalized))) {
+        const commands = simpleCommands(normalized);
+        if (commands.some(({ words }) => envDump(words))) {
+          deny("builtin:env-dump", message);
+          return;
+        }
+        if (commands.some(({ words }) => powerCommand(words))) {
+          deny("builtin:power", message);
+          return;
+        }
+        if (gitControlWrite(normalized, commands)) {
+          deny("builtin:git-control-write", message);
+          return;
+        }
+        const git = strongest(commands.map(({ words }) => gitVerdict(words)));
+        if (git === "deny") {
+          deny(
+            "builtin:git-config-exec",
+            "Blocked by opencode-dockerized security policy: git configuration that runs a program executes outside the sandbox: " +
+              command.slice(0, 200),
+          );
+          return;
+        }
+        if (event.effect === "allow" && (git === "ask" || GIT_ASK.some((p) => p.test(normalized)))) {
           decide(
             event,
             resources,
@@ -1035,16 +1667,21 @@ export default {
         }
       }
 
-      if (READ_ACTIONS.has(action)) {
-        for (const path of resources) {
-          const real = tryRealpath(path);
-          if (DENY_READ.test(path) || (real !== undefined && DENY_READ.test(real))) {
-            deny(
-              "builtin:deny-read",
-              "Blocked by opencode-dockerized security policy: refusing to read " + path.slice(0, 200),
-            );
-            return;
-          }
+      // Read checks for the read tools, and for any other action that names a
+      // file (unknown or future tools, `external_directory`), so a secret is
+      // never reachable through an action the guard does not know yet.
+      const readTargets = READ_ACTIONS.has(action)
+        ? resources
+        : !shell && !WRITE_ACTIONS.has(action) && action !== "webfetch" && action !== "websearch"
+          ? resources.filter((r) => PATH_LIKE.test(r))
+          : [];
+      for (const path of readTargets) {
+        if (path !== "" && deniedRead(path)) {
+          deny(
+            "builtin:deny-read",
+            "Blocked by opencode-dockerized security policy: refusing to read " + path.slice(0, 200),
+          );
+          return;
         }
       }
 
@@ -1078,24 +1715,15 @@ export default {
           // skipping them. The runtime resolves relative tool paths against the
           // session directory, so `../outside.txt` must not become a
           // confinement bypass that relies solely on the first-layer
-          // `permissions`. Absolute paths get symlink-aware checks;
-          // `/tmp/opencode` stays writable.
-          const absolute = path.startsWith("/")
-            ? normalizeLexical(path)
-            : normalizeLexical(roots[0] + "/" + path);
-          // Resolve symlinks so a link inside the project cannot be used to
-          // write outside it. Check both the literal path and its real target
-          // (and the real parent, since the target may not exist yet).
-          const candidates = [absolute];
-          const real = tryRealpath(absolute);
-          if (real) candidates.push(real);
-          const parent = tryRealpath(absolute.replace(/\/[^/]*$/, "") || "/");
-          if (parent)
-            candidates.push(parent + "/" + absolute.replace(/.*\//, ""));
-          const outside = candidates.some(
-            (c) => !roots.some((r) => c === r || c.startsWith(r + "/")),
-          );
-          if (outside) {
+          // `permissions`. `/tmp/opencode` stays writable.
+          const absolute = toAbsolute(path);
+          // Follow symlinks the way the kernel will on write: every existing
+          // component, a dangling link at the target, and `..` after a link.
+          // Both the lexical path and the physical one must stay inside.
+          const physical = physicalPath(absolute);
+          const candidates = [normalizeLexical(absolute) || "/"];
+          if (physical !== undefined) candidates.push(physical);
+          if (physical === undefined || candidates.some((c) => !isInsideRoots(c))) {
             deny(
               "builtin:write-outside",
               "Blocked by opencode-dockerized security policy: write outside project directory: " +

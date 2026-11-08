@@ -102,6 +102,70 @@ for (const file of FILES.slice(0, 2)) {
   }
 }
 
+// ReDoS budget for the guard's built-in rules (DENY_BASH, DENY_READ,
+// DENY_WRITE, the simple-command and git analyses). In `off` mode the vendored
+// sets are disabled, so the whole hook time is the built-ins' cost; each
+// adversarial value at the scan cap must evaluate within BUILTIN_BUDGET_MS.
+// balanced also runs the vendored sets (budgeted per rule above), so it gets a
+// looser whole-hook budget.
+{
+  const { stageGuard, makeProject, loadGuard, cleanup } = await import("./guard-harness.mjs");
+  const BUILTIN_BUDGET_MS = 200;
+  const HOOK_BUDGET_MS = 1000;
+  const fill = (head, unitText) => head + unitText.repeat(Math.ceil((CAP - head.length) / unitText.length)).slice(0, CAP - head.length);
+  const SHELL_INPUTS = [
+    ...ADVERSARIAL,
+    fill("git show ", ":"),
+    fill("", "cat "),
+    fill("", "cat a-"),
+    fill("node -p ", "x"),
+    fill("cat ", "a"),
+    fill("", "rm "),
+    fill("", "$("),
+    fill("rm -rf ", "/a"),
+    fill("git", " -x"),
+    fill("> ", ".git/"),
+    fill("", "/proc/"),
+    fill("", "print("),
+    fill("", "console.log("),
+    fill("", "{a,b}"),
+    fill("cat ", "[a"),
+    fill("cat .", "*"),
+    fill("", "ssh-keygen -y "),
+    fill("", "./x -y -f "),
+    fill("", "git diff "),
+    fill("", "env "),
+    fill("", "bash -c "),
+    fill("", "git -c a=b "),
+    fill("curl ", "http://a "),
+    fill("", "ps e"),
+    fill("", "::ffff:"),
+  ];
+  const PATH_INPUTS = [
+    "/" + "a/".repeat(Math.floor(CAP / 2) - 4) + "key",
+    "/" + ".git/".repeat(Math.floor(CAP / 5) - 1),
+    "a".repeat(CAP - 10) + ".env",
+    "/proc/" + "1/".repeat(Math.floor(CAP / 2) - 8) + "x",
+  ];
+  const stage = stageGuard();
+  const { root, PROJECT } = makeProject();
+  for (const [mode, budget] of [["off", BUILTIN_BUDGET_MS], ["balanced", HOOK_BUDGET_MS]]) {
+    const evaluate = await loadGuard(stage, PROJECT, mode);
+    const cases = [
+      ...SHELL_INPUTS.map((v) => ["bash", v]),
+      ...PATH_INPUTS.flatMap((v) => [["read", v], ["write", PROJECT + v], ["edit", v]]),
+      ["webfetch", "http://" + "a.".repeat(Math.floor(CAP / 2) - 8) + "com/"],
+    ];
+    for (const [action, value] of cases) {
+      const t0 = process.hrtime.bigint();
+      evaluate.raw(action, [value]);
+      const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+      check(`[${mode}] guard ${action}: ${ms.toFixed(0)} ms on "${value.slice(0, 16)}…" x${value.length} (budget ${budget})`, ms < budget);
+    }
+  }
+  cleanup(stage, root);
+}
+
 // Integrity: SHA256SUMS and SOURCE.json.
 const sums = new Map(
   readFileSync(join(policies, "SHA256SUMS"), "utf8")
