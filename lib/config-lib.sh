@@ -40,11 +40,13 @@ OCODE_BIN_PATH_LINE='export PATH="$HOME/.local/share/opencode-dockerized/bin:$PA
 # COLOR DEFINITIONS (with defaults if not set)
 # ============================================
 
-: "${RED:='\033[0;31m'}"
-: "${GREEN:='\033[0;32m'}"
-: "${YELLOW:='\033[1;33m'}"
-: "${BLUE:='\033[0;34m'}"
-: "${NC:='\033[0m'}"
+# Same form as the callers' definitions (a literal backslash escape that
+# `echo -e` interprets); no quotes inside the default, or they would be stored.
+: "${RED:=\033[0;31m}"
+: "${GREEN:=\033[0;32m}"
+: "${YELLOW:=\033[1;33m}"
+: "${BLUE:=\033[0;34m}"
+: "${NC:=\033[0m}"
 
 # Honor NO_COLOR (https://no-color.org) and dumb terminals: strip ANSI codes.
 # Applied here so every script sourcing this library (wrapper, setup,
@@ -91,6 +93,15 @@ config_error() {
     else
         echo -e "${RED}✗${NC} $1"
     fi
+}
+
+# Command-override test seams (GPG_AGENT_PROBE_CMD, GPG_AGENT_LAUNCH_CMD,
+# GPG_RELAY_CMD) run arbitrary shell code, so a stray variable in the user's
+# environment must never activate them: they are honoured only when the test
+# suites opt in explicitly with OPENCODE_DOCKERIZED_TEST_HOOKS=1.
+# Usage: test_hooks_enabled && ...
+test_hooks_enabled() {
+    [ "${OPENCODE_DOCKERIZED_TEST_HOOKS:-}" = 1 ]
 }
 
 # Resolve an editor: $EDITOR first, then common fallbacks.
@@ -145,53 +156,287 @@ GPG_SOCKET=""                   # Resolved host agent socket (set by build_mount
 # SHARED HELPERS
 # ============================================
 
+# Expand a leading "~" or "~/" to $HOME. Other forms (~user) are returned
+# unchanged, so callers then reject them as relative paths.
+# Usage: path=$(expand_tilde "~/x")
+expand_tilde() {
+    local p="$1"
+    case "$p" in
+    "~") p="$HOME" ;;
+    "~/"*) p="$HOME/${p#"~/"}" ;;
+    esac
+    printf '%s\n' "$p"
+}
+
+# Collapse "//", "/./" and ".." in an absolute path without touching the
+# filesystem (container paths, or the missing tail of a host path).
+# Usage: path=$(normalize_path_lexical "/a//b/../c")
+normalize_path_lexical() {
+    local p="$1" part out=""
+    local -a parts=() stack=()
+    IFS='/' read -r -a parts <<<"$p"
+    for part in "${parts[@]}"; do
+        case "$part" in
+        "" | .) ;;
+        ..) [ "${#stack[@]}" -gt 0 ] && stack=("${stack[@]:0:${#stack[@]}-1}") ;;
+        *) stack+=("$part") ;;
+        esac
+    done
+    for part in "${stack[@]}"; do
+        out="$out/$part"
+    done
+    printf '%s\n' "${out:-/}"
+}
+
+# Canonical absolute form of a host path: symlinks resolved and "//", "/./",
+# ".." collapsed. A missing tail is kept (lexically normalized) below the
+# canonical form of its longest existing ancestor, so a path that does not
+# exist yet still compares correctly. Fails (returns 1) for relative paths.
+# Usage: canon=$(canonical_path "/some/path") || ...
+canonical_path() {
+    local p="$1" out
+    [[ "$p" == /* ]] || return 1
+    if out=$(readlink -m -- "$p" 2>/dev/null) && [ -n "$out" ]; then
+        printf '%s\n' "$out"
+        return 0
+    fi
+    # Portable fallback (no GNU readlink -m, e.g. macOS).
+    local head="$p" tail=""
+    while [ "$head" != "/" ] && [ ! -e "$head" ]; do
+        tail="/$(basename -- "$head")$tail"
+        head=$(dirname -- "$head")
+    done
+    if [ -d "$head" ]; then
+        head=$(cd -P -- "$head" 2>/dev/null && pwd -P) || return 1
+    else
+        head=$(readlink -f -- "$head" 2>/dev/null) || return 1
+    fi
+    normalize_path_lexical "$head$tail"
+}
+
+# True when A and B are the same path or one contains the other (both
+# absolute and normalized).
+# Usage: paths_overlap A B && ...
+paths_overlap() {
+    local a="$1" b="$2"
+    [ "$a" = "$b" ] && return 0
+    { [ "$a" = "/" ] || [ "$b" = "/" ]; } && return 0
+    [[ "$a" == "$b"/* ]] && return 0
+    [[ "$b" == "$a"/* ]] && return 0
+    return 1
+}
+
+# Unix socket path from DOCKER_HOST (unix://...), empty otherwise.
+# Usage: sock=$(docker_host_socket_path)
+docker_host_socket_path() {
+    case "${DOCKER_HOST:-}" in
+    unix://*) printf '%s\n' "${DOCKER_HOST#unix://}" ;;
+    esac
+}
+
+# Decide whether a canonical host path touches a protected host location: it
+# is "/", $HOME itself, or it equals, lies under or contains the SSH/GnuPG
+# homes, the wrapper config (incl. OCODE_HOME), ~/.claude or a Docker socket.
+# Both the literal and the symlink-resolved form of each location are checked.
+# With "project" as second argument, ~/.config as a whole is protected too.
+# Sets PROTECTED_REASON / PROTECTED_HINT and returns 0 when protected.
+# Usage: if host_path_is_protected "$canon" [project]; then ...; fi
+host_path_is_protected() {
+    local canon="$1" scope="${2:-mount}" home_c entry loc reason hint form
+    PROTECTED_REASON=""
+    PROTECTED_HINT=""
+    home_c=$(canonical_path "$HOME" 2>/dev/null) || home_c="$HOME"
+
+    if [ "$canon" = "/" ]; then
+        PROTECTED_REASON="it is the whole host filesystem"
+        PROTECTED_HINT="Use a dedicated subdirectory instead."
+        return 0
+    fi
+    for form in "$(normalize_path_lexical "$HOME")" "$home_c"; do
+        if [ "$canon" = "$form" ]; then
+            PROTECTED_REASON="it is your home directory"
+            PROTECTED_HINT="Use a dedicated subdirectory instead (e.g. ~/projects/my-app)."
+            return 0
+        fi
+    done
+
+    local docker_hint="Use setting.docker_socket=true to share the Docker socket (root-equivalent on the host)."
+    local -a protected=(
+        "$HOME/.ssh|SSH private keys|Use setting.ssh_agent_support=true instead (config/known_hosts are mounted read-only automatically)."
+        "$HOME/.gnupg|GnuPG private keys|Use setting.gpg_agent_support=true instead (only the public keyring and the agent socket are shared)."
+        "$CONFIG_DIR|the wrapper configuration and its security layer|Keep the wrapper config ($CONFIG_DIR) out of the container."
+        "$OCODE_HOME|the OpenCode state tree (config, guard, auth)|Keep the wrapper state ($OCODE_HOME) out of the container."
+        "$HOME/.claude|Claude Code credentials and history|Only skills, agents, commands and CLAUDE.md are shared, automatically and read-only."
+        "/var/run/docker.sock|the Docker socket|$docker_hint"
+        "/run/docker.sock|the Docker socket|$docker_hint"
+    )
+    local dh_sock
+    dh_sock=$(docker_host_socket_path)
+    [ -n "$dh_sock" ] && protected+=("$dh_sock|the Docker socket|$docker_hint")
+    [ "$scope" = project ] && protected+=("$HOME/.config|your host configuration (incl. the wrapper config)|Keep projects outside ~/.config.")
+
+    for entry in "${protected[@]}"; do
+        loc="${entry%%|*}"
+        reason="${entry#*|}"
+        hint="${reason#*|}"
+        reason="${reason%%|*}"
+        [[ "$loc" == /* ]] || continue
+        for form in "$(normalize_path_lexical "$loc")" "$(canonical_path "$loc" 2>/dev/null)"; do
+            [ -n "$form" ] || continue
+            if paths_overlap "$canon" "$form"; then
+                PROTECTED_REASON="it overlaps $form ($reason)"
+                PROTECTED_HINT="$hint"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# Container-side locations a custom mount must never shadow: the read-only
+# OpenCode config tree (guard, policies, rules) and the SSH/GnuPG paths the
+# wrapper itself manages.
+# Usage: container_path_is_protected "/normalized/path" && ...
+container_path_is_protected() {
+    local path="$1" p
+    [ "$path" = "/" ] && return 0
+    for p in /home/coder/.config/opencode /home/coder/.ssh /home/coder/.gnupg /home/coder/.gnupg-agent; do
+        if [ "$path" = "$p" ] || [[ "$path" == "$p"/* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Validate one custom mount (host path, container path, mode) and print the
+# docker -v value ("<canonical host>:<normalized container>:<mode>"). Errors
+# go to stderr and 1 is returned. The host path must be absolute (a leading ~
+# is expanded) and is canonicalized before the protected-path checks, so
+# symlinks, "//", "/./" and ".." cannot slip past them.
+# Usage: spec=$(validate_custom_mount HOST CONTAINER [MODE]) || ...
+validate_custom_mount() {
+    local host_path container_path="$2" mode="${3:-}" canon c_norm
+    host_path=$(expand_tilde "$1")
+
+    if [ -z "$host_path" ] || [[ "$host_path" != /* ]]; then
+        config_error "Invalid mount host path '$1': it must be absolute (or start with ~/)" >&2
+        return 1
+    fi
+    if ! canon=$(canonical_path "$host_path") || [ -z "$canon" ]; then
+        config_error "Could not resolve mount host path '$1'" >&2
+        return 1
+    fi
+    case "$canon" in
+    *:*)
+        config_error "Invalid mount host path '$canon': ':' is not supported" >&2
+        return 1
+        ;;
+    esac
+    if host_path_is_protected "$canon"; then
+        config_error "Refusing to mount $host_path: $PROTECTED_REASON." >&2
+        config_info "$PROTECTED_HINT" >&2
+        return 1
+    fi
+
+    if [ -z "$container_path" ] || [[ "$container_path" != /* ]]; then
+        config_error "Invalid mount '$1:$container_path': container path must be absolute" >&2
+        return 1
+    fi
+    c_norm=$(normalize_path_lexical "$container_path")
+    if container_path_is_protected "$c_norm"; then
+        config_error "Refusing to mount over $c_norm: it would shadow the read-only OpenCode config or the wrapper-managed SSH/GnuPG paths." >&2
+        return 1
+    fi
+
+    # No mode means read-only. Otherwise only ro/rw, optionally with an
+    # SELinux label (z/Z), are accepted: a bare label or any other word would
+    # silently make the mount writable.
+    [ -n "$mode" ] || mode="ro"
+    if [[ ! "$mode" =~ ^(ro|rw)(,[zZ])?$ ]]; then
+        config_error "Invalid mount mode '$mode' (use ro, rw, optionally with ,z or ,Z)" >&2
+        return 1
+    fi
+    printf '%s\n' "$canon:$c_norm:$mode"
+}
+
+# Top-level directories of the container image. A project whose $HOME-relative
+# path starts with one of them (~/bin, ~/usr, ~/tmp, ...) would be mounted over
+# that system directory, so it is placed under /home/coder instead.
+CONTAINER_RESERVED_TOPDIRS=" bin boot dev etc home lib lib32 lib64 libx32 media mnt opt proc root run sbin srv sys tmp usr var "
+
 # Compute the container mount path for a project directory.
-# Strips $HOME prefix so the path is portable across machines/users.
+# Strips $HOME (literal or symlink-resolved) so the path is portable across
+# machines/users. When the stripped path would land on a system directory of
+# the image it is placed under /home/coder instead (always traversable by the
+# container user, independent of the host user name).
 # Example: /home/user/projects/acme/frontend -> /projects/acme/frontend
+#          /home/user/bin/tool               -> /home/coder/bin/tool
 #          /opt/work/myproject                -> /opt/work/myproject (unchanged)
 # Usage: container_path=$(compute_container_path "/home/user/projects/myapp")
 compute_container_path() {
-    local host_path="$1"
+    local host_path="$1" home_c rel="" first
+    home_c=$(cd "$HOME" 2>/dev/null && pwd -P) || home_c="$HOME"
 
     if [[ "$host_path" == "$HOME"/* ]]; then
-        echo "${host_path#"$HOME"}"
+        rel="${host_path#"$HOME"}"
+    elif [[ "$host_path" == "$home_c"/* ]]; then
+        rel="${host_path#"$home_c"}"
     else
         echo "$host_path"
+        return 0
     fi
+
+    first="${rel#/}"
+    first="${first%%/*}"
+    case "$CONTAINER_RESERVED_TOPDIRS" in
+    *" $first "*) echo "/home/coder$rel" ;;
+    *) echo "$rel" ;;
+    esac
 }
 
-# Reject project directories that would expose the host home or the whole
-# filesystem to the sandbox: "/", $HOME, and any ancestor of $HOME (e.g. /home)
-# are refused. Only a project subdirectory is allowed.
+# Reject project directories that would expose sensitive host locations to
+# the sandbox (mounted read-write): "/", $HOME, any ancestor of $HOME, and
+# anything that equals, lies under or contains ~/.ssh, ~/.gnupg, ~/.config,
+# the wrapper config/state, ~/.claude or a Docker socket. Paths are compared
+# in canonical form (and against the symlink-resolved $HOME).
 # Usage: validate_project_dir "/abs/path" || exit 1
 validate_project_dir() {
-    local project_dir="$1"
+    local project_dir="$1" canon home_c
 
     if [ -z "$project_dir" ]; then
         config_error "A project directory is required."
         return 1
     fi
+    if ! canon=$(canonical_path "$project_dir"); then
+        config_error "The project directory must be an absolute path: $project_dir"
+        return 1
+    fi
+    home_c=$(cd "$HOME" 2>/dev/null && pwd -P) || home_c="$HOME"
 
-    if [ "$project_dir" = "/" ]; then
+    if [ "$canon" = "/" ]; then
         config_error "Refusing to run with '/' as the project."
         config_info "Pass a project subdirectory instead (e.g. ~/projects/my-app)."
         return 1
     fi
 
-    if [ "$project_dir" = "$HOME" ]; then
+    if [ "$canon" = "$HOME" ] || [ "$canon" = "$home_c" ]; then
         config_error "Refusing to run with the home directory ($HOME) as the project."
         config_info "Pass a project subdirectory instead."
         return 1
     fi
 
     # Any ancestor of $HOME (e.g. /home) would expose the home through the mount.
-    case "$HOME" in
-    "$project_dir"/*)
+    if [[ "$HOME" == "$canon"/* ]] || [[ "$home_c" == "$canon"/* ]]; then
         config_error "Refusing to run with '$project_dir' as the project: it contains your home directory."
         config_info "Pass a project subdirectory instead (e.g. ~/projects/my-app)."
         return 1
-        ;;
-    esac
+    fi
+
+    if host_path_is_protected "$canon" project; then
+        config_error "Refusing to run with '$project_dir' as the project: $PROTECTED_REASON."
+        config_info "Pass a regular project directory instead (e.g. ~/projects/my-app)."
+        return 1
+    fi
 
     return 0
 }
@@ -212,7 +457,7 @@ file_sha256() {
     echo "${out%% *}"
 }
 
-# Keep only the newest N timestamped backups (FILE.bak.<stamp>) of a file.
+# Keep only the newest N timestamped backups (FILE.bak.<stamp>[.<n>]) of a file.
 # Usage: prune_backups FILE [N=3]
 prune_backups() {
     local file="$1" keep="${2:-3}" old
@@ -240,7 +485,17 @@ install_managed_file() {
         return 0
     fi
     if [ -f "$dest" ] && [ "$keep_backup" = true ]; then
-        if cp "$dest" "$dest.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null; then
+        # Two refreshes within the same second must not overwrite each other's
+        # backup: add a counter suffix when the stamp is taken (cp -n never
+        # clobbers an existing backup).
+        local stamp backup n=0
+        stamp=$(date +%Y%m%d%H%M%S)
+        backup="$dest.bak.$stamp"
+        while [ -e "$backup" ] || [ -L "$backup" ]; do
+            n=$((n + 1))
+            backup="$dest.bak.$stamp.$n"
+        done
+        if cp -n "$dest" "$backup" 2>/dev/null && [ -f "$backup" ]; then
             prune_backups "$dest" 3
             config_warning "Backed up previous $label"
         fi
@@ -306,150 +561,204 @@ json_valid() {
     return 2
 }
 
-# Merge user-added permission rules into a fresh opencode.json template.
-# Rules are flat single-key objects matched by (action,resource): template rules
-# win conflicts (reported via MERGED_OVERRIDDEN), unknown user rules are
-# preserved (counted in MERGED_ADDED). Single-line, minified and multi-line
-# hand-written rules all work (extracted as escaped one-liners, joined back per
-# object); rules with nested braces are left to the replace path.
-# The result is JSON-validated before use; on failure nothing is written.
+# Merge program shared by the node and python3 implementations below (same
+# semantics). Arguments: <installed> <template> <output>. Prints tab-separated
+# report lines (ADDED n / OVERRIDDEN action:resource / SKIPPED n / LEGACY 1),
+# or "ERROR<TAB>message" and exits 1. Messages never echo file content.
+# shellcheck disable=SC2016 # JavaScript source, expanded by node, not bash
+OPENCODE_MERGE_JS='
+const fs = require("fs");
+const [inst, tpl, out] = process.argv.slice(1);
+const fail = (m) => { process.stdout.write("ERROR\t" + m + "\n"); process.exit(1); };
+let u, t;
+try { u = JSON.parse(fs.readFileSync(inst, "utf8")); } catch (e) { fail("your opencode.json is not valid JSON"); }
+try { t = JSON.parse(fs.readFileSync(tpl, "utf8")); } catch (e) { fail("the permission template is not valid JSON"); }
+const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+if (!isObj(u)) fail("your opencode.json is not a JSON object");
+if (!isObj(t) || !Array.isArray(t.permissions)) fail("the permission template has no permissions array");
+const ur = u.permissions === undefined ? [] : u.permissions;
+if (!Array.isArray(ur)) fail("\"permissions\" in your opencode.json is not an array");
+const isRule = (r) => isObj(r) && typeof r.action === "string" && typeof r.resource === "string";
+const key = (r) => r.action + "\u0000" + r.resource;
+const canon = (r) => JSON.stringify(Object.keys(r).sort().map((k) => [k, r[k]]));
+const tkeys = new Set(t.permissions.map(key));
+const seen = new Set(t.permissions.map(canon));
+const added = [];
+const report = [];
+let skipped = 0;
+for (const r of ur) {
+  if (!isRule(r)) { skipped++; continue; }
+  const c = canon(r);
+  if (seen.has(c)) continue;
+  if (tkeys.has(key(r))) { report.push("OVERRIDDEN\t" + r.action + ":" + r.resource); continue; }
+  seen.add(c);
+  added.push(r);
+}
+const o = { "$schema": t["$schema"] };
+for (const k of Object.keys(u)) if (k !== "permission" && k !== "permissions") o[k] = u[k];
+for (const k of Object.keys(t)) if (k !== "permissions" && !(k in o)) o[k] = t[k];
+o.permissions = t.permissions.concat(added);
+const one = (r) => "{ " + Object.keys(r).map((k) => JSON.stringify(k) + ": " + JSON.stringify(r[k])).join(", ") + " }";
+const keys = Object.keys(o);
+const lines = ["{"];
+keys.forEach((k, i) => {
+  const comma = i < keys.length - 1 ? "," : "";
+  if (k === "permissions") {
+    lines.push("  \"permissions\": [");
+    o.permissions.forEach((r, j) => lines.push("    " + one(r) + (j < o.permissions.length - 1 ? "," : "")));
+    lines.push("  ]" + comma);
+  } else {
+    lines.push("  " + JSON.stringify(k) + ": " + JSON.stringify(o[k], null, 2).replace(/\n/g, "\n  ") + comma);
+  }
+});
+lines.push("}");
+fs.writeFileSync(out, lines.join("\n") + "\n");
+report.push("ADDED\t" + added.length);
+if (skipped) report.push("SKIPPED\t" + skipped);
+if (u.permission !== undefined) report.push("LEGACY\t1");
+process.stdout.write(report.join("\n") + "\n");
+'
+
+OPENCODE_MERGE_PY='
+import json, sys
+inst, tpl, out = sys.argv[1:4]
+def fail(m):
+    sys.stdout.write("ERROR\t" + m + "\n")
+    sys.exit(1)
+try:
+    with open(inst, encoding="utf-8") as fh:
+        u = json.load(fh)
+except Exception:
+    fail("your opencode.json is not valid JSON")
+try:
+    with open(tpl, encoding="utf-8") as fh:
+        t = json.load(fh)
+except Exception:
+    fail("the permission template is not valid JSON")
+if not isinstance(u, dict):
+    fail("your opencode.json is not a JSON object")
+if not isinstance(t, dict) or not isinstance(t.get("permissions"), list):
+    fail("the permission template has no permissions array")
+ur = u.get("permissions", [])
+if not isinstance(ur, list):
+    fail("\"permissions\" in your opencode.json is not an array")
+def is_rule(r):
+    return isinstance(r, dict) and isinstance(r.get("action"), str) and isinstance(r.get("resource"), str)
+def key(r):
+    return (r["action"], r["resource"])
+def canon(r):
+    return json.dumps(sorted(r.items(), key=lambda kv: kv[0]), sort_keys=True)
+tkeys = set(key(r) for r in t["permissions"])
+seen = set(canon(r) for r in t["permissions"])
+added, report, skipped = [], [], 0
+for r in ur:
+    if not is_rule(r):
+        skipped += 1
+        continue
+    c = canon(r)
+    if c in seen:
+        continue
+    if key(r) in tkeys:
+        report.append("OVERRIDDEN\t" + r["action"] + ":" + r["resource"])
+        continue
+    seen.add(c)
+    added.append(r)
+o = {"$schema": t.get("$schema")}
+for k, v in u.items():
+    if k not in ("permission", "permissions"):
+        o[k] = v
+for k, v in t.items():
+    if k != "permissions" and k not in o:
+        o[k] = v
+o["permissions"] = t["permissions"] + added
+def dump(v, **kw):
+    return json.dumps(v, ensure_ascii=False, **kw)
+def one(r):
+    return "{ " + ", ".join(dump(k) + ": " + dump(v, separators=(",", ":")) for k, v in r.items()) + " }"
+keys = list(o.keys())
+lines = ["{"]
+for i, k in enumerate(keys):
+    comma = "," if i < len(keys) - 1 else ""
+    if k == "permissions":
+        lines.append("  \"permissions\": [")
+        n = len(o["permissions"])
+        for j, r in enumerate(o["permissions"]):
+            lines.append("    " + one(r) + ("," if j < n - 1 else ""))
+        lines.append("  ]" + comma)
+    else:
+        lines.append("  " + dump(k) + ": " + dump(o[k], indent=2).replace("\n", "\n  ") + comma)
+lines.append("}")
+with open(out, "w", encoding="utf-8") as fh:
+    fh.write("\n".join(lines) + "\n")
+report.append("ADDED\t" + str(len(added)))
+if skipped:
+    report.append("SKIPPED\t" + str(skipped))
+if "permission" in u:
+    report.append("LEGACY\t1")
+sys.stdout.write("\n".join(report) + "\n")
+'
+
+# Merge user-added permission rules into a fresh opencode.json template with a
+# real JSON parser (node, else python3): rules are matched by
+# (action,resource), template rules win conflicts (reported via
+# MERGED_OVERRIDDEN), other user rules are kept verbatim (MERGED_ADDED), and
+# so are the user's top-level keys other than permission/permissions.
+# Fails closed: without a parser, or when the user file is not valid JSON,
+# nothing usable is written, MERGE_ERROR explains why and 1 is returned.
 # Usage: merge_opencode_permissions <installed> <template> <output>
-# Sets: MERGED_ADDED (count), MERGED_OVERRIDDEN ("action:resource ..." list)
+# Sets: MERGED_ADDED, MERGED_OVERRIDDEN ("action:resource ..."), MERGED_SKIPPED,
+#       MERGED_LEGACY (true when a V1 "permission" block was dropped), MERGE_ERROR
 merge_opencode_permissions() {
-    local installed="$1" template="$2" output="$3"
+    local installed="$1" template="$2" output="$3" report rc=0 kind val
     MERGED_ADDED=0
     MERGED_OVERRIDDEN=""
+    MERGED_SKIPPED=0
+    MERGED_LEGACY=false
+    MERGE_ERROR=""
 
-    cp "$template" "$output" 2>/dev/null || return 1
+    if command -v node >/dev/null 2>&1; then
+        report=$(node -e "$OPENCODE_MERGE_JS" "$installed" "$template" "$output" 2>/dev/null) || rc=$?
+    elif command -v python3 >/dev/null 2>&1; then
+        report=$(python3 -I -c "$OPENCODE_MERGE_PY" "$installed" "$template" "$output" 2>/dev/null) || rc=$?
+    else
+        MERGE_ERROR="neither node nor python3 is available on the host to merge JSON safely"
+        return 1
+    fi
 
-    local t_norm t_keys
-    t_norm=$(grep -oE '\{[^{}]*"action"[^{}]*\}' "$template" 2>/dev/null | tr -d '[:space:]' || true)
-    t_keys=$(grep -oE '\{[^{}]*"action"[^{}]*\}' "$template" 2>/dev/null | while IFS= read -r o; do
-        printf '%s|%s\n' "$(printf '%s' "$o" | grep -oE '"action"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)" "$(printf '%s' "$o" | grep -oE '"resource"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)"
-    done || true)
-
-    # Extract flat rule objects as single escaped lines (backslash-escaped, real
-    # newlines as literal \n), so multi-line hand-written rules survive the
-    # pipeline. Objects with nested braces are skipped here and fall back to
-    # the replace path via validation below. Portable awk (no gawk-isms).
-    # Extract flat rule objects as single escaped lines (backslash-escaped, real
-    # newlines as literal \n). Buffers are kept per nesting level so inner rule
-    # objects emit on their own closing brace; the document wrapper (which also
-    # mentions "action") is excluded via its "permissions" key. Braces inside
-    # JSON strings still confuse counting — validation below is the backstop.
-    local -a user_objs=()
-    local esc obj norm a r seen="" examined=0
-    while IFS= read -r esc; do
-        [ -n "$esc" ] || continue
-        obj=$(printf '%b' "$esc")
-        examined=$((examined + 1))
-        norm=$(printf '%s' "$obj" | tr -d '[:space:]')
-        if grep -qxF -- "$norm" <<<"$t_norm"; then
-            continue
-        fi
-        case "$seen" in
-        *"|$norm|"*) continue ;;
+    if [ "$rc" -ne 0 ]; then
+        while IFS=$'\t' read -r kind val; do
+            [ "$kind" = ERROR ] && MERGE_ERROR="$val" && break
+        done <<<"$report"
+        [ -n "$MERGE_ERROR" ] || MERGE_ERROR="the JSON merge failed"
+        return 1
+    fi
+    while IFS=$'\t' read -r kind val; do
+        case "$kind" in
+        ADDED) MERGED_ADDED="$val" ;;
+        OVERRIDDEN) MERGED_OVERRIDDEN="$MERGED_OVERRIDDEN $val" ;;
+        SKIPPED) MERGED_SKIPPED="$val" ;;
+        LEGACY) MERGED_LEGACY=true ;;
         esac
-        a=$(printf '%s' "$obj" | grep -oE '"action"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
-        r=$(printf '%s' "$obj" | grep -oE '"resource"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
-        if [ -z "$a" ] || [ -z "$r" ]; then
-            continue
-        fi
-        if grep -qxF -- "$a|$r" <<<"$t_keys"; then
-            MERGED_OVERRIDDEN="$MERGED_OVERRIDDEN $a:$r"
-            continue
-        fi
-        user_objs+=("$obj")
-        seen="$seen|$norm|"
-        MERGED_ADDED=$((MERGED_ADDED + 1))
-    done < <(awk '
-        BEGIN { depth = 0 }
-        function emit_if_rule(text) {
-            if (text ~ /"action"/ && text !~ /"permissions"[ \t\r\n]*:/) {
-                gsub(/\\/, "\\\\", text)
-                gsub(/\n/, "\\n", text)
-                print text
-            }
-        }
-        {
-            line = $0 "\n"
-            for (i = 1; i <= length(line); i++) {
-                c = substr(line, i, 1)
-                if (c == "{") {
-                    depth++
-                    stack[depth] = ""
-                }
-                if (depth >= 1) {
-                    for (d = 1; d <= depth; d++) stack[d] = stack[d] c
-                }
-                if (c == "}") {
-                    emit_if_rule(stack[depth])
-                    delete stack[depth]
-                    depth--
-                    if (depth < 0) depth = 0
-                }
-            }
-        }' "$installed" 2>/dev/null || true)
-
-    # Coverage sanity: every "action" key should have been examined; otherwise
-    # some custom rule evaded parsing and stays only in the backup.
-    local wanted
-    wanted=$(grep -oE '"action"[[:space:]]*:' "$installed" 2>/dev/null | wc -l | tr -d ' ')
-    if [ "$examined" -lt "$wanted" ]; then
-        config_warning "Some custom rules could not be parsed and were left in the backup"
-    fi
-
-    local new_tmp
-    new_tmp=$(mktemp 2>/dev/null) || return 1
-
-    if [ "$MERGED_ADDED" -gt 0 ]; then
-        # Comma-terminate every rule object except the last (per object, so
-        # multi-line rules keep their interior commas), give the template's
-        # last rule a trailing comma, and insert before the closing bracket.
-        local idx total=${#user_objs[@]}
-        : >"$new_tmp" || {
-            rm -f "$new_tmp"
-            return 1
-        }
-        for ((idx = 0; idx < total; idx++)); do
-            printf '%s' "${user_objs[$idx]}" | sed 's/^/    /' >>"$new_tmp" || {
-                rm -f "$new_tmp"
-                return 1
-            }
-            [ "$idx" -lt $((total - 1)) ] && printf ',' >>"$new_tmp"
-            printf '\n' >>"$new_tmp"
-        done
-        local last_rule close_at
-        last_rule=$(grep -n '"action"' "$output" | tail -1 | cut -d: -f1)
-        close_at=$(grep -n '^  \]$' "$output" | head -1 | cut -d: -f1)
-        if [ -z "$last_rule" ] || [ -z "$close_at" ]; then
-            rm -f "$new_tmp"
-            return 1
-        fi
-        sed "${last_rule}s/}[[:space:]]*$/},/" "$output" >"$new_tmp.merged" 2>/dev/null || {
-            rm -f "$new_tmp" "$new_tmp.merged"
-            return 1
-        }
-        head -n $((close_at - 1)) "$new_tmp.merged" >"$new_tmp.out" 2>/dev/null || {
-            rm -f "$new_tmp" "$new_tmp.merged"
-            return 1
-        }
-        cat "$new_tmp" >>"$new_tmp.out"
-        tail -n +"$close_at" "$new_tmp.merged" >>"$new_tmp.out"
-        cat "$new_tmp.out" >"$output"
-        rm -f "$new_tmp.merged" "$new_tmp.out"
-    fi
-    rm -f "$new_tmp"
+    done <<<"$report"
 
     # Validate before the caller moves anything into place.
     local v=0
     json_valid "$output" || v=$?
-    [ "$v" -eq 1 ] && return 1
+    if [ "$v" -eq 1 ]; then
+        MERGE_ERROR="the merged result is not valid JSON"
+        return 1
+    fi
     return 0
 }
 
 ensure_opencode_dockerized_config() {
-    mkdir -p "$CONFIG_DIR/plugins" 2>/dev/null || return 0
+    # Failures installing the security layer are reported and returned: a
+    # session must never start silently without the guard or its rules.
+    local layer_rc=0
+    if ! mkdir -p "$CONFIG_DIR/plugins" 2>/dev/null; then
+        config_error "Could not create $CONFIG_DIR/plugins"
+        return 1
+    fi
 
     # Directory holding this library's checkout root (lib/ -> repo root),
     # used to locate the versioned security sources.
@@ -468,10 +777,15 @@ ensure_opencode_dockerized_config() {
             cp "$CONFIG_DIR/opencode.json" "$CONFIG_DIR/opencode.json.bak" 2>/dev/null || true
             config_warning "Backed up pre-V2 opencode.json to opencode.json.bak"
         fi
-        template_tmp=$(mktemp 2>/dev/null) || return 0
-        merged_tmp=$(mktemp 2>/dev/null) || {
+        # Temp files live next to the target so the final rename is atomic.
+        template_tmp=$(mktemp "$CONFIG_DIR/.opencode.json.tpl.XXXXXX" 2>/dev/null) || {
+            config_error "Could not write the sandbox permissions in $CONFIG_DIR"
+            return 1
+        }
+        merged_tmp=$(mktemp "$CONFIG_DIR/.opencode.json.new.XXXXXX" 2>/dev/null) || {
             rm -f "$template_tmp"
-            return 0
+            config_error "Could not write the sandbox permissions in $CONFIG_DIR"
+            return 1
         }
         cat >"$template_tmp" <<'EOF'
 {
@@ -520,19 +834,34 @@ ensure_opencode_dockerized_config() {
   ]
 }
 EOF
-        if [ "$had_file" = true ] && merge_opencode_permissions "$CONFIG_DIR/opencode.json.bak" "$template_tmp" "$merged_tmp"; then
-            cat "$merged_tmp" >"$CONFIG_DIR/opencode.json" 2>/dev/null || true
-            [ "$MERGED_ADDED" -gt 0 ] && config_success "Preserved $MERGED_ADDED custom rule(s) in $CONFIG_DIR/opencode.json"
-            [ -n "$MERGED_OVERRIDDEN" ] && config_warning "Template overrode custom rule(s):$MERGED_OVERRIDDEN"
-        else
-            if [ "$had_file" = true ]; then
-                config_warning "Could not merge custom rules; keeping your backed-up opencode.json unchanged"
+        # Fail closed: when the user's rules cannot be merged safely, the old
+        # file is left untouched and the layer reports failure, so no session
+        # starts with outdated permissions (fix or delete the file to proceed).
+        local refreshed=false
+        if [ "$had_file" = true ]; then
+            if merge_opencode_permissions "$CONFIG_DIR/opencode.json" "$template_tmp" "$merged_tmp" &&
+                mv -f "$merged_tmp" "$CONFIG_DIR/opencode.json" 2>/dev/null; then
+                refreshed=true
+                [ "$MERGED_ADDED" -gt 0 ] && config_success "Preserved $MERGED_ADDED custom rule(s) in $CONFIG_DIR/opencode.json"
+                [ -n "$MERGED_OVERRIDDEN" ] && config_warning "Template overrode custom rule(s):$MERGED_OVERRIDDEN"
+                [ "$MERGED_SKIPPED" -gt 0 ] && config_warning "Dropped $MERGED_SKIPPED permission entr(ies) without string action/resource (kept in opencode.json.bak)"
+                [ "$MERGED_LEGACY" = true ] && config_warning "Dropped the legacy V1 \"permission\" block (kept in opencode.json.bak)"
             else
-                cat "$template_tmp" >"$CONFIG_DIR/opencode.json" 2>/dev/null || true
+                config_error "Could not refresh the sandbox permissions: ${MERGE_ERROR:-could not replace $CONFIG_DIR/opencode.json}."
+                config_info "Fix or delete $CONFIG_DIR/opencode.json (a copy is in opencode.json.bak), then run 'opencode-dockerized config sync'."
+                layer_rc=1
             fi
+        elif mv -f "$template_tmp" "$CONFIG_DIR/opencode.json" 2>/dev/null; then
+            refreshed=true
+        else
+            config_error "Could not write $CONFIG_DIR/opencode.json"
+            layer_rc=1
         fi
         rm -f "$template_tmp" "$merged_tmp"
-        config_success "Refreshed security permissions at $CONFIG_DIR/opencode.json"
+        if [ "$refreshed" = true ]; then
+            chmod 0644 "$CONFIG_DIR/opencode.json" 2>/dev/null || true
+            config_success "Refreshed security permissions at $CONFIG_DIR/opencode.json"
+        fi
     fi
 
     # (Re)generate the rules when missing, or when predating the Tool Usage,
@@ -702,10 +1031,6 @@ EOF
         config_success "Created security rules at $CONFIG_DIR/AGENTS.md"
     fi
 
-    # Failures installing the security layer are reported and returned: a
-    # session must never start silently without the guard.
-    local layer_rc=0
-
     # Install the security hooks from the versioned repo copy
     # (plugins/security-guard.js) so the guard can be linted and reviewed like
     # the rest of the code. Content, not the version marker, decides: a changed
@@ -740,6 +1065,7 @@ EOF
         for pf in "${policy_files[@]}"; do
             install_managed_file "$policy_dest/$pf" "$oc_dir/plugins/policies/$pf" "config-tree policy $pf" false || layer_rc=1
         done
+        install_managed_file "$policy_dest/VERSION" "$oc_dir/plugins/policies/VERSION" "config-tree policy VERSION marker" false || layer_rc=1
         # Global rules: back up a user-authored AGENTS.md (not one of ours) once,
         # then keep the managed rules in place.
         if [ -f "$CONFIG_DIR/AGENTS.md" ]; then
@@ -918,7 +1244,7 @@ check_security_layer() {
     local mirror_guard mirror_stale=false
     mirror_guard=$(grep -oE 'OPENCODE_DOCKERIZED_GUARD_VERSION=[0-9]+' "$oc_dir/plugins/security-guard.js" 2>/dev/null | head -1)
     cmp -s "$repo_dir/plugins/security-guard.js" "$oc_dir/plugins/security-guard.js" || mirror_stale=true
-    for pf in unsafe-tool-patterns.json prompt-injection-patterns.json allow-patterns.json; do
+    for pf in unsafe-tool-patterns.json prompt-injection-patterns.json allow-patterns.json VERSION; do
         cmp -s "$CONFIG_DIR/plugins/policies/$pf" "$oc_dir/plugins/policies/$pf" || mirror_stale=true
     done
     if [ -f "$CONFIG_DIR/AGENTS.md" ]; then
@@ -1131,7 +1457,8 @@ resolve_gpg_agent_extra_socket() {
 # presence alone is not enough: a stale socket file would pass for "running",
 # so on a real host the agent is probed with gpg-connect-agent (2s timeout).
 # Test seams:
-#   - GPG_AGENT_PROBE_CMD replaces the probe with an arbitrary command.
+#   - GPG_AGENT_PROBE_CMD replaces the probe with an arbitrary command (only
+#     with OPENCODE_DOCKERIZED_TEST_HOOKS=1, see test_hooks_enabled).
 #   - GPG_AGENT_SOCKET / GPG_AGENT_EXTRA_SOCKET (plain test sockets, not real
 #     agents) skip the probe and trust the socket.
 # Usage: gpg_agent_is_running
@@ -1144,7 +1471,7 @@ gpg_agent_is_running() {
         return 1
     fi
 
-    if [ -n "${GPG_AGENT_PROBE_CMD:-}" ]; then
+    if [ -n "${GPG_AGENT_PROBE_CMD:-}" ] && test_hooks_enabled; then
         bash -c "$GPG_AGENT_PROBE_CMD" >/dev/null 2>&1 && return 0
         return 1
     fi
@@ -1212,7 +1539,7 @@ ensure_gpg_agent_ready() {
     done
 
     config_info "Starting host gpg-agent for GnuPG forwarding..."
-    if [ -n "${GPG_AGENT_LAUNCH_CMD:-}" ]; then
+    if [ -n "${GPG_AGENT_LAUNCH_CMD:-}" ] && test_hooks_enabled; then
         bash -c "$GPG_AGENT_LAUNCH_CMD" >/dev/null 2>&1 || true
     else
         gpgconf --launch gpg-agent >/dev/null 2>&1 || config_warning "gpgconf --launch gpg-agent failed"
@@ -1267,10 +1594,73 @@ ensure_ssh_agent_ready() {
     return 0
 }
 
+# Rename SRC onto DST without ever moving *into* a directory (or a symlink to
+# one) that appeared at DST: GNU mv -T; plain mv where -T is unavailable.
+# Usage: gpg_mirror_rename SRC DST
+gpg_mirror_rename() {
+    if mv --version >/dev/null 2>&1; then
+        mv -fT -- "$1" "$2" 2>/dev/null
+    else
+        mv -f -- "$1" "$2" 2>/dev/null
+    fi
+}
+
+# Remove one top-level entry NAME of the GnuPG mirror. Strictly confined to
+# $OCODE_HOME/.gnupg/<name>; rm never follows a symlink given as operand, so
+# a planted link is dropped without touching its target.
+# Usage: gpg_mirror_remove NAME
+gpg_mirror_remove() {
+    local name="$1"
+    case "$name" in
+    "" | */* | . | ..) return 1 ;;
+    esac
+    [ -n "$OCODE_HOME" ] || return 1
+    rm -rf -- "${OCODE_HOME:?}/.gnupg/$name" 2>/dev/null
+}
+
+# Move the staged entry STAGE/NAME into the mirror. The mirror is mounted
+# read-write into the container, so anything already at the target may be a
+# planted symlink: nothing there is ever written through. Files replace the
+# target with an atomic rename (a symlink or directory in the way is removed
+# first); directories are swapped whole (the old entry is renamed aside into
+# the stage dir), so no path component the container controls is traversed.
+# Unchanged regular files are left alone (no churn under live sessions).
+# Usage: gpg_mirror_place STAGE NAME
+gpg_mirror_place() {
+    local stage="$1" name="$2" target
+    case "$name" in
+    "" | */* | . | ..) return 1 ;;
+    esac
+    target="$OCODE_HOME/.gnupg/$name"
+
+    if [ -d "$stage/$name" ] && [ ! -L "$stage/$name" ]; then
+        if [ -d "$target" ] && [ ! -L "$target" ] && [ -f "$target/pubring.db" ] && [ ! -L "$target/pubring.db" ] &&
+            cmp -s "$stage/$name/pubring.db" "$target/pubring.db"; then
+            return 0
+        fi
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            gpg_mirror_rename "$target" "$stage/.old.$name" || return 1
+        fi
+        gpg_mirror_rename "$stage/$name" "$target"
+        return
+    fi
+
+    if [ -f "$target" ] && [ ! -L "$target" ] && cmp -s "$stage/$name" "$target"; then
+        return 0
+    fi
+    if [ -L "$target" ] || { [ -e "$target" ] && [ ! -f "$target" ]; }; then
+        gpg_mirror_remove "$name" || return 1
+    fi
+    gpg_mirror_rename "$stage/$name" "$target"
+}
+
 # Mirror the host's *public* GnuPG material into $OCODE_HOME/.gnupg so the
 # container can use the host gpg-agent (forwarded via its socket) without ever
 # receiving the private keys. Only public files are copied; private-keys-v1.d,
 # the agent sockets and random_seed are deliberately excluded.
+# Every entry is built in a private stage dir next to the mirror and renamed
+# into place (see gpg_mirror_place), because the container can plant symlinks
+# in the mirror between runs.
 # Usage: ensure_gpg_mirror
 ensure_gpg_mirror() {
     local host_gpg_home="${GNUPGHOME:-$HOME/.gnupg}"
@@ -1281,8 +1671,16 @@ ensure_gpg_mirror() {
         return 0
     fi
 
+    # The mirror root itself is never a link (only the wrapper creates it).
+    [ -L "$dest" ] && rm -f -- "$dest" 2>/dev/null
     mkdir -p "$dest" 2>/dev/null || return 0
     chmod 700 "$dest" 2>/dev/null || true
+
+    local stage
+    if ! stage=$(mktemp -d "$OCODE_HOME/.gnupg-stage.XXXXXX" 2>/dev/null); then
+        config_warning "Could not prepare the GnuPG mirror in $OCODE_HOME"
+        return 0
+    fi
 
     # Public keyring (GnuPG 2.x keybox) plus its lock/trust files. With keyboxd
     # the database can also live under public-keys.d/, so mirror that too.
@@ -1290,14 +1688,17 @@ ensure_gpg_mirror() {
     local f
     for f in pubring.kbx trustdb.gpg sshcontrol; do
         if [ -f "$host_gpg_home/$f" ]; then
-            install -m 600 "$host_gpg_home/$f" "$dest/$f" 2>/dev/null ||
-                cp "$host_gpg_home/$f" "$dest/$f" 2>/dev/null || true
+            if cp -- "$host_gpg_home/$f" "$stage/$f" 2>/dev/null && chmod 600 "$stage/$f" 2>/dev/null; then
+                gpg_mirror_place "$stage" "$f" || config_warning "Could not mirror $f into $dest"
+            fi
         fi
     done
     if [ -f "$host_gpg_home/public-keys.d/pubring.db" ]; then
-        mkdir -p "$dest/public-keys.d" 2>/dev/null || true
-        install -m 600 "$host_gpg_home/public-keys.d/pubring.db" "$dest/public-keys.d/pubring.db" 2>/dev/null ||
-            cp "$host_gpg_home/public-keys.d/pubring.db" "$dest/public-keys.d/pubring.db" 2>/dev/null || true
+        if mkdir -m 700 "$stage/public-keys.d" 2>/dev/null &&
+            cp -- "$host_gpg_home/public-keys.d/pubring.db" "$stage/public-keys.d/pubring.db" 2>/dev/null &&
+            chmod 600 "$stage/public-keys.d/pubring.db" 2>/dev/null; then
+            gpg_mirror_place "$stage" public-keys.d || config_warning "Could not mirror public-keys.d into $dest"
+        fi
     fi
 
     # Mirror the config verbatim, including `use-keyboxd`: on such hosts GnuPG
@@ -1305,24 +1706,34 @@ ensure_gpg_mirror() {
     # container must run keyboxd to read it. entrypoint.sh launches it at boot;
     # `no-autostart` (below) still prevents a keyless local gpg-agent. Stale
     # mirrored config is removed when the host has none.
-    local conf
-    for conf in gpg.conf common.conf; do
-        if [ -f "$host_gpg_home/$conf" ]; then
-            install -m 600 "$host_gpg_home/$conf" "$dest/$conf" 2>/dev/null ||
-                cp "$host_gpg_home/$conf" "$dest/$conf" 2>/dev/null || true
-        else
-            rm -f "$dest/$conf" 2>/dev/null || true
+    if [ -f "$host_gpg_home/common.conf" ]; then
+        if cp -- "$host_gpg_home/common.conf" "$stage/common.conf" 2>/dev/null && chmod 600 "$stage/common.conf" 2>/dev/null; then
+            gpg_mirror_place "$stage" common.conf || config_warning "Could not mirror common.conf into $dest"
         fi
-    done
-
-    # Never let the container's gpg auto-start a keyless local agent: the real
-    # agent is the host's, reached through the forwarded socket.
-    if [ -f "$dest/gpg.conf" ]; then
-        grep -qE '^[[:space:]]*no-autostart([[:space:]]|$)' "$dest/gpg.conf" 2>/dev/null ||
-            echo "no-autostart" >>"$dest/gpg.conf" 2>/dev/null || true
     else
-        echo "no-autostart" >"$dest/gpg.conf" 2>/dev/null || true
+        gpg_mirror_remove common.conf || true
     fi
+
+    # gpg.conf is rebuilt from the host copy on every run, so `no-autostart`
+    # (never let the container's gpg auto-start a keyless local agent: the real
+    # agent is the host's, reached through the forwarded socket) is added at
+    # most once, and the result is renamed into place atomically.
+    if [ -f "$host_gpg_home/gpg.conf" ]; then
+        cp -- "$host_gpg_home/gpg.conf" "$stage/gpg.conf" 2>/dev/null || : >"$stage/gpg.conf"
+    else
+        : >"$stage/gpg.conf"
+    fi
+    if ! grep -qE '^[[:space:]]*no-autostart([[:space:]]|$)' "$stage/gpg.conf" 2>/dev/null; then
+        # Keep the appended option on its own line.
+        if [ -s "$stage/gpg.conf" ] && [ -n "$(tail -c 1 "$stage/gpg.conf" 2>/dev/null)" ]; then
+            echo >>"$stage/gpg.conf"
+        fi
+        echo "no-autostart" >>"$stage/gpg.conf"
+    fi
+    chmod 600 "$stage/gpg.conf" 2>/dev/null || true
+    gpg_mirror_place "$stage" gpg.conf || config_warning "Could not write $dest/gpg.conf"
+
+    rm -rf -- "$stage" 2>/dev/null || true
 
     # Without a public keyring gpg cannot build a signature even when the agent
     # socket is forwarded: warn instead of failing silently later.
@@ -1421,6 +1832,7 @@ cleanup_stale_relays() {
 # Relay a GnuPG agent socket through a socket on a normal filesystem so Docker
 # can bind it. One process per session; the wrapper stops it when the container
 # exits. Uses `socat` by default; GPG_RELAY_CMD overrides the command for tests
+# (only with OPENCODE_DOCKERIZED_TEST_HOOKS=1, see test_hooks_enabled)
 # (it receives RELAY_SOCK and RELAY_REAL in its environment).
 # Usage: relay_socket=$(start_gpg_relay <real_socket>)
 start_gpg_relay() {
@@ -1428,7 +1840,8 @@ start_gpg_relay() {
     [ -n "$real" ] && [ -S "$real" ] || return 1
     relay_dir_ok || return 1
 
-    local template="${GPG_RELAY_CMD:-}"
+    local template=""
+    test_hooks_enabled && template="${GPG_RELAY_CMD:-}"
     if [ -z "$template" ]; then
         command -v socat >/dev/null 2>&1 || return 1
         # Single quotes are intentional: expanded later via RELAY_SOCK/RELAY_REAL env.
@@ -1490,40 +1903,66 @@ stop_gpg_relay() {
 }
 
 # Detect if a directory is a git worktree and return the main repo's .git directory path
-# A worktree has a .git FILE (not directory) containing "gitdir: <path>"
+# A worktree has a .git FILE (not directory) containing "gitdir: <path>".
+# That file lives in the project, so the container can rewrite it: it is only
+# trusted when the round trip checks out on the host side, i.e. it points at
+# <common>/worktrees/<name> and that directory's own `gitdir` file (outside the
+# project, written by `git worktree add`) points back at this project's .git
+# (canonical paths). Anything else is reported and mounts nothing.
 # Returns (via stdout): "<git_common_dir>" if worktree, empty string otherwise
+# Warnings go to stderr so callers can capture stdout.
 # Usage: main_git_dir=$(detect_git_worktree "/path/to/worktree")
 detect_git_worktree() {
     local project_dir="$1"
 
     # Quick check: if .git is a directory (normal repo) or doesn't exist, not a worktree
-    if [ ! -f "$project_dir/.git" ]; then
+    if [ ! -f "$project_dir/.git" ] || [ -L "$project_dir/.git" ]; then
         return 0
     fi
 
-    # Use git to reliably resolve paths (handles relative/absolute gitdir pointers)
-    if ! command -v git >/dev/null 2>&1; then
-        config_warning "Git worktree detected but 'git' is not installed on the host — git info will be unavailable in container"
+    local line="" gitdir project_c gitdir_c common back="" back_c
+    IFS= read -r line <"$project_dir/.git" 2>/dev/null || [ -n "$line" ] || return 0
+    line="${line%$'\r'}"
+    case "$line" in
+    "gitdir: "*) gitdir="${line#gitdir: }" ;;
+    *) return 0 ;;
+    esac
+    [ -n "$gitdir" ] || return 0
+    [[ "$gitdir" == /* ]] || gitdir="$project_dir/$gitdir"
+
+    project_c=$(canonical_path "$project_dir") || return 0
+    gitdir_c=$(canonical_path "$gitdir") || gitdir_c=""
+
+    if [ -z "$gitdir_c" ] || [ ! -d "$gitdir_c" ] || [ "$(basename -- "$(dirname -- "$gitdir_c")")" != worktrees ]; then
+        config_warning "Ignoring untrusted git worktree pointer in $project_dir/.git (not <repo>/.git/worktrees/<name>); no main .git directory mounted" >&2
         return 0
     fi
+    common=$(dirname -- "$(dirname -- "$gitdir_c")")
 
-    # git rev-parse --git-common-dir gives us the shared .git directory
-    local git_common_dir
-    git_common_dir=$(git -C "$project_dir" rev-parse --git-common-dir 2>/dev/null) || return 0
-
-    # Resolve to absolute path
-    if [[ "$git_common_dir" != /* ]]; then
-        git_common_dir=$(cd "$project_dir" && cd "$git_common_dir" && pwd)
-    else
-        git_common_dir=$(cd "$git_common_dir" && pwd)
+    if [ -f "$gitdir_c/gitdir" ]; then
+        IFS= read -r back <"$gitdir_c/gitdir" 2>/dev/null || true
+        back="${back%$'\r'}"
+    fi
+    [ -z "$back" ] || [[ "$back" == /* ]] || back="$gitdir_c/$back"
+    back_c=""
+    [ -n "$back" ] && back_c=$(canonical_path "$back" 2>/dev/null)
+    if [ -z "$back_c" ] || [ "$back_c" != "$project_c/.git" ]; then
+        config_warning "Ignoring untrusted git worktree pointer in $project_dir/.git (the worktree entry does not point back at this project); no main .git directory mounted" >&2
+        return 0
     fi
 
     # Sanity check: the common dir should be a real .git directory
-    if [ ! -d "$git_common_dir/objects" ] || [ ! -d "$git_common_dir/refs" ]; then
+    if [ ! -d "$common/objects" ] || [ ! -d "$common/refs" ]; then
         return 0
     fi
 
-    echo "$git_common_dir"
+    # Defense in depth: never mount a protected host location this way.
+    if host_path_is_protected "$common"; then
+        config_warning "Ignoring git worktree common dir $common: $PROTECTED_REASON" >&2
+        return 0
+    fi
+
+    echo "$common"
 }
 
 # Build Docker volume/bind args needed for git worktree support
@@ -1588,6 +2027,61 @@ validate_opencode_config() {
         esac
     done
     return 0
+}
+
+# Print the inline sandbox config JSON with "websearch": {"provider": ID} set.
+# With node or python3 the document is parsed and the key replaced (the
+# setting wins over a hand-written one). Without a parser it falls back to a
+# shape-checked text merge that handles "{}" and refuses (returns 1) when a
+# "websearch" key already exists, so it never yields `{,` or a duplicate key.
+# ID must already be allowlisted by the caller.
+# Usage: merged=$(merge_websearch_provider "$json" exa) || ...
+merge_websearch_provider() {
+    local json="$1" provider="$2" out
+    if command -v node >/dev/null 2>&1; then
+        out=$(printf '%s' "$json" | node -e '
+let o;
+try { o = JSON.parse(require("fs").readFileSync(0, "utf8")); } catch (e) { process.exit(1); }
+if (o === null || typeof o !== "object" || Array.isArray(o)) process.exit(1);
+o.websearch = { provider: process.argv[1] };
+process.stdout.write(JSON.stringify(o));
+' "$provider" 2>/dev/null) && [ -n "$out" ] && {
+            printf '%s\n' "$out"
+            return 0
+        }
+        return 1
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        out=$(printf '%s' "$json" | python3 -I -c '
+import json, sys
+try:
+    o = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not isinstance(o, dict):
+    sys.exit(1)
+o["websearch"] = {"provider": sys.argv[1]}
+sys.stdout.write(json.dumps(o, separators=(",", ":"), ensure_ascii=False))
+' "$provider" 2>/dev/null) && [ -n "$out" ] && {
+            printf '%s\n' "$out"
+            return 0
+        }
+        return 1
+    fi
+
+    # Text fallback on the known shape: a single object, first char "{" and
+    # last char "}" (surrounding whitespace already trimmed by the caller).
+    [[ "$json" == "{"*"}" ]] || return 1
+    if [[ "$json" =~ \"websearch\"[[:space:]]*: ]]; then
+        return 1
+    fi
+    local body="${json#\{}"
+    body="${body%\}}"
+    if [[ "$body" =~ ^[[:space:]]*$ ]]; then
+        printf '%s\n' "{\"websearch\":{\"provider\":\"$provider\"}}"
+    else
+        printf '%s\n' "{${body},\"websearch\":{\"provider\":\"$provider\"}}"
+    fi
 }
 
 # Build common Docker run arguments shared by run_opencode and run_auth
@@ -1662,25 +2156,25 @@ build_common_docker_args() {
     # the OpenCode config directory stay read-only.
     # OPENCODE_CONFIG_DIR must stay unset: it replaces the global config directory
     # (breaking MCP persistence and the seeded config) — the plugin hooks are
-    # mounted as a read-only file into the config plugins dir instead
-    # (see build_standard_volume_args).
+    # mirrored into the config tree on the host and delivered by its single
+    # read-only directory mount instead (see ensure_opencode_dockerized_config
+    # and build_standard_volume_args).
     if [ -f "$CONFIG_DIR/opencode.json" ]; then
         local sandbox_rule_json
         if sandbox_rule_json=$(tr -d '\r\n' <"$CONFIG_DIR/opencode.json" 2>/dev/null) && [ -n "$sandbox_rule_json" ]; then
             # Drop trailing whitespace so the closing brace is really last.
             sandbox_rule_json="${sandbox_rule_json%"${sandbox_rule_json##*[![:space:]]}"}"
-            # Optional built-in websearch provider (setting.websearch_provider).
-            # Merged into the inline config alongside the permissions; the file
-            # keeps its known shape (a single object ending in `}`), so a suffix
-            # strip plus append is exact. The provider id is allowlisted at parse
-            # time and re-checked here, so no JSON injection is possible.
+            # Optional built-in websearch provider (setting.websearch_provider),
+            # merged into the inline config alongside the permissions. The
+            # provider id is allowlisted, so no JSON injection is possible.
             if [ -n "$WEBSEARCH_PROVIDER" ]; then
                 case "$WEBSEARCH_PROVIDER" in
                 exa | firecrawl | parallel | tavily | random)
-                    if [[ "$sandbox_rule_json" == *"}" ]]; then
-                        sandbox_rule_json="${sandbox_rule_json%\}},\"websearch\":{\"provider\":\"$WEBSEARCH_PROVIDER\"}}"
+                    local merged_cfg
+                    if merged_cfg=$(merge_websearch_provider "$sandbox_rule_json" "$WEBSEARCH_PROVIDER"); then
+                        sandbox_rule_json="$merged_cfg"
                     else
-                        config_warning "Cannot merge websearch provider into sandbox rules (unexpected shape); skipping"
+                        config_warning "Cannot merge websearch provider into sandbox rules (unexpected shape or existing \"websearch\" key); skipping"
                     fi
                     ;;
                 *)
@@ -1688,6 +2182,7 @@ build_common_docker_args() {
                     ;;
                 esac
             fi
+
             DOCKER_COMMON_ARGS+=(-e "OPENCODE_CONFIG_CONTENT=$sandbox_rule_json")
         else
             config_warning "Could not read $CONFIG_DIR/opencode.json — sandbox permission rules not applied"
@@ -2160,58 +2655,35 @@ build_mount_args() {
     ensure_gpg_agent_ready
     cleanup_stale_relays
 
+    local mount spec colons
     for mount in "${CUSTOM_MOUNTS[@]}"; do
-        # Expand a leading ~ to the home directory (only at the start of the
-        # host path; ':' inside paths is the field separator and unsupported)
-        if [[ "$mount" == "~"* ]]; then
-            mount="$HOME${mount#"~"}"
+        # A mount entry must be host_path:container_path[:mode]; ':' inside a
+        # path is unsupported, so more than three fields is malformed.
+        colons="${mount//[^:]/}"
+        if [ "${#colons}" -lt 1 ] || [ "${#colons}" -gt 2 ]; then
+            config_error "Invalid mount '$mount': expected host_path:container_path[:mode]"
+            exit 1
         fi
 
-        # Extract host_path, container_path, and mode
         local host_path="${mount%%:*}"
         local rest="${mount#*:}"
-        local container_path="${rest%:*}"
-        local mode="${rest##*:}"
-
-        # A mount entry must be host_path:container_path[:mode].
-        if [[ "$mount" != *:* ]]; then
-            config_error "Invalid mount '$mount': expected host_path:container_path"
-            exit 1
+        local container_path="$rest" mode=""
+        if [ "${#colons}" -eq 2 ]; then
+            container_path="${rest%%:*}"
+            mode="${rest#*:}"
+            if [ -z "$mode" ]; then
+                config_error "Invalid mount '$mount': empty mode (use ro or rw)"
+                exit 1
+            fi
         fi
 
-        # Never expose the host SSH private material: agent forwarding is the
-        # supported path (config/known_hosts are mounted read-only automatically).
-        if [ "$host_path" = "$HOME/.ssh" ] || [[ "$host_path" == "$HOME/.ssh/"* ]]; then
-            config_error "Refusing to mount $host_path: it would expose SSH private keys."
-            config_info "Use setting.ssh_agent_support=true instead (config/known_hosts are mounted read-only automatically)."
+        # Canonical host path, protected-location and container-path checks
+        # (SSH/GnuPG homes, wrapper config, ~/.claude, Docker socket, "/",
+        # $HOME; never over the read-only OpenCode config tree).
+        if ! spec=$(validate_custom_mount "$host_path" "$container_path" "$mode"); then
             exit 1
         fi
-
-        # Never expose the host GnuPG private material either: agent forwarding
-        # mirrors only the public keyring and forwards the agent socket.
-        if [ "$host_path" = "$HOME/.gnupg" ] || [[ "$host_path" == "$HOME/.gnupg/"* ]]; then
-            config_error "Refusing to mount $host_path: it would expose GnuPG private keys."
-            config_info "Use setting.gpg_agent_support=true instead (only the public keyring and the agent socket are shared)."
-            exit 1
-        fi
-
-        # A malformed entry must not reach docker as `-v host::mode`.
-        if [ -z "$container_path" ] || [[ "$container_path" != /* ]]; then
-            config_error "Invalid mount '$mount': container path must be absolute"
-            exit 1
-        fi
-
-        # No mode means read-only. Otherwise only ro/rw, optionally with an
-        # SELinux label (z/Z), are accepted: a bare label or any other word would
-        # silently make the mount writable.
-        if [ "$mode" = "$container_path" ]; then
-            DOCKER_MOUNT_ARGS+=(-v "$host_path:$container_path:ro")
-        elif [[ "$mode" =~ ^(ro|rw)(,[zZ])?$ ]]; then
-            DOCKER_MOUNT_ARGS+=(-v "$host_path:$container_path:$mode")
-        else
-            config_error "Invalid mount mode '$mode' for '$mount' (use ro, rw, optionally with ,z or ,Z)"
-            exit 1
-        fi
+        DOCKER_MOUNT_ARGS+=(-v "$spec")
     done
 
     # Handle SSH agent forwarding if enabled. ensure_ssh_agent_ready has already
@@ -2341,9 +2813,12 @@ build_env_args() {
 # Build the docker --env-file argument from setting.env_file.
 # The file holds secrets (dotenv KEY=VALUE lines) and is consumed host-side by
 # `docker run --env-file`, so values never appear on the wrapper command line.
-# The file itself is never mounted: it must live under CONFIG_DIR, which no
-# mount ever serves. This is the only way user secrets reach the container
-# (the old env.* host passthrough was removed).
+# It must live under CONFIG_DIR, whose root is never mounted, and outside
+# OCODE_HOME, whose subtrees are (config read-only; data, state and cache
+# read-write). Both sides are canonicalized, so `..` segments or symlinks
+# cannot escape the check and a symlinked CONFIG_DIR still works. This is the
+# only way user secrets reach the container (the old env.* host passthrough
+# was removed).
 # Populates DOCKER_ENV_FILE_ARGS array.
 # Usage: build_env_file_args
 build_env_file_args() {
@@ -2351,25 +2826,26 @@ build_env_file_args() {
 
     [ -n "$ENV_FILE" ] || return 0
 
-    # Expand a leading ~, then canonicalize so `..` segments cannot escape the
-    # containment check below (readlink -m needs no existing file; fall back to
-    # the literal path where it is unavailable, e.g. macOS).
-    local env_file="$ENV_FILE"
-    if [[ "$env_file" == "~"* ]]; then
-        env_file="$HOME${env_file#"~"}"
+    local env_file cfg_c ocode_c
+    env_file=$(expand_tilde "$ENV_FILE")
+    if ! env_file=$(canonical_path "$env_file"); then
+        config_error "env file must be an absolute path (or start with ~/): $ENV_FILE"
+        exit 1
     fi
-    local canonical
-    if canonical=$(readlink -m "$env_file" 2>/dev/null) && [ -n "$canonical" ]; then
-        env_file="$canonical"
-    fi
+    cfg_c=$(canonical_path "$CONFIG_DIR") || cfg_c="$CONFIG_DIR"
+    ocode_c=$(canonical_path "$OCODE_HOME") || ocode_c="$OCODE_HOME"
 
     case "$env_file" in
-    "$CONFIG_DIR" | "$CONFIG_DIR"/*) ;;
+    "$cfg_c"/*) ;;
     *)
         config_error "Refusing env file outside \$CONFIG_DIR ($CONFIG_DIR): it could be mounted into the container."
         exit 1
         ;;
     esac
+    if paths_overlap "$env_file" "$ocode_c"; then
+        config_error "Refusing env file under \$OCODE_HOME ($OCODE_HOME): that tree is mounted into the container."
+        exit 1
+    fi
 
     if [ ! -f "$env_file" ]; then
         config_error "env file not found: $env_file"
@@ -2431,39 +2907,27 @@ add_mount() {
         return 1
     fi
 
-    # Container path must be absolute (relative paths resolve unpredictably)
-    if [[ "$container_path" != /* ]]; then
-        config_error "Container path must be absolute: $container_path"
+    case "$host_path$container_path" in
+    *:*)
+        config_error "Mount paths must not contain ':'"
         return 1
-    fi
-
-    # Validate host path exists (leading ~ expanded for the check)
-    local expanded_path="$host_path"
-    if [[ "$expanded_path" == "~"* ]]; then
-        expanded_path="$HOME${expanded_path#"~"}"
-    fi
-
-    # Never expose the host SSH private material via a custom mount.
-    if [ "$expanded_path" = "$HOME/.ssh" ] || [[ "$expanded_path" == "$HOME/.ssh/"* ]]; then
-        config_error "Refusing to mount $expanded_path: it would expose SSH private keys."
-        config_info "Use setting.ssh_agent_support=true instead (config/known_hosts are mounted read-only automatically)."
-        return 1
-    fi
-
-    # Never expose the host GnuPG private material via a custom mount.
-    if [ "$expanded_path" = "$HOME/.gnupg" ] || [[ "$expanded_path" == "$HOME/.gnupg/"* ]]; then
-        config_error "Refusing to mount $expanded_path: it would expose GnuPG private keys."
-        config_info "Use setting.gpg_agent_support=true instead (only the public keyring and the agent socket are shared)."
-        return 1
-    fi
-
-    if [ ! -e "$expanded_path" ]; then
-        config_warning "Host path does not exist: $expanded_path"
-    fi
+        ;;
+    esac
 
     if [ -n "$mode" ] && [ "$mode" != "ro" ] && [ "$mode" != "rw" ]; then
         config_error "Invalid mode: $mode (must be 'ro' or 'rw')"
         return 1
+    fi
+
+    # Same checks as build_mount_args: absolute host path (leading ~
+    # expanded), canonicalized before the protected-location checks, and a
+    # container path that never shadows the read-only config or SSH/GnuPG.
+    validate_custom_mount "$host_path" "$container_path" "$mode" >/dev/null || return 1
+
+    local expanded_path
+    expanded_path=$(expand_tilde "$host_path")
+    if [ ! -e "$expanded_path" ]; then
+        config_warning "Host path does not exist: $expanded_path"
     fi
 
     local mount_entry="$host_path:$container_path"

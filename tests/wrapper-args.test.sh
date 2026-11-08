@@ -19,6 +19,11 @@ trap 'rm -r "$TMP" 2>/dev/null || true' EXIT
 # the refusal without this override.
 export OPENCODE_DOCKERIZED_ALLOW_CONTAINER_SYNC=1
 
+# The GPG command-override seams (GPG_AGENT_PROBE_CMD, GPG_AGENT_LAUNCH_CMD,
+# GPG_RELAY_CMD) are only honoured with this explicit opt-in; a dedicated
+# assertion below verifies they are ignored without it.
+export OPENCODE_DOCKERIZED_TEST_HOOKS=1
+
 # Some assertions need a real AF_UNIX socket file; node is the most portable way
 # to create one here (present in the image and on CI runners).
 have_node=false
@@ -1057,7 +1062,7 @@ env -u CONFIG_DIR -u OCODE_HOME HOME="$ONLY_HOME" "$REPO_DIR/bin/opencode-docker
     fail "--only global must never create a symlink"
 grep -qF -- 'opencode-dockerized/bin' "$ONLY_HOME/.bashrc" ||
     fail "--only global must add bin/ to PATH"
-if grep -q "OpenCode Dockerized completion" "$ONLY_HOME/.bashrc"; then
+if grep -qi "opencode.dockerized completion" "$ONLY_HOME/.bashrc"; then
     fail "--only global must not touch completions"
 fi
 if grep -q "OpenCode Dockerized aliases" "$ONLY_HOME/.bashrc"; then
@@ -1087,7 +1092,7 @@ grep -qF -- 'opencode-dockerized/bin' "$PIPE_HOME/.bashrc" ||
     fail "piped install must add bin/ to PATH"
 grep -qF -- "alias ocd='opencode-dockerized'" "$PIPE_HOME/.bashrc" ||
     fail "piped install must add aliases"
-grep -q "OpenCode Dockerized completion" "$PIPE_HOME/.bashrc" ||
+grep -qi "opencode.dockerized completion" "$PIPE_HOME/.bashrc" ||
     fail "piped install must add completions"
 
 # config sync must remove the obsolete second install binary when present.
