@@ -16,7 +16,7 @@ Shell script-based Docker wrapper for running [OpenCode](https://opencode.ai) in
 - `plugins/security-guard.js` — Versioned OpenCode V2 hooks (source of truth; copied into the user config by `lib/config-lib.sh`)
 - `policies/` — Vendored `opencode-policy` pattern sets + local `allow-patterns.json` (see `policies/README.md`)
 - `tests/security-guard.test.mjs`, `tests/security-guard-adversarial.test.mjs`, `tests/policy-lint.test.mjs` — Guard regression, bypass and rule-set tests (shared harness in `tests/guard-harness.mjs`)
-- `tests/*.test.sh` — Wrapper contract tests against a throw-away HOME, a local git origin and a stub `docker`
+- `tests/*.test.sh` — Wrapper contract tests against a throw-away HOME, a local git origin and a stub `docker` (`tests/config-hardening.test.sh` covers the mount/project/worktree/env_file/GPG-mirror refusals). Test-only command overrides (`GPG_AGENT_PROBE_CMD`, `GPG_AGENT_LAUNCH_CMD`, `GPG_RELAY_CMD`) are honoured only with `OPENCODE_DOCKERIZED_TEST_HOOKS=1`
 - `scripts/` — `check-version-bumps.sh` (CI) and `pins-report.sh`
 - `SECURITY.md`, `CONTRIBUTING.md` — Security model and contribution guide
 - `config.example` — Example user config (INI-style), in `examples/`
@@ -110,7 +110,7 @@ source "$REPO_ROOT/lib/config-lib.sh"
 - **Declare and assign separately:** `local dir_name; dir_name=$(...)` (SC2155)
 - **Absolute paths:** `BIN_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"` + `REPO_ROOT="$(cd "$BIN_DIR/.." && pwd)"`
 - **Defaults with `:=`:** `CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/opencode-dockerized}"`
-- **Color defaults in modules:** `: "${RED:='\033[0;31m'}"` (avoid overwriting caller-defined values)
+- **Color defaults in modules:** `: "${RED:=$'\033[0;31m'}"` (ANSI-C quoting stores the real escape byte; avoids overwriting caller-defined values)
 - **Use arrays for Docker args:** Never build docker args as strings — use arrays and `"${array[@]}"`
 
 ### Color Output / Logging
@@ -191,7 +191,7 @@ mount.gitconfig=~/.gitconfig:/home/coder/.gitconfig
 ```
 
 Secrets only travel via `setting.env_file` (dotenv file under `~/.config/opencode-dockerized/`,
-`docker --env-file`, never mounted). The old `env.*` host passthrough was removed.
+`docker --env-file`, never mounted; a file under `$OCODE_HOME` is refused because that tree is mounted). The old `env.*` host passthrough was removed.
 
 ### Dockerfile Conventions
 
@@ -200,7 +200,8 @@ Secrets only travel via `setting.env_file` (dotenv file under `~/.config/opencod
 - Parameterize and pin every tool version via `ARG` (no `latest`): `ARG NVM_VERSION=v0.40.8`, `ARG NODE_VERSION=24.22.2`, `ARG UV_VERSION=0.13.6`, `ARG PNPM_VERSION=12.16.1`, `ARG OPENCODE_VERSION=2.2.5`, the Docker CLI package versions and the Docker apt key fingerprint. `tests/dockerfile-lint.test.sh` enforces this and that the versions quoted here match the Dockerfile
 - Never pipe a remote script into a shell: download the installer (nvm, uv, pnpm) to a file, verify it with `sha256sum -c` against its pinned `*_INSTALL_SHA256` ARG, then run it. When an installer changes upstream the build stops on purpose; review it and bump the hash
 - Install pnpm with the official standalone script run as `env PNPM_VERSION="${PNPM_VERSION}" SHELL="$(which bash)" sh /tmp/pnpm-install.sh`; the installer verifies the release archive against its npm integrity and signature, and `$PNPM_HOME/bin` goes on `PATH` via `ENV`
-- Provenance `LABEL`s (`org.opencontainers.image.revision`, `dev.opencode-dockerized.opencode-version`, `dev.opencode-dockerized.dockerfile-sha256`) are set last from build args the wrapper passes; the wrapper compares the Dockerfile hash to warn about a stale image
+- Provenance `LABEL`s (`org.opencontainers.image.revision`, `dev.opencode-dockerized.opencode-version`, `dev.opencode-dockerized.dockerfile-sha256`) are set last from build args the wrapper passes; the `dockerfile-sha256` label (name kept for compatibility) is the sha256 of `Dockerfile` followed by `entrypoint.sh` (`IMAGE_BUILD_INPUTS` in the wrapper), and the wrapper compares it to warn about a stale image
+- The Docker apt key file must hold exactly one primary key (`pub` count == 1) whose fingerprint equals `DOCKER_GPG_FINGERPRINT`
 - `.dockerignore` is an allowlist (`*` plus the files the Dockerfile COPYs)
 - Install global packages with `pnpm add -g` (never `npm install -g`), passing `--allow-build=<pkg>` since pnpm blocks lifecycle scripts by default; keep npm/npx available for `npx`-based MCP servers
 - Clean apt cache in same RUN layer: `&& rm -rf /var/lib/apt/lists/*`
@@ -228,8 +229,15 @@ Secrets only travel via `setting.env_file` (dotenv file under `~/.config/opencod
 - Writes are allowed only inside the project directory and `/tmp/opencode` (the advertised scratch dir); the generated `opencode.json` allowlists `/tmp/opencode/*` for writes and the guard mirrors that root
 - OpenCode self-update is disabled in the container via `OPENCODE_DISABLE_AUTOUPDATE=true`
 - Run as non-root `coder` inside container; the wrapper maps the host user with `--user <host uid>:<host gid>` so no root process runs
-- Use `--rm` for automatic container cleanup; `--network host` for simplicity
-- Custom user mounts default to read-only
+- Use `--rm` for automatic container cleanup; `--network host` is the default for simplicity, but it exposes host abstract unix sockets (X11, session buses) and localhost services: document `setting.network=bridge` as the safer choice
+- Resource hygiene: `--pids-limit` is always set; memory/CPU only with `setting.memory`/`setting.cpus` (`doctor` warns when no memory limit applies); `/tmp/opencode` is a tmpfs capped at `size=512m`, the rest of `/tmp` lives on the container layer
+- Self-update/install trust: `OCD_VERIFY_SIGNATURES=true` verifies the target commit (or signed tag) **before** HEAD moves (`commit_signature_trusted` in the wrapper, `signature_rejected` in `install.sh`); `OCD_SIGNING_FINGERPRINTS` (space-separated) pins the accepted keys (`%G?` G or U plus `%GF`/`%GP` in the list)
+- `update` flags incoming host-executed code (`bin/`, `lib/`, `install.sh`, `scripts/`, `completions/`) and asks before pulling it on a TTY (`--yes` skips); `upgrade` always asks on a TTY
+- rc-file lines are only written for install paths without `$`, backtick, `"`, `\` or newline (`rc_safe_path`); PATH and completion lines live in `# >>> opencode-dockerized … >>>` blocks that a re-install replaces
+- Custom user mounts default to read-only. Host paths must be absolute or `~/…` and are canonicalized (`readlink -f`); a mount that is, contains or sits under `~/.ssh`, `~/.gnupg`, `$CONFIG_DIR`, `$OCODE_HOME`, `~/.claude`, a Docker socket, `/` or `$HOME` is refused, as is a container path under `/home/coder/.config/opencode`, `.ssh` or `.gnupg` (`validate_custom_mount`)
+- The project directory gets the same treatment (`validate_project_dir`, compared against the literal and the resolved `$HOME`): `$HOME`, `/`, and anything overlapping `~/.ssh`, `~/.gnupg`, `~/.config`, `$CONFIG_DIR`, `$OCODE_HOME`, `~/.claude` or a Docker socket are refused
+- A git worktree's shared `.git` dir is mounted only when the project's `.git` file points at `<common>/worktrees/<name>` and that entry's `gitdir` points back at the project (the `.git` file is container-writable)
+- Refreshing a customized, outdated `opencode.json` merges JSON with `node` (or `python3`); if neither is available or the merge fails, the run is blocked (fail closed) and the user file is left untouched
 - Only pass environment variables explicitly listed in config
 - Container names sanitized to prevent injection via directory names
 
@@ -237,7 +245,7 @@ Secrets only travel via `setting.env_file` (dotenv file under `~/.config/opencod
 
 | Host Path | Container Path | Mode | Purpose |
 |-----------|---------------|------|---------|
-| `$PROJECT_DIR` | `$PROJECT_DIR` (with `$HOME` stripped) | rw | Project files |
+| `$PROJECT_DIR` | `$PROJECT_DIR` (with `$HOME` stripped; a path whose first component is a system dir such as `~/bin` maps to `/home/coder/bin`) | rw | Project files |
 | `~/.config/opencode-dockerized/home/.config/opencode/` | `/home/coder/.config/opencode/` | ro | Self-contained config: MCP servers, `cli.json`, skills, agents, commands, plugins. The security files (`AGENTS.md`, `plugins/security-guard.js`, `plugins/policies/`) are mirrored into this tree on the host by `ensure_opencode_dockerized_config` |
 | `~/.config/opencode-dockerized/home/.local/share/opencode/` | `/home/coder/.local/share/opencode/` | rw | Auth database, sessions |
 | `~/.config/opencode-dockerized/home/.local/state/opencode/` | `/home/coder/.local/state/opencode/` | rw | Selected model, prompt history, locks |

@@ -79,9 +79,16 @@
 #
 # setting.security_policy=balanced
 
-# Optional container resource limits (docker --memory / --cpus). Empty = no limit.
+# Optional container resource limits (docker --memory / --cpus). Empty = no limit
+# (`doctor` warns when no memory limit applies). /tmp/opencode is a 512 MiB tmpfs
+# that counts against the memory limit; the rest of /tmp uses the container layer.
 # setting.memory=4g   (swap is pinned to the same value, so the limit is real)
 # setting.cpus=2
+#
+# Networking: host (default) shares the host network namespace, including
+# localhost services and abstract unix sockets such as X11's. bridge isolates it
+# (host services stay reachable as host.docker.internal).
+# setting.network=bridge
 # Mount ~/.npmrc read-only (needed for private registries). Off by default: the file
 # can hold registry auth tokens, and a mounted copy is readable by the agent.
 # setting.mount_npmrc=true

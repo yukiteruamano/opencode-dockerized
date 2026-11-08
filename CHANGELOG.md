@@ -4,6 +4,59 @@ All notable changes to opencode-dockerized. Versions follow `WRAPPER_VERSION`;
 the guard (`OPENCODE_DOCKERIZED_GUARD_VERSION`) and the policy set
 (`policies/VERSION`) carry their own counters.
 
+## Unreleased — security audit fixes
+
+### Guard (v21)
+- Persistence through git config and git hooks is blocked.
+- Environment dumps get an additional backstop, and `/proc/<pid>/task/<tid>/environ`
+  is treated like `/proc/<pid>/environ`.
+- Write confinement follows symlinks.
+- The read tool covers `.env*` files and relative paths.
+- False positives reduced; cloud metadata endpoints covered more broadly;
+  regex evaluation bounded against ReDoS.
+
+### Config library
+- Git worktree trust, a canonicalised mount guard, project dir validation,
+  fail-closed permission refresh, `setting.env_file` containment, GnuPG mirror
+  symlink handling, and test-only hooks gated behind
+  `OPENCODE_DOCKERIZED_TEST_HOOKS=1`.
+
+### Wrapper and installer
+- `install.sh` verifies the target commit (upstream head, branch tip, tag or
+  SHA) **before** fast-forwarding or checking out, so a refused signature never
+  moves HEAD; fresh clones are made without a working tree until verified, and
+  an offline refresh still verifies HEAD.
+- `OCODE_REF=<branch>` on a reused checkout follows `origin/<branch>` (tracking
+  branch created or fast-forwarded); tags and SHAs are checked out as before.
+- New `OCD_SIGNING_FINGERPRINTS` (space-separated) pins the trusted signing
+  keys for `update`/`upgrade` and `install.sh` (`%G?` G or U, `%GF`/`%GP` in the
+  list). Without it a valid signature from any keyring key is accepted, as before
+  (docs now say so).
+- `update` flags incoming host-executed code (`bin/`, `lib/`, `install.sh`,
+  `scripts/`, `completions/`) and asks for confirmation on a TTY (`--yes` skips).
+- `:previous` is only re-tagged when the rebuild produced a different image ID,
+  so repeated updates keep the good rollback target; `rollback` reminds to run
+  `config sync` after the printed `git reset`.
+- The drift label hashes `Dockerfile` + `entrypoint.sh`, so entrypoint changes
+  mark the image stale.
+- Dockerfile: the Docker apt key file must contain exactly one primary key with
+  the pinned fingerprint.
+- `run DIR extra…` now fails instead of silently ignoring the extra arguments
+  (`run -- DIR` still works).
+- `doctor` warns when no memory limit applies.
+- The installer refuses install paths containing `$`, backtick, `"`, `\` or a
+  newline (they would be evaluated in rc files); completion lines now live in a
+  marked block that a re-install from a moved checkout replaces.
+- Completions: `--full` for `update`/`upgrade`; bash no longer offers config
+  subcommands after `debug config`; zsh `config opencode <TAB>` offers
+  `path|edit`.
+- `scripts/check-version-bumps.sh` fails when the guard marker or
+  `policies/VERSION` is missing or decreased (numeric compare).
+- Docs: what is and is not pinned in the image, `--pull` vs. the digest-pinned
+  base, the `--network host` exposure of abstract unix sockets (prefer
+  `setting.network=bridge`), resource limits and the corrected colour-default
+  snippet in `AGENTS.md`.
+
 ## 0.15.0 (unreleased)
 
 ### Security

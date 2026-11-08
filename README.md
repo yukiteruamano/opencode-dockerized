@@ -133,21 +133,40 @@ opencode-dockerized update
 #### Updates, rollback and reproducibility
 
 - `update` shows the incoming commits (and warns when they touch the guard, the
-  policies, `lib/` or the Dockerfile), merges exactly the revision it showed, then
-  re-runs itself with the new code, refreshes the security layer and rebuilds the
-  image with the newest OpenCode release from npm. The base image is always
-  pulled, system packages and the toolchain are refreshed at most weekly, and
-  `update --full` drops the Docker cache. Two runs never overlap (lock).
-- The previous image stays as `opencode-dockerized:previous` and the previous code
-  revision is recorded, so `rollback` can undo an upgrade that turned out badly.
+  policies, `lib/` or the Dockerfile, and separately when they touch code that
+  runs on the host: `bin/`, `lib/`, `install.sh`, `scripts/`, `completions/`),
+  merges exactly the revision it showed, then re-runs itself with the new code,
+  refreshes the security layer and rebuilds the image with the newest OpenCode
+  release from npm. On a terminal, `update` asks before pulling host-code
+  changes (`upgrade` always asks); `--yes` skips the question. System packages
+  and the toolchain are refreshed at most weekly, and `update --full` drops the
+  Docker cache. The base image is pinned by digest, so it only changes when the
+  Dockerfile's `FROM` line is bumped (`--pull` cannot move a digest). Two runs
+  never overlap (lock).
+- The image an update replaced stays as `opencode-dockerized:previous` (only
+  when the rebuild really produced a different image, so a repeated `update`
+  never overwrites the good rollback target) and the previous code revision is
+  recorded. `rollback` restores the image and prints the `git reset` for the
+  code; run `opencode-dockerized config sync` after that reset so the installed
+  security layer matches the restored code.
 - Images are tagged by OpenCode version and wrapper commit and carry provenance
-  labels; `run` warns when the image was built from a different Dockerfile than
-  your checkout.
+  labels; `run` warns when the image was built from a different `Dockerfile` or
+  `entrypoint.sh` than your checkout.
 - Set `OCD_VERIFY_SIGNATURES=true` to refuse an upstream head (update) or a clone
-  (`install.sh`) without a valid signature; `OCODE_REF=vX.Y.Z` installs a tag.
-- Everything the image installs is pinned (base image digest, Node, uv, pnpm,
-  OpenCode, Docker CLI) and the remote installers are checked against pinned
-  hashes; `scripts/pins-report.sh` shows what has newer releases.
+  or refresh (`install.sh`) without a valid signature; the target is checked
+  before the checkout moves. On its own this accepts **a valid signature from
+  any key in your keyring**. Pin the maintainer key as well with
+  `OCD_SIGNING_FINGERPRINTS="<fingerprint> [...]"` (space-separated, honoured by
+  `update`/`upgrade` and `install.sh`): then only signatures from those keys
+  are trusted. `OCODE_REF=vX.Y.Z` installs a tag, `OCODE_REF=<branch>` follows
+  `origin/<branch>`.
+- Pinned: the base image digest, Node, uv, pnpm, the OpenCode release of a plain
+  `build`, and the Docker CLI packages; the remote installers are checked
+  against pinned hashes (`scripts/pins-report.sh` shows what has newer
+  releases). **Not** pinned: the Debian packages from `apt-get install` (latest
+  in the suite at build time, unless `APT_SNAPSHOT` is set), the dependency tree
+  pnpm resolves for `@opencode/cli` (no lockfile), and `update`, which builds
+  the newest OpenCode release from npm instead of the Dockerfile pin.
 
 ### Global Installation
 
@@ -744,7 +763,7 @@ This significantly reduces risk while maintaining full functionality.
 ## ⚠️ Important Notes
 
 1. **Docker Socket (opt-in)**: Not mounted by default. Set `setting.docker_socket=true` to use the host's Docker daemon (no privileged mode needed) — it is root-equivalent on the host, so enable it only when required.
-2. **Network Access**: Container uses host network mode by default for convenience
+2. **Network Access**: Container uses host network mode by default for convenience. That shares the host network namespace: every host service on localhost is reachable, and so are **abstract unix sockets** (for example X11's `@/tmp/.X11-unix/X0`, D-Bus or other desktop session buses), which file-based isolation does not cover. Prefer `setting.network=bridge` unless you need host networking
 3. **Configuration Updates**: The OpenCode config is self-contained under `~/.config/opencode-dockerized/home/.config/opencode/` and mounted **read-only**; modify it on the host (`config opencode edit`) and restart. Auth/MCP-OAuth live in the read-write data dir, so `auth`/`mcp auth` keep working
 4. **Persistent Data**: Project files plus the whole `~/.config/opencode-dockerized/home/` state tree persist across restarts and rebuilds
 5. **No sudo/apt inside**: The image ships no sudo (no sudoers entry, no binary) — the agent runs as the host user, never as root, with all Linux capabilities dropped and `no-new-privileges` set, so it cannot escalate by design

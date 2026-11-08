@@ -22,6 +22,9 @@ the least access it needs to be useful.
 | SSH agent forwarding (opt-in) | `setting.ssh_agent_support=true` forwards only the host `SSH_AUTH_SOCK` and mounts `~/.ssh/config`/`known_hosts` read-only; private keys (`id_*`, `*.pem`, `*.key`) are never mounted, and a custom mount of `~/.ssh` is refused |
 | Dangerous commands | Deny rules + hook backstops for `sudo`, `rm -rf /`, `mkfs`, `dd of=/dev/…`, `shutdown`/`reboot`; `git push` requires approval |
 | Self-protection | The OpenCode config tree is mounted **read-only**; the security files (`AGENTS.md`, `security-guard.js`, `policies/`) are mirrored into it on the host by the wrapper, so a session cannot relax its own rules or add a persistent plugin/MCP server. Sandbox permission rules are passed inline (`OPENCODE_CONFIG_CONTENT`), not from a writable file |
+| Mount and project validation | Custom mounts and the project directory are canonicalized (`readlink -f`, symlinked `$HOME` included); anything that is, contains or sits under `~/.ssh`, `~/.gnupg`, the wrapper config (`~/.config/opencode-dockerized`, incl. its state tree), `~/.claude`, a Docker socket, `/` or `$HOME` is refused, as is `~/.config` as a project and a mount over the read-only config tree |
+| Persistence into the next session | A worktree `.git` file is trusted only when the shared repo's `worktrees/<name>/gitdir` points back at the project, so a session cannot make the next run mount another host repository; the guard denies writes to `.git/**/hooks/` and `.git/**/config` and `git config` of executable keys (`core.fsmonitor`, `core.hooksPath`, `core.sshCommand`, editors/pagers, `!` aliases, filters, textconv, credential helpers), which would otherwise run on the host |
+| Fail closed | If the permission template cannot be merged into a customized `opencode.json`, the run is blocked instead of starting with the old rules |
 | Policy patterns | The vendored `opencode-policy` pattern sets, evaluated by `plugins/security-guard.js` (see `policies/README.md`) |
 
 ## Known limitations
@@ -31,7 +34,26 @@ the least access it needs to be useful.
   allows mounting `/` and escaping to host root. It is **off by default**;
   enable it only for Docker-in-Docker / Testcontainers.
 - **`--network host`.** The container shares the host network namespace, so it
-  can reach host services and the internet without restrictions.
+  can reach host services and the internet without restrictions. That includes
+  **abstract unix sockets** (they live in the network namespace, not the
+  filesystem): an X11 server listening on `@/tmp/.X11-unix/X0`, session buses
+  or other desktop services are reachable even though their socket files are not
+  mounted, which can mean keystroke injection or screen capture. Use
+  `setting.network=bridge` unless you need host networking.
+- **Resource limits.** `--pids-limit` is always set; memory and CPU are only
+  capped when `setting.memory`/`setting.cpus` are configured (`doctor` warns
+  when no memory limit applies). The scratch dir `/tmp/opencode` is a tmpfs
+  capped at 512 MiB (it counts against the memory limit); the rest of the
+  container's `/tmp` is on the container's writable layer and is bounded only
+  by host disk space.
+- **Self-update trust.** `OCD_VERIFY_SIGNATURES=true` alone accepts a valid
+  signature from any key in your keyring; set `OCD_SIGNING_FINGERPRINTS` to pin
+  the maintainer key(s). The pulled target is verified before HEAD moves, and
+  `update` asks before pulling changes to host-executed code (`bin/`, `lib/`,
+  `install.sh`, `scripts/`, `completions/`) when run on a terminal.
+- **Image contents are not fully pinned.** Debian packages are unversioned
+  (unless `APT_SNAPSHOT` is used), pnpm resolves `@opencode/cli`'s dependency
+  tree without a lockfile, and `update` builds the newest OpenCode release.
 - **GnuPG agent forwarding is a signing oracle.** With
   `setting.gpg_agent_support=true` the container can ask the host `gpg-agent` to
   sign arbitrary data while it runs; it cannot read the private keys. Pinentry
