@@ -132,6 +132,76 @@ OCD_VERIFY_SIGNATURES=true run "$WRAPPER" update --no-build
 [ "$(git -C "$TMP/install" rev-parse HEAD)" = "$before" ] ||
     fail "a refused pull must not move HEAD"
 
+# 4c2. Pinned maintainer keys: with OCD_SIGNING_FINGERPRINTS only a signature
+# from a pinned key is trusted, not any key in the keyring.
+if command -v gpg >/dev/null 2>&1; then
+    export GNUPGHOME="$TMP/gnupg"
+    mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
+    gen_key() {
+        gpg --batch --pinentry-mode loopback --passphrase '' --quick-gen-key "$1 <$1@example.invalid>" ed25519 sign never >/dev/null 2>&1
+        gpg --list-keys --with-colons "$1@example.invalid" 2>/dev/null | awk -F: '/^fpr/ {print $10; exit}'
+    }
+    MAINT_FPR="$(gen_key maint)"
+    OTHER_FPR="$(gen_key other)"
+    if [ -n "$MAINT_FPR" ] && [ -n "$OTHER_FPR" ]; then
+        push_signed() { (cd "$TMP/other" && git pull -q --ff-only && echo "$1" >>CHANGELOG.test && git add -A &&
+            git -c gpg.program=gpg -c user.signingkey="$2" commit -q -S -m "$1" && git push -q origin HEAD:master); }
+        push_signed signed-by-other "$OTHER_FPR"
+        before="$(git -C "$TMP/install" rev-parse HEAD)"
+        OCD_VERIFY_SIGNATURES=true OCD_SIGNING_FINGERPRINTS="$MAINT_FPR" run "$WRAPPER" update --no-build
+        [ "$RC" -eq 1 ] || fail "a head signed by a key that is not pinned must be refused (got $RC)"
+        grep -q 'pinned to OCD_SIGNING_FINGERPRINTS' <<<"$OUT" || fail "the refusal must mention the pinned keys"
+        [ "$(git -C "$TMP/install" rev-parse HEAD)" = "$before" ] || fail "a non-pinned signature must not move HEAD"
+        push_signed signed-by-maint "$MAINT_FPR"
+        OCD_VERIFY_SIGNATURES=true OCD_SIGNING_FINGERPRINTS="${MAINT_FPR,,}" run "$WRAPPER" update --no-build
+        [ "$RC" -eq 0 ] || fail "a head signed by a pinned key must be accepted (got $RC)"
+        [ "$(git -C "$TMP/install" rev-parse HEAD)" = "$(git -C "$TMP/origin.git" rev-parse master)" ] ||
+            fail "a pinned signature must fast-forward to the upstream head"
+    else
+        echo "note: could not create throwaway GnuPG keys; skipping the pinned-key scenario"
+    fi
+    gpgconf --kill gpg-agent >/dev/null 2>&1 || true
+    unset GNUPGHOME
+fi
+
+# 4c3. Host-executed code (bin/, install.sh, scripts/, completions/, lib/) is
+# flagged, and `update` asks before pulling it when interactive (a TTY via
+# `script`); --yes skips the question, and other changes are pulled silently.
+if command -v script >/dev/null 2>&1 && script -qec true /dev/null </dev/null >/dev/null 2>&1; then
+    tty_update() {
+        OUT="$(printf '%s\n' "$1" | SHELL=/bin/bash script -qec "$WRAPPER update --no-build ${2:-}" /dev/null 2>&1)"
+        RC=$?
+    }
+    (cd "$TMP/other" && git pull -q --ff-only && echo '# touched' >>scripts/pins-report.sh &&
+        git add -A && git commit -q -m "host script change" && git push -q origin HEAD:master)
+    before="$(git -C "$TMP/install" rev-parse HEAD)"
+    tty_update n
+    grep -q 'runs on the HOST' <<<"$OUT" || fail "a change under scripts/ must be flagged as host-executed code"
+    grep -q 'Pull 1 commit(s)?' <<<"$OUT" || fail "update must ask before pulling host-code changes on a TTY"
+    [ "$(git -C "$TMP/install" rev-parse HEAD)" = "$before" ] || fail "declining the prompt must not move HEAD"
+    tty_update "" --yes
+    if grep -q 'Pull 1 commit(s)?' <<<"$OUT"; then fail "update --yes must not ask"; fi
+    [ "$(git -C "$TMP/install" rev-parse HEAD)" = "$(git -C "$TMP/origin.git" rev-parse master)" ] ||
+        fail "update --yes must pull the host-code change"
+    push_upstream_commit docs-only
+    tty_update n
+    if grep -q 'Pull 1 commit(s)?' <<<"$OUT"; then fail "update must not ask when no host code changes"; fi
+    [ "$(git -C "$TMP/install" rev-parse HEAD)" = "$(git -C "$TMP/origin.git" rev-parse master)" ] ||
+        fail "update must pull a change that touches no host code without asking"
+else
+    echo "note: script(1) cannot allocate a pty here; skipping the interactive update prompt scenario"
+fi
+for f in install.sh bin/opencode-dockerized completions/bash.sh; do
+    (cd "$TMP/other" && git pull -q --ff-only && echo '# touched' >>"$f" &&
+        git add -A && git commit -q -m "touch $f" && git push -q origin HEAD:master)
+    run "$WRAPPER" upgrade --check
+    grep -q 'runs on the HOST' <<<"$OUT" || fail "a change to $f must be flagged as host-executed code"
+    grep -qF "    $f" <<<"$OUT" || fail "the flagged host-code list must name $f"
+    run "$WRAPPER" update --no-build --yes
+    [ "$RC" -eq 0 ] || fail "update --yes after touching $f must succeed (got $RC)"
+done
+push_upstream_commit five # leave the checkout behind for the scenarios below
+
 # 4d. Machine-readable --check.
 run "$WRAPPER" upgrade --check --json
 [ "$RC" -eq 10 ] || fail "--check --json must keep exit code 10 (got $RC)"
@@ -172,31 +242,55 @@ export PATH="$PATH_BACKUP"
 
 # 4g. The rebuild refreshes what a cached build never would: base image (--pull),
 # the weekly package/toolchain layers (APT_REFRESH), the newest OpenCode release,
-# and with --full the whole cache. The previous image is kept as :previous.
+# and with --full the whole cache. The replaced image is kept as :previous.
+# The stub keeps the current image ID in a file; `build` switches it to
+# $DOCKER_STUB_BUILD_ID when set (a changed image), else leaves it (a no-op).
 STUB_BIN="$TMP/stub-bin"
 mkdir -p "$STUB_BIN" "$TMP/reg/@opencode/cli"
 export DOCKER_STUB_LOG="$TMP/docker.log"
+export DOCKER_STUB_ID_FILE="$TMP/docker.id"
+echo sha256:aaa >"$DOCKER_STUB_ID_FILE"
 cat >"$STUB_BIN/docker" <<'STUB'
 #!/bin/bash
 echo "$*" >>"$DOCKER_STUB_LOG"
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$3" = --format ] && [ "$4" = '{{.Id}}' ]; then
+    cat "$DOCKER_STUB_ID_FILE"
+fi
+if [ "$1" = build ] && [ -n "${DOCKER_STUB_BUILD_ID:-}" ]; then
+    echo "$DOCKER_STUB_BUILD_ID" >"$DOCKER_STUB_ID_FILE"
+fi
 exit 0
 STUB
 chmod +x "$STUB_BIN/docker"
 printf '{"name":"@opencode/cli","version":"2.9.9"}' >"$TMP/reg/@opencode/cli/latest"
 : >"$DOCKER_STUB_LOG"
-PATH="$STUB_BIN:$PATH" OCD_NPM_REGISTRY="file://$TMP/reg" run "$WRAPPER" update --full
+PATH="$STUB_BIN:$PATH" OCD_NPM_REGISTRY="file://$TMP/reg" DOCKER_STUB_BUILD_ID=sha256:bbb run "$WRAPPER" update --full
 [ "$RC" -eq 0 ] || fail "update --full against a stub docker must succeed (got $RC)"
 build_line="$(grep -m1 '^build ' "$DOCKER_STUB_LOG")"
 for needle in ' --pull ' ' --no-cache ' '--build-arg APT_REFRESH=' '--build-arg OPENCODE_BUILD_TIME=' '--build-arg OPENCODE_VERSION=2.9.9'; do
     grep -qF -- "$needle" <<<"$build_line" || fail "update --full build line lacks '$needle'"
 done
-grep -qx 'tag opencode-dockerized:latest opencode-dockerized:previous' "$DOCKER_STUB_LOG" ||
-    fail "the previous image must be tagged :previous before rebuilding"
+grep -qx 'tag sha256:aaa opencode-dockerized:previous' "$DOCKER_STUB_LOG" ||
+    fail "the replaced image (by ID) must be tagged :previous after a rebuild that changed it"
 : >"$DOCKER_STUB_LOG"
+# A rebuild that yields the same image must keep the existing rollback target.
 PATH="$STUB_BIN:$PATH" OCD_NPM_REGISTRY="file://$TMP/reg" run "$WRAPPER" update
 build_line="$(grep -m1 '^build ' "$DOCKER_STUB_LOG")"
 if grep -qF -- ' --no-cache ' <<<"$build_line"; then fail "a plain update must keep the Docker cache"; fi
-grep -qF -- ' --pull ' <<<"$build_line" || fail "a plain update must still pull the base image"
+grep -qF -- ' --pull ' <<<"$build_line" || fail "a plain update must still pass --pull"
+if grep -q 'opencode-dockerized:previous' "$DOCKER_STUB_LOG"; then
+    fail "a rebuild that produced the same image must not overwrite :previous"
+fi
+grep -q 'same image' <<<"$OUT" || fail "an unchanged rebuild must say :previous was kept"
+
+# 4h. rollback restores :previous and prints the git reset plus the config sync.
+: >"$DOCKER_STUB_LOG"
+PATH="$STUB_BIN:$PATH" run "$WRAPPER" rollback
+[ "$RC" -eq 0 ] || fail "rollback must succeed (got $RC)"
+grep -qx 'tag opencode-dockerized:previous opencode-dockerized:latest' "$DOCKER_STUB_LOG" ||
+    fail "rollback must restore :previous"
+grep -q 'reset --hard' <<<"$OUT" || fail "rollback must print the git reset"
+grep -q 'config sync' <<<"$OUT" || fail "rollback must tell the user to run config sync after the reset"
 
 # 5. Diverged: refuse, leave the checkout untouched, exit 1.
 push_upstream_commit two

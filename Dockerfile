@@ -66,10 +66,16 @@ RUN apt-get update && apt-get install -y \
 
 # Install Docker CLI only (uses host Docker daemon via mounted socket)
 # We don't need docker-ce (daemon) or containerd.io since we use the host's Docker.
-# The repository key is accepted only when it has the published fingerprint.
+# The repository key file is accepted only when it holds exactly one primary
+# key and that key has the published fingerprint (an extra key appended to the
+# file would otherwise be trusted by signed-by too).
 RUN install -m 0755 -d /etc/apt/keyrings && \
     curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc && \
-    actual_fingerprint="$(gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc | awk -F: '/^fpr/ && !seen {print $10; seen=1}')" && \
+    key_listing="$(gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc)" && \
+    primary_keys="$(grep -c '^pub:' <<<"${key_listing}" || true)" && \
+    { [ "${primary_keys}" = 1 ] || \
+        { echo "Docker apt key file must hold exactly one primary key (found ${primary_keys})" >&2; exit 1; }; } && \
+    actual_fingerprint="$(awk -F: '/^pub:/ {p=1; next} p && /^fpr:/ {print $10; exit}' <<<"${key_listing}")" && \
     { [ "${actual_fingerprint}" = "${DOCKER_GPG_FINGERPRINT}" ] || \
         { echo "Docker apt key fingerprint mismatch: got ${actual_fingerprint}" >&2; exit 1; }; } && \
     chmod a+r /etc/apt/keyrings/docker.asc && \
@@ -168,7 +174,9 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # Provenance labels (last, so changing them never invalidates the layers above).
 # The wrapper passes GIT_SHA, DOCKERFILE_SHA256 and BUILD_DATE; it reads the
-# Dockerfile hash back to warn when the image is older than the checkout.
+# hash back to warn when the image is older than the checkout. Despite the
+# name, DOCKERFILE_SHA256 covers every build input: the sha256 of Dockerfile
+# followed by entrypoint.sh (concatenated in that order).
 ARG GIT_SHA=unknown
 ARG DOCKERFILE_SHA256=unknown
 ARG BUILD_DATE=unknown

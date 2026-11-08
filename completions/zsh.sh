@@ -64,18 +64,25 @@ _opencode_dockerized() {
                         '--json[Output statistics as JSON]'
                     ;;
                 config)
-                    local -a config_cmds
-                    config_cmds=(
-                        'show:Show current configuration'
-                        'edit:Edit wrapper config file in $EDITOR'
-                        'path:Print wrapper config file path'
-                        'sync:Refresh security layer from repo (--check for drift only)'
-                        'opencode:Show or edit the OpenCode config (path|edit)'
-                    )
-                    _describe -t config_cmds 'config subcommand' config_cmds
+                    # words[1]=config; CURRENT counts from it after `*::`.
+                    if (( CURRENT == 2 )); then
+                        local -a config_cmds
+                        config_cmds=(
+                            'show:Show current configuration'
+                            'edit:Edit wrapper config file in $EDITOR'
+                            'path:Print wrapper config file path'
+                            'sync:Refresh security layer from repo (--check for drift only)'
+                            'opencode:Show or edit the OpenCode config (path|edit)'
+                        )
+                        _describe -t config_cmds 'config subcommand' config_cmds
+                    elif (( CURRENT == 3 )) && [[ $words[2] == opencode ]]; then
+                        _values 'opencode config subcommand' path edit
+                    elif (( CURRENT == 3 )) && [[ $words[2] == sync ]]; then
+                        _values 'sync flag' --check
+                    fi
                     ;;
                 upgrade|update)
-                    _values 'self-update flag' --check --json --yes --no-build
+                    _values 'self-update flag' --check --json --yes --no-build --full
                     ;;
                 install)
                     _arguments \

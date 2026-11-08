@@ -129,7 +129,13 @@ mem=""
 for f in "$root/sys/fs/cgroup/memory.max" "$root/sys/fs/cgroup/memory/memory.limit_in_bytes"; do
     [ -r "$f" ] && { mem=$(cat "$f"); break; }
 done
-if [ -n "$mem" ] && [ "$mem" != max ]; then note "memory limit: $mem bytes"; else note "memory limit: none (setting.memory unset)"; fi
+# A missing memory cap is a warning, not a failure: it is a valid choice, but a
+# runaway process can then exhaust the host (set setting.memory, e.g. 4g).
+if [ -n "$mem" ] && [ "$mem" != max ]; then
+    note "memory limit: $mem bytes"
+else
+    note "memory limit: WARNING none (set setting.memory, e.g. setting.memory=4g)"
+fi
 echo "== ssh agent =="
 if [ "${OPENCODE_DOCKERIZED_SSH_AGENT:-false}" != true ]; then
     note "ssh agent forwarding: disabled in wrapper config (skipped)"
@@ -294,7 +300,24 @@ tag_image_versions() {
     [ -z "$short_sha" ] || docker tag "$IMAGE_NAME" "$base:$short_sha" || true
 }
 
-# Build the image with provenance build args (commit, Dockerfile hash, date).
+# Files baked into the image by the build: a change to any of them makes the
+# image stale. Order is fixed so the hash is deterministic.
+IMAGE_BUILD_INPUTS=(Dockerfile entrypoint.sh)
+
+# SHA-256 over the build inputs, concatenated in IMAGE_BUILD_INPUTS order.
+# Stored in the dev.opencode-dockerized.dockerfile-sha256 label (name kept for
+# compatibility with older images and `clean`). Prints nothing on failure.
+build_inputs_sha256() {
+    local -a paths=()
+    local f
+    for f in "${IMAGE_BUILD_INPUTS[@]}"; do
+        [ -f "$REPO_ROOT/$f" ] || return 1
+        paths+=("$REPO_ROOT/$f")
+    done
+    file_sha256 <(cat "${paths[@]}")
+}
+
+# Build the image with provenance build args (commit, build-input hash, date).
 # Options: --latest resolves the newest OpenCode release first; any other
 # argument goes to `docker build` as-is.
 # Usage: build_image_with_args [--latest] [docker build args...]
@@ -318,7 +341,7 @@ build_image_with_args() {
         fi
     fi
     git_sha=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)
-    dockerfile_sha=$(file_sha256 "$REPO_ROOT/Dockerfile" || true)
+    dockerfile_sha=$(build_inputs_sha256 || true)
     build_args+=(
         --build-arg "GIT_SHA=${git_sha:-unknown}"
         --build-arg "DOCKERFILE_SHA256=${dockerfile_sha:-unknown}"
@@ -328,11 +351,12 @@ build_image_with_args() {
     tag_image_versions
 }
 
-# Warn when the image was not built from this checkout's Dockerfile: the
-# entrypoint and tool versions baked into it may not match the wrapper.
+# Warn when the image was not built from this checkout's Dockerfile and
+# entrypoint.sh: the entrypoint and tool versions baked into it may not match
+# the wrapper.
 check_image_drift() {
     local want have
-    want=$(file_sha256 "$REPO_ROOT/Dockerfile" 2>/dev/null || true)
+    want=$(build_inputs_sha256 2>/dev/null || true)
     [ -n "$want" ] || return 0
     have=$(docker image inspect --format '{{ index .Config.Labels "dev.opencode-dockerized.dockerfile-sha256" }}' "$IMAGE_NAME" 2>/dev/null || true)
     case "$have" in
@@ -341,7 +365,7 @@ check_image_drift() {
         ;;
     "$want") ;;
     *)
-        print_warning "The image was built from a different Dockerfile than this checkout; run '$(basename "$0") build' (or 'update') to rebuild it."
+        print_warning "The image was built from a different Dockerfile or entrypoint.sh than this checkout; run '$(basename "$0") build' (or 'update') to rebuild it."
         ;;
     esac
     return 0
@@ -489,8 +513,23 @@ run_auth() {
     print_success "Authentication complete! Your credentials are saved in $OCODE_HOME/.local/share/opencode"
 }
 
+# Refuse arguments `run` would otherwise silently drop (it takes one DIR).
+# Checked before anything touches the config tree or Docker.
+# Usage: check_run_args [--] [DIR]
+check_run_args() {
+    [ "${1:-}" = "--" ] && shift
+    [ $# -le 1 ] && return 0
+    shift
+    print_error "Unexpected argument(s) after the project directory: $*"
+    print_info "Usage: $(basename "$0") run [--] [DIR] (OpenCode options are not forwarded by 'run')"
+    exit 1
+}
+
 # Function to run OpenCode
+# Usage: run_opencode [--] [DIR]
 run_opencode() {
+    # `--` ends option parsing, so a directory named like an option still works.
+    [ "${1:-}" = "--" ] && shift
     local project_dir="${1:-$(pwd)}"
     local dry_run="${DRY_RUN:-false}"
 
@@ -589,12 +628,12 @@ run_opencode() {
 # Exit codes: 0 updated, 1 failed/declined, 2 already up to date, 10 update
 # available (--check only). Callers must capture them with `|| rc=$?`:
 # a bare `cmd; rc=$?` never reaches the assignment under `set -e`.
-# Usage: _git_pull_wrapper <yes:true|false> <check_only:true|false>
+# Usage: _git_pull_wrapper <yes:true|false> <check_only:true|false> [prompt:always|host-code]
 UP_FAILED=1
 UP_CURRENT=2
 UP_AVAILABLE=10
 _git_pull_wrapper() {
-    local yes="$1" check_only="$2"
+    local yes="$1" check_only="$2" prompt="${3:-always}"
     if [ ! -d "$REPO_ROOT/.git" ]; then
         print_error "Not a git checkout ($REPO_ROOT); reinstall with install.sh to enable self-update."
         return 1
@@ -632,7 +671,16 @@ _git_pull_wrapper() {
     if [ "$check_only" = true ]; then
         return "$UP_AVAILABLE"
     fi
-    if [ "$yes" != true ] && [ -t 0 ]; then
+    # Opt-in: refuse an upstream head without a trusted signature, before
+    # asking anything and before HEAD moves.
+    if [ "${OCD_VERIFY_SIGNATURES:-false}" = true ] && ! commit_signature_trusted "$REPO_ROOT" "$remote_rev"; then
+        print_error "Upstream head ${remote_rev:0:12} has no trusted signature (OCD_VERIFY_SIGNATURES=true${OCD_SIGNING_FINGERPRINTS:+, pinned to OCD_SIGNING_FINGERPRINTS}); refusing to merge."
+        return 1
+    fi
+    # `upgrade` always asks on a TTY; `update` asks only when the pull brings
+    # code that runs on the host (see _show_incoming_changes). --yes skips both.
+    if [ "$yes" != true ] && [ -t 0 ] &&
+        { [ "$prompt" = always ] || [ "${_UP_HOST_CODE_CHANGED:-false}" = true ]; }; then
         local ans
         read -r -p "Pull $n commit(s)? (Y/n): " ans || ans=""
         case "${ans:-y}" in
@@ -642,12 +690,6 @@ _git_pull_wrapper() {
             return 1
             ;;
         esac
-    fi
-    # Opt-in: refuse an upstream head without a valid signature.
-    if [ "${OCD_VERIFY_SIGNATURES:-false}" = true ] &&
-        ! git -C "$REPO_ROOT" verify-commit "$remote_rev" >/dev/null 2>&1; then
-        print_error "Upstream head ${remote_rev:0:12} has no valid signature (OCD_VERIFY_SIGNATURES=true); refusing to merge."
-        return 1
     fi
     # Keep the previous revision so `rollback` can point back to it.
     mkdir -p "$CONFIG_DIR" 2>/dev/null || true
@@ -662,11 +704,14 @@ _git_pull_wrapper() {
     return 0
 }
 
-# List the incoming commits and flag changes to the security layer or the image
-# build, so the user sees what a pull brings before it is merged.
+# List the incoming commits and flag changes to the security layer, the image
+# build and the code that runs on the host (outside the sandbox), so the user
+# sees what a pull brings before it is merged.
+# Sets _UP_HOST_CODE_CHANGED=true when host-executed code changes.
 # Usage: _show_incoming_changes <remote_rev>
 _show_incoming_changes() {
-    local remote_rev="$1" touched
+    local remote_rev="$1" touched host_code
+    _UP_HOST_CODE_CHANGED=false
     git -C "$REPO_ROOT" log --oneline --no-merges -n 20 "HEAD..$remote_rev" | sed 's/^/    /'
     touched=$(git -C "$REPO_ROOT" diff --name-only "HEAD..$remote_rev" -- \
         Dockerfile entrypoint.sh lib plugins policies | head -10)
@@ -674,14 +719,48 @@ _show_incoming_changes() {
         print_warning "Incoming changes touch the security layer or the image build:"
         printf '%s\n' "$touched" | sed 's/^/    /'
     fi
+    host_code=$(git -C "$REPO_ROOT" diff --name-only "HEAD..$remote_rev" -- \
+        bin lib install.sh scripts completions opencode-dockerized.sh setup.sh run-simple.sh | head -10)
+    if [ -n "$host_code" ]; then
+        _UP_HOST_CODE_CHANGED=true
+        print_warning "Incoming changes touch code that runs on the HOST, outside the sandbox (review before pulling):"
+        printf '%s\n' "$host_code" | sed 's/^/    /'
+    fi
+}
+
+# True when <rev> carries a signature this host trusts. Without
+# OCD_SIGNING_FINGERPRINTS that is any valid signature from a key in the
+# keyring (`git verify-commit`). With it (space-separated fingerprints), the
+# signature must be good (%G? = G, or U: good but the key's validity is unset,
+# which the pin replaces) and its signing key (%GF) or primary key (%GP) must
+# be one of the pinned fingerprints.
+# Usage: commit_signature_trusted <repo_dir> <rev>
+commit_signature_trusted() {
+    local dir="$1" rev="$2" pins="${OCD_SIGNING_FINGERPRINTS:-}" info status fpr primary pin
+    if [ -z "$pins" ]; then
+        git -C "$dir" verify-commit "$rev" >/dev/null 2>&1
+        return
+    fi
+    info=$(git -C "$dir" log -1 --format='%G?%n%GF%n%GP' "$rev" 2>/dev/null) || return 1
+    status=$(sed -n 1p <<<"$info")
+    fpr=$(sed -n 2p <<<"$info" | tr '[:lower:]' '[:upper:]')
+    primary=$(sed -n 3p <<<"$info" | tr '[:lower:]' '[:upper:]')
+    case "$status" in G | U) ;; *) return 1 ;; esac
+    for pin in $pins; do
+        pin=$(tr '[:lower:]' '[:upper:]' <<<"$pin")
+        if [ -n "$fpr" ] && [ "$pin" = "$fpr" ]; then return 0; fi
+        if [ -n "$primary" ] && [ "$pin" = "$primary" ]; then return 0; fi
+    done
+    return 1
 }
 
 # Rebuild the image with cache-busting so the latest OpenCode is installed.
+# The image it replaces becomes :previous (the rollback target) only when the
+# build really produced a different image: a no-op rebuild must not overwrite
+# the last known-good rollback with the current image.
 _rebuild_opencode_image() {
-    local previous_tag="${IMAGE_NAME%:*}:previous"
-    if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-        docker tag "$IMAGE_NAME" "$previous_tag" || true
-    fi
+    local previous_tag="${IMAGE_NAME%:*}:previous" old_id new_id
+    old_id=$(image_id "$IMAGE_NAME")
     print_info "Rebuilding image with latest code..."
     # --pull refreshes the base image; APT_REFRESH (ISO week) re-runs the system
     # package layers at most weekly; --full also drops the cache entirely.
@@ -690,11 +769,24 @@ _rebuild_opencode_image() {
         --build-arg "APT_REFRESH=$(date +%G-%V)")
     [ "${_UP_FULL:-false}" = true ] && rebuild_args+=(--no-cache)
     if ! build_image_with_args "${rebuild_args[@]}"; then
-        print_error "Image build failed; the previous image is kept as $previous_tag. Run '$(basename "$0") rollback' to restore it."
+        print_error "Image build failed; $IMAGE_NAME was left unchanged ('$(basename "$0") rollback' restores $previous_tag if needed)."
         return 1
+    fi
+    new_id=$(image_id "$IMAGE_NAME")
+    if [ -n "$old_id" ] && [ "$old_id" != "$new_id" ]; then
+        docker tag "$old_id" "$previous_tag" || true
+        print_info "The replaced image is kept as $previous_tag ('$(basename "$0") rollback' restores it)."
+    elif [ -n "$old_id" ]; then
+        print_info "The rebuild produced the same image; $previous_tag is kept as it was."
     fi
     print_info "Updated OpenCode version:"
     docker run --rm --entrypoint bash "$IMAGE_NAME" -c "opencode --version" 2>/dev/null || true
+}
+
+# Image ID of a tag, empty when it does not exist.
+# Usage: image_id <image>
+image_id() {
+    docker image inspect --format '{{.Id}}' "$1" 2>/dev/null || true
 }
 
 # Parse self-update flags shared by `update` and `upgrade`.
@@ -811,6 +903,8 @@ rollback_wrapper() {
     if [ -s "$rev_file" ]; then
         print_info "To restore the previous wrapper code, run:"
         echo "  git -C \"$REPO_ROOT\" reset --hard $(cat "$rev_file")"
+        print_info "Then refresh the installed security layer from that code:"
+        echo "  $(basename "$0") config sync"
         restored=true
     fi
     if [ "$restored" != true ]; then
@@ -845,11 +939,12 @@ full_upgrade() {
         return "$pull_rc"
     fi
     acquire_wrapper_lock || return 1
-    # `update` never prompts (historic one-shot); `upgrade` prompts when tty.
+    # `update` prompts only for incoming host-code changes; `upgrade` always
+    # prompts when interactive. --yes skips the prompt for both.
     if [ "$_UP_POST_PULL" = true ]; then
         pull_rc=$UP_CURRENT # the code was already pulled by the previous process
     elif [ "$cmd" = "update" ]; then
-        _git_pull_wrapper true false || pull_rc=$?
+        _git_pull_wrapper "$_UP_YES" false host-code || pull_rc=$?
     else
         _git_pull_wrapper "$_UP_YES" false || pull_rc=$?
     fi
@@ -1117,7 +1212,7 @@ OpenCode Docker Wrapper
 Usage: $0 [COMMAND] [OPTIONS]
 
 Commands:
-    run [DIR]           Run OpenCode in Docker (default: current directory)
+    run [--] [DIR]      Run OpenCode in Docker (default: current directory)
     auth                Run OpenCode authentication (opencode auth login)
     models [DIR]        List models available to the configured providers
     exec MSG [OPTS]     Run a non-interactive prompt (opencode run)
@@ -1127,9 +1222,9 @@ Commands:
     debug [ARGS]        Debugging tools (paths|config|agents, default: paths)
     doctor              Diagnose install, guard, SSH/GPG, websearch, theme and env file
     install [OPTS]      First-time install / repair PATH, config, completions, aliases
-    upgrade [--check [--json]|--yes|--no-build]  Full upgrade: git pull + sync + image rebuild
+    upgrade [--check [--json]|--yes|--no-build|--full]  Full upgrade: git pull + sync + image rebuild
     build               Build the Docker image
-    update [--check [--json]|--yes|--no-build]   Full upgrade: git pull + sync + image rebuild
+    update [--check [--json]|--yes|--no-build|--full]   Full upgrade: git pull + sync + image rebuild
     rollback            Restore the previous image; show how to restore the previous code
     uninstall           Show how to remove the install (config is left untouched)
     version             Show wrapper, guard and OpenCode versions
@@ -1141,6 +1236,7 @@ Commands:
 Environment Variables:
     DRY_RUN=true        Print the Docker command without executing it
     OCD_VERIFY_SIGNATURES=true  Refuse to pull/install an upstream head without a valid signature
+    OCD_SIGNING_FINGERPRINTS="FPR ..."  With the above, trust only these (maintainer) keys
     OCD_SERVER_TIMEOUT=SECS     Seconds to wait for the in-container server (default 120)
 
 Examples:
@@ -1217,6 +1313,7 @@ main() {
 
     case "$command" in
     run)
+        check_run_args "$@"
         check_docker
         check_config
         run_opencode "$@"

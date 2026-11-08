@@ -17,19 +17,21 @@ _opencode_dockerized() {
             return 0
             ;;
         opencode)
-            if [ "${COMP_WORDS[1]}" = "config" ]; then
+            if [ "${COMP_WORDS[1]}" = "config" ] && [ "${COMP_CWORD}" -eq 3 ]; then
                 mapfile -t COMPREPLY < <(compgen -W "path edit" -- "${cur}")
                 return 0
             fi
             ;;
         config)
-            # Complete config subcommands
-            mapfile -t COMPREPLY < <(compgen -W "show edit path opencode sync" -- "${cur}")
+            # Only `opencode-dockerized config <TAB>`, never `debug config <TAB>`
+            if [ "${COMP_WORDS[1]}" = "config" ] && [ "${COMP_CWORD}" -eq 2 ]; then
+                mapfile -t COMPREPLY < <(compgen -W "show edit path opencode sync" -- "${cur}")
+            fi
             return 0
             ;;
         sync)
             # Second-level flag for `config sync`
-            if [ "${COMP_WORDS[1]}" = "config" ]; then
+            if [ "${COMP_WORDS[1]}" = "config" ] && [ "${COMP_CWORD}" -eq 3 ]; then
                 mapfile -t COMPREPLY < <(compgen -W "--check" -- "${cur}")
                 return 0
             fi
@@ -47,7 +49,7 @@ _opencode_dockerized() {
             return 0
             ;;
         upgrade|update)
-            mapfile -t COMPREPLY < <(compgen -W "--check --json --yes --no-build" -- "${cur}")
+            mapfile -t COMPREPLY < <(compgen -W "--check --json --yes --no-build --full" -- "${cur}")
             return 0
             ;;
         install)
@@ -69,6 +71,15 @@ _opencode_dockerized() {
             return 0
             ;;
         *)
+            ;;
+    esac
+
+    case "${COMP_WORDS[1]}" in
+        upgrade|update)
+            if [ "${COMP_CWORD}" -gt 1 ]; then
+                mapfile -t COMPREPLY < <(compgen -W "--check --json --yes --no-build --full" -- "${cur}")
+                return 0
+            fi
             ;;
     esac
 

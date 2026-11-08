@@ -86,6 +86,20 @@ if grep -q -- ' --memory ' <<<"$line"; then fail "a zero memory limit must be ig
 grep -q -- ' --pids-limit 4096 ' <<<"$line" || fail "an invalid pids_limit must fall back to the default"
 rm -f "$CONFIG_DIR/config"
 
+# 1d. `run` takes a single DIR: extra arguments are refused before anything
+# runs (they used to be dropped silently); `--` still ends option parsing.
+run_wrapper run "$TMP/proj" --model foo
+[ "$RC" -eq 1 ] || fail "run with extra arguments must exit 1 (got $RC)"
+grep -q 'Unexpected argument(s) after the project directory: --model foo' <<<"$OUT" ||
+    fail "the unexpected arguments must be named"
+if grep -q '^run ' "$DOCKER_STUB_LOG"; then fail "no container may start when run gets extra arguments"; fi
+mkdir -p "$TMP/-dashdir"
+run_wrapper run -- "$TMP/-dashdir"
+[ "$RC" -eq 0 ] || fail "run -- DIR must succeed (got $RC)"
+docker_run_line | grep -qF -- "$TMP/-dashdir" || fail "run -- DIR must mount DIR"
+run_wrapper run -- "$TMP/proj" extra
+[ "$RC" -eq 1 ] || fail "run -- DIR extra must be refused too (got $RC)"
+
 # 2. The container's exit code is propagated; only real failures are reported.
 DOCKER_STUB_RC=3 run_wrapper run "$TMP/proj"
 [ "$RC" -eq 3 ] || fail "run must exit with the container's code (want 3, got $RC)"
@@ -179,12 +193,17 @@ fi
 exit 0
 STUB
 export DOCKER_STUB_VERSION_LABEL=2.0.26
-want_dsha="$(sha256sum "$REPO_DIR/Dockerfile" | cut -d' ' -f1)"
+# The drift label hashes Dockerfile + entrypoint.sh (concatenated, in that
+# order), so an entrypoint-only change is detected too.
+want_dsha="$(cat "$REPO_DIR/Dockerfile" "$REPO_DIR/entrypoint.sh" | sha256sum | cut -d' ' -f1)"
+[ "$want_dsha" != "$(sha256sum "$REPO_DIR/Dockerfile" | cut -d' ' -f1)" ] ||
+    fail "test setup: the build-input hash must differ from the Dockerfile-only hash"
 run_wrapper build
 [ "$RC" -eq 0 ] || fail "build must succeed against the stub (got $RC)"
 build_line="$(grep -m1 '^build ' "$DOCKER_STUB_LOG")"
 grep -qE -- '--build-arg GIT_SHA=[0-9a-f]{40}' <<<"$build_line" || fail "build must pass GIT_SHA"
-grep -q -- "--build-arg DOCKERFILE_SHA256=$want_dsha" <<<"$build_line" || fail "build must pass the Dockerfile hash"
+grep -q -- "--build-arg DOCKERFILE_SHA256=$want_dsha" <<<"$build_line" ||
+    fail "build must pass the hash of Dockerfile + entrypoint.sh"
 grep -qE -- '--build-arg BUILD_DATE=[0-9]{4}-' <<<"$build_line" || fail "build must pass BUILD_DATE"
 grep -q -- ' -t opencode-dockerized:latest ' <<<"$build_line" || fail "build must tag the default image name"
 grep -qx 'tag opencode-dockerized:latest opencode-dockerized:2.0.26' "$DOCKER_STUB_LOG" ||
@@ -217,6 +236,9 @@ DOCKER_STUB_SHA_LABEL="$want_dsha" run_wrapper run "$TMP/proj"
 if grep -qE 'different Dockerfile|no build labels' <<<"$OUT"; then fail "an up-to-date image must not warn"; fi
 DOCKER_STUB_SHA_LABEL="deadbeef" run_wrapper run "$TMP/proj"
 grep -q 'different Dockerfile' <<<"$OUT" || fail "a Dockerfile hash mismatch must warn"
+DOCKER_STUB_SHA_LABEL="$(sha256sum "$REPO_DIR/Dockerfile" | cut -d' ' -f1)" run_wrapper run "$TMP/proj"
+grep -q 'different Dockerfile or entrypoint.sh' <<<"$OUT" ||
+    fail "an image built with another entrypoint.sh (Dockerfile-only hash) must warn"
 DOCKER_STUB_SHA_LABEL="" run_wrapper run "$TMP/proj"
 grep -q 'no build labels' <<<"$OUT" || fail "an image without labels must be reported"
 unset DOCKER_STUB_VERSION_LABEL

@@ -16,6 +16,16 @@ install_fail() {
     INSTALL_FAILED=true
 }
 
+# True when a path can be written into a double-quoted rc-file line without
+# the shell evaluating any part of it: no `$`, backtick, `"`, `\` or newline.
+# Usage: rc_safe_path <path>
+rc_safe_path() {
+    case "$1" in
+    *'$'* | *'`'* | *'"'* | *'\'* | *$'\n'*) return 1 ;;
+    esac
+    return 0
+}
+
 # PATH export for a bin dir, $HOME-relative when possible so the rc keeps
 # working if HOME is mounted elsewhere. $HOME/$PATH stay literal in the line.
 # Usage: path_export_line <bin_dir>
@@ -44,6 +54,7 @@ ensure_path_in_rc() {
     local legacy_line='export PATH="$HOME/.local/share/opencode-dockerized/bin:$PATH"'
     root="$(install_root 2>/dev/null || true)"
     [ -n "$root" ] || return 2
+    rc_safe_path "$root" || return 2
     path_line="$(path_export_line "$root/bin")"
     [ -f "$rc_file" ] || : >"$rc_file" 2>/dev/null || return 2
 
@@ -264,45 +275,102 @@ ensure_global_command() {
     [ "$ok" = true ]
 }
 
-_install_bash_completion() {
-    local repo_dir="$1"
-    local bash_rc="$HOME/.bashrc"
-    local completion_line="[ -f \"$repo_dir/completions/bash.sh\" ] && source \"$repo_dir/completions/bash.sh\""
-    if grep -qF -- "$completion_line" "$bash_rc" 2>/dev/null; then
-        echo "Bash completion already configured in ~/.bashrc"
-    else
-        {
-            echo ""
-            echo "# OpenCode Dockerized completion"
-            echo "$completion_line"
-        } >>"$bash_rc" || {
-            install_fail "Could not update ~/.bashrc with the bash completion"
-            return 1
-        }
-        echo "Added bash completion to ~/.bashrc"
-        echo "  Run: source ~/.bashrc"
-    fi
+# Source line for a completion script; the path was checked by rc_safe_path.
+# Usage: completion_source_line <repo_dir> <bash|zsh>
+completion_source_line() {
+    printf '[ -f "%s" ] && source "%s"\n' "$1/completions/$2.sh" "$1/completions/$2.sh"
 }
 
-_install_zsh_completion() {
-    local repo_dir="$1"
-    local zsh_rc="$HOME/.zshrc"
-    local completion_line="[ -f \"$repo_dir/completions/zsh.sh\" ] && source \"$repo_dir/completions/zsh.sh\""
-    if grep -qF -- "$completion_line" "$zsh_rc" 2>/dev/null; then
-        echo "Zsh completion already configured in ~/.zshrc"
-    else
-        {
-            echo ""
-            echo "# OpenCode Dockerized completion"
-            echo "$completion_line"
-        } >>"$zsh_rc" || {
-            install_fail "Could not update ~/.zshrc with the zsh completion"
+# Ensure the completion source line for THIS checkout is in an rc file, inside
+# a delimited block (like the PATH block) so a moved checkout replaces the old
+# line instead of leaving a stale one. Legacy unmarked lines (the
+# "# OpenCode Dockerized completion" comment and the source line after it, or
+# any source line of an opencode-dockerized .../completions/<shell>.sh) are
+# migrated into the block.
+# Returns 0 when changed, 1 when already present, 2 on error.
+# Usage: ensure_completion_in_rc <rcfile> <repo_dir> <bash|zsh>
+ensure_completion_in_rc() {
+    local rc_file="$1" repo_dir="$2" shell="$3" line current tmp
+    local begin="# >>> opencode-dockerized completion >>>" end="# <<< opencode-dockerized completion <<<"
+    local legacy_marker="# OpenCode Dockerized completion"
+    local legacy_re="^\\[ -f \".*/completions/$shell\\.sh\" \\] && source \".*/completions/$shell\\.sh\"\$"
+    rc_safe_path "$repo_dir" || return 2
+    line="$(completion_source_line "$repo_dir" "$shell")"
+    [ -f "$rc_file" ] || : >"$rc_file" 2>/dev/null || return 2
+    # Already done: the block holds this line and nothing stale is left. A
+    # legacy source line is one right after the legacy marker, or one naming an
+    # opencode-dockerized path; anyone else's completion lines are kept. The
+    # regex goes through ENVIRON because awk -v would interpret its backslashes.
+    # shellcheck disable=SC2016 # awk program
+    local legacy_awk='
+        $0==b {skip=1; prev=0; next}
+        skip && $0==e {skip=0; next}
+        skip {next}
+        $0==lm {prev=1; stale++; next}
+        $0 ~ ENVIRON["LR"] && (prev || index($0, "opencode-dockerized")) {prev=0; stale++; next}
+        {prev=0; if (!count) print}
+        END {if (count) print stale+0}'
+    if grep -qxF -- "$begin" "$rc_file" 2>/dev/null; then
+        current=$(awk -v b="$begin" -v e="$end" '$0==b{f=1;next} $0==e{f=0} f' "$rc_file")
+        if [ "$current" = "$line" ] &&
+            [ "$(LR="$legacy_re" awk -v b="$begin" -v e="$end" -v lm="$legacy_marker" -v count=1 "$legacy_awk" "$rc_file")" = 0 ]; then
             return 1
-        }
-        echo "Added zsh completion to ~/.zshrc"
-        echo "  Run: source ~/.zshrc"
+        fi
     fi
+    [ -w "$rc_file" ] || return 2
+    tmp=$(mktemp "$rc_file.tmp.XXXXXX" 2>/dev/null) || return 2
+    LR="$legacy_re" awk -v b="$begin" -v e="$end" -v lm="$legacy_marker" -v count=0 "$legacy_awk" \
+        "$rc_file" >"$tmp" || {
+        rm -f "$tmp"
+        return 2
+    }
+    {
+        echo ""
+        echo "$begin"
+        echo "$line"
+        echo "$end"
+    } >>"$tmp" || {
+        rm -f "$tmp"
+        return 2
+    }
+    cat "$tmp" >"$rc_file" 2>/dev/null || {
+        rm -f "$tmp"
+        return 2
+    }
+    rm -f "$tmp"
+    return 0
 }
+
+# True when the rc file already sources THIS checkout's completion in the block.
+# Usage: completion_configured <rcfile> <repo_dir> <bash|zsh>
+completion_configured() {
+    local current
+    grep -qxF -- "# >>> opencode-dockerized completion >>>" "$1" 2>/dev/null || return 1
+    current=$(awk '$0=="# >>> opencode-dockerized completion >>>"{f=1;next} $0=="# <<< opencode-dockerized completion <<<"{f=0} f' "$1")
+    [ "$current" = "$(completion_source_line "$2" "$3")" ]
+}
+
+# Usage: _install_shell_completion <repo_dir> <bash|zsh>
+_install_shell_completion() {
+    local repo_dir="$1" shell="$2" status=0 rc_name
+    rc_name=".${shell}rc"
+    ensure_completion_in_rc "$HOME/$rc_name" "$repo_dir" "$shell" || status=$?
+    case "$status" in
+    0)
+        echo "Added $shell completion to ~/$rc_name"
+        echo "  Run: source ~/$rc_name"
+        ;;
+    1) echo "${shell^} completion already configured in ~/$rc_name" ;;
+    *)
+        install_fail "Could not update ~/$rc_name with the $shell completion"
+        return 1
+        ;;
+    esac
+}
+
+_install_bash_completion() { _install_shell_completion "$1" bash; }
+
+_install_zsh_completion() { _install_shell_completion "$1" zsh; }
 
 _install_bash_aliases() {
     ensure_global_command || true
@@ -426,6 +494,13 @@ run_install_main() {
         config_error "Could not locate the checkout root."
         return 1
     }
+    # rc files get double-quoted lines with this path: refuse one the shell would
+    # evaluate (`$(...)`, backticks, quotes) instead of writing it.
+    if ! rc_safe_path "$REPO_ROOT"; then
+        config_error "Refusing to install from '$REPO_ROOT': the path contains \$, \`, \", \\ or a newline, which would be evaluated by your shell rc file."
+        config_info "Move the checkout to a plain path (or set OCODE_INSTALL_DIR) and run the installer again."
+        return 1
+    fi
     ensure_git_upstream "$REPO_ROOT" || true
     if [ "$(readlink -f "$REPO_ROOT" 2>/dev/null || echo "$REPO_ROOT")" != "$(readlink -f "$OCODE_INSTALL_DIR" 2>/dev/null || echo "$OCODE_INSTALL_DIR")" ] && [ -d "$OCODE_INSTALL_DIR/.git" ]; then
         ensure_git_upstream "$OCODE_INSTALL_DIR" || true
@@ -465,13 +540,11 @@ run_install_main() {
     if wants_section completions; then
         echo ""
         echo "Shell Completions Setup"
-        local bash_completion_line="[ -f \"$REPO_ROOT/completions/bash.sh\" ] && source \"$REPO_ROOT/completions/bash.sh\""
-        local zsh_completion_line="[ -f \"$REPO_ROOT/completions/zsh.sh\" ] && source \"$REPO_ROOT/completions/zsh.sh\""
         local bash_completion_installed=false zsh_completion_installed=false
-        if [ -f "$HOME/.bashrc" ] && grep -qF -- "$bash_completion_line" "$HOME/.bashrc" 2>/dev/null; then
+        if [ -f "$HOME/.bashrc" ] && completion_configured "$HOME/.bashrc" "$REPO_ROOT" bash; then
             bash_completion_installed=true
         fi
-        if [ -f "$HOME/.zshrc" ] && grep -qF -- "$zsh_completion_line" "$HOME/.zshrc" 2>/dev/null; then
+        if [ -f "$HOME/.zshrc" ] && completion_configured "$HOME/.zshrc" "$REPO_ROOT" zsh; then
             zsh_completion_installed=true
         fi
         if [ "$SETUP_YES" = true ]; then

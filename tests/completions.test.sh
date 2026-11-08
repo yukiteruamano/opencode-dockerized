@@ -53,5 +53,33 @@ COMP_WORDS=(opencode-dockerized upgrade --)
 COMP_CWORD=2
 _opencode_dockerized
 grep -qw -- "--json" <<<"${COMPREPLY[*]}" || fail "upgrade must complete --json"
+grep -qw -- "--full" <<<"${COMPREPLY[*]}" || fail "upgrade must complete --full"
+COMP_WORDS=(opencode-dockerized update --yes --f)
+COMP_CWORD=3
+_opencode_dockerized
+[ "${COMPREPLY[*]}" = "--full" ] || fail "update must keep completing its flags after another flag (got: ${COMPREPLY[*]})"
+grep -q -- "--no-build --full" "$REPO_DIR/completions/zsh.sh" || fail "zsh update/upgrade must offer --full"
+
+# `config <TAB>` offers config subcommands, but `debug config <TAB>` must not.
+COMP_WORDS=(opencode-dockerized config "")
+COMP_CWORD=2
+_opencode_dockerized
+grep -qw sync <<<"${COMPREPLY[*]}" || fail "config must complete its subcommands (got: ${COMPREPLY[*]})"
+COMP_WORDS=(opencode-dockerized debug config "")
+COMP_CWORD=3
+_opencode_dockerized
+if grep -qw sync <<<"${COMPREPLY[*]}"; then
+    fail "'debug config <TAB>' must not offer the config subcommands (got: ${COMPREPLY[*]})"
+fi
+COMP_WORDS=(opencode-dockerized config opencode "")
+COMP_CWORD=3
+_opencode_dockerized
+[ "${COMPREPLY[*]}" = "path edit" ] || fail "config opencode must complete path|edit (got: ${COMPREPLY[*]})"
+
+# zsh: the config subcommand list is offered only at the first config position,
+# so `config opencode <TAB>` completes path|edit instead of repeating the list.
+grep -q 'CURRENT == 2' "$REPO_DIR/completions/zsh.sh" || fail "zsh config completion must be position-aware"
+grep -q "_values 'opencode config subcommand' path edit" "$REPO_DIR/completions/zsh.sh" ||
+    fail "zsh 'config opencode' must complete path|edit"
 
 echo "completions test passed"

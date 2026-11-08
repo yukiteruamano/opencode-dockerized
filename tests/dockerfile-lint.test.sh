@@ -48,6 +48,11 @@ done < <(grep -E '^[^#]*\bcurl +-' "$DOCKERFILE")
 # The Docker apt key is checked against its published fingerprint.
 arg_default DOCKER_GPG_FINGERPRINT | grep -qE '^[0-9A-F]{40}$' || fail "DOCKER_GPG_FINGERPRINT must be a 40-hex fingerprint"
 grep -q '\${DOCKER_GPG_FINGERPRINT}' "$DOCKERFILE" || fail "the Docker key fingerprint must be verified"
+# ...and the key file must hold exactly one primary key: an extra key would be
+# trusted by signed-by even though the first one matches.
+grep -qF "grep -c '^pub:'" "$DOCKERFILE" || fail "the Docker key file must be checked for a single primary key (pub count)"
+grep -qF '[ "${primary_keys}" = 1 ]' "$DOCKERFILE" || fail "the pub count must be required to be exactly 1"
+if grep -qF '!seen' "$DOCKERFILE"; then fail "the fingerprint must not be taken from the first fpr line alone"; fi
 
 # Provenance labels, so the wrapper can detect drift between checkout and image.
 for label in org.opencontainers.image.source org.opencontainers.image.revision \

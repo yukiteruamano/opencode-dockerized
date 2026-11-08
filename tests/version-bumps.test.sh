@@ -64,4 +64,40 @@ echo 2 >policies/VERSION; commit_all "policy bump"
 check
 [ "$RC" -eq 0 ] || fail "a bumped policy set must pass ($OUT)"
 
+# The marker must not disappear from the new guard.
+reset_to_base
+printf 'const M = "no marker here";\n' >plugins/security-guard.js; commit_all "guard marker removed"
+check
+[ "$RC" -ne 0 ] || fail "a guard without its version marker must fail"
+grep -q 'missing' <<<"$OUT" || fail "the failure must say the marker is missing ($OUT)"
+
+# Versions only go up (numeric compare: 10 > 9).
+git checkout -q master
+printf 'const M = "OPENCODE_DOCKERIZED_GUARD_VERSION=9";\n' >plugins/security-guard.js
+echo 9 >policies/VERSION
+commit_all "base at 9"
+reset_to_base
+printf 'const M = "OPENCODE_DOCKERIZED_GUARD_VERSION=10";\n' >plugins/security-guard.js; commit_all "guard 10"
+check
+[ "$RC" -eq 0 ] || fail "9 -> 10 is a numeric increase and must pass ($OUT)"
+
+reset_to_base
+printf 'const M = "OPENCODE_DOCKERIZED_GUARD_VERSION=8";\n' >plugins/security-guard.js; commit_all "guard down"
+check
+[ "$RC" -ne 0 ] || fail "a decreased guard version must fail"
+grep -q 'decreased' <<<"$OUT" || fail "the failure must say the guard version decreased ($OUT)"
+
+reset_to_base
+echo '[{"id":"q"}]' >policies/unsafe-tool-patterns.json
+echo 3 >policies/VERSION; commit_all "policy down"
+check
+[ "$RC" -ne 0 ] || fail "a decreased policies/VERSION must fail"
+grep -q 'decreased' <<<"$OUT" || fail "the failure must say policies/VERSION decreased ($OUT)"
+
+reset_to_base
+echo '[{"id":"q"}]' >policies/unsafe-tool-patterns.json
+: >policies/VERSION; commit_all "policy version emptied"
+check
+[ "$RC" -ne 0 ] || fail "an empty policies/VERSION must fail"
+
 echo "version-bumps test passed"

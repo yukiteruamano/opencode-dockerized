@@ -73,6 +73,15 @@ run_doctor
 [ "$RC" -ne 0 ] || fail "a missing pids limit must fail the check"
 grep -q 'pids limit: NONE' <<<"$OUT" || fail "the missing pids limit must be named"
 
+# 4b. No memory cap is warned about (a valid choice, so it does not fail).
+grep -q 'memory limit: 2147483648 bytes' <<<"$(build_root mem-ok; run_doctor; echo "$OUT")" ||
+    fail "doctor must report the memory limit"
+build_root nomem
+echo max >"$R/sys/fs/cgroup/memory.max"
+run_doctor
+[ "$RC" -eq 0 ] || fail "a missing memory limit must warn, not fail (got $RC)"
+grep -q 'memory limit: WARNING none (set setting.memory' <<<"$OUT" || fail "a missing memory limit must be warned about"
+
 # 5. A missing scratch dir is a problem.
 build_root noscratch
 rmdir "$R/tmp/opencode"
