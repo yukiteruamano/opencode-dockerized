@@ -6,7 +6,7 @@ plus one small Node.js security plugin and vendored JSON policy data.
 ## Before you start
 
 ```bash
-./install.sh          # installs bin/ on PATH, creates ~/.config/opencode-dockerized + security layer
+./install.sh          # installs bin/ on PATH, creates the default profile (~/.config/opencode-dockerized/profiles/default) + security layer
 opencode-dockerized build
 ```
 
@@ -56,7 +56,7 @@ statically. The image itself is built and smoke-tested by the `image` CI job.
 ## Security layer changes
 
 - **`plugins/security-guard.js` is the source of truth.** It is copied into
-  `~/.config/opencode-dockerized/plugins/` by `lib/config-lib.sh`, which compares
+  each profile's `~/.config/opencode-dockerized/profiles/<name>/plugins/` by `lib/config-lib.sh`, which compares
   file content; still bump `OPENCODE_DOCKERIZED_GUARD_VERSION` on any behavior
   change (CI enforces it on pull requests via `scripts/check-version-bumps.sh`).
   The replaced copy is kept as a timestamped `.bak.<stamp>`.
@@ -84,10 +84,14 @@ GitHub Actions SHAs.
 
 Releases are signed tags `vX.Y.Z` on `master` whose `WRAPPER_VERSION` matches;
 `opencode-dockerized version` shows `git describe`, and `install.sh` can install
-a tag (`OCODE_REF=v0.15.0`, optionally with `OCD_VERIFY_SIGNATURES=true`).
+a tag (`OCODE_REF=v0.16.0`, optionally with `OCD_VERIFY_SIGNATURES=true`).
 Describe user-visible changes in `CHANGELOG.md`.
 
 ## Docs
 
 Update `README.md` (and `SECURITY.md` where relevant) for user-visible
-changes. The wrapper config lives at `~/.config/opencode-dockerized/config`.
+changes. The wrapper config lives per profile at
+`~/.config/opencode-dockerized/profiles/<name>/config` (`default` unless
+`--profile` is given). A change to the on-disk layout needs a migration in
+`lib/profiles-lib.sh` (see `tests/profile-migration.test.sh`), so existing
+installs keep their config, secrets and auth across the update.

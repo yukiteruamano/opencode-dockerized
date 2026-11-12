@@ -5,10 +5,11 @@
 Shell script-based Docker wrapper for running [OpenCode](https://opencode.ai) in secure, isolated containers. Sandboxes OpenCode so its blast radius is limited to the mounted project directory. Source is Bash scripts, a Dockerfile, one small Node.js V2 plugin (`plugins/security-guard.js`) with vendored JSON policy data (`policies/`), and Node-based policy tests (`tests/`). No package manager files and no build step.
 
 **Key files:**
-- `bin/opencode-dockerized` — Main wrapper, no extension (build, run, auth, models, exec, mcp, plugin, stats, debug, doctor, install, upgrade, update, config, clean commands). Reached via `<install>/bin` on PATH; nothing lives in `~/.local/bin`. `bin/` holds only this binary.
+- `bin/opencode-dockerized` — Main wrapper, no extension (run, auth, models, exec, mcp, plugin, stats, debug, doctor, install, upgrade, build, update, rollback, uninstall, version, config, profile, clean commands; global `--profile`). Reached via `<install>/bin` on PATH; nothing lives in `~/.local/bin`. `bin/` holds only this binary.
 - `install.sh` — Curl-able bootstrap: runs the local `bin/opencode-dockerized install` when present, else clones to `~/.local/share/opencode-dockerized` and runs it there (full setup in one shot, no second manual install)
 - `lib/config-lib.sh` — Shared library sourced by other scripts (config parsing, mount/env arg building, shared volume logic, interactive prompts, installs the security layer). **Not executable directly.**
 - `lib/install-lib.sh` — Install wizard library sourced by the wrapper's `install` command (`--yes`, `--only config,completions,aliases,global[,path][,build]`). **Not executable directly.**
+- `lib/profiles-lib.sh` — Profile naming and the one-time move of a pre-profiles tree into `profiles/default`; sourced by the wrapper **before** `config-lib.sh`. **Not executable directly.**
 - `opencode-dockerized.sh`, `setup.sh` (root) — Compat shims forwarding to `bin/`+`lib/`
 - `Dockerfile` — Container image (Debian trixie-slim + Node.js/NVM + pnpm + OpenCode V2 (`@opencode/cli`), no sudo)
 - `entrypoint.sh` — Container entrypoint (unprivileged; resolves workdir, loads NVM, execs the command)
@@ -16,7 +17,7 @@ Shell script-based Docker wrapper for running [OpenCode](https://opencode.ai) in
 - `plugins/security-guard.js` — Versioned OpenCode V2 hooks (source of truth; copied into the user config by `lib/config-lib.sh`)
 - `policies/` — Vendored `opencode-policy` pattern sets + local `allow-patterns.json` (see `policies/README.md`)
 - `tests/security-guard.test.mjs`, `tests/security-guard-adversarial.test.mjs`, `tests/policy-lint.test.mjs` — Guard regression, bypass and rule-set tests (shared harness in `tests/guard-harness.mjs`)
-- `tests/*.test.sh` — Wrapper contract tests against a throw-away HOME, a local git origin and a stub `docker` (`tests/config-hardening.test.sh` covers the mount/project/worktree/env_file/GPG-mirror refusals; `tests/profile-flow.test.sh` the multi-account profiles; `tests/commands-smoke.test.sh` every command's happy path, refusals and help drift). Test-only command overrides (`GPG_AGENT_PROBE_CMD`, `GPG_AGENT_LAUNCH_CMD`, `GPG_RELAY_CMD`) are honoured only with `OPENCODE_DOCKERIZED_TEST_HOOKS=1`
+- `tests/*.test.sh` — Wrapper contract tests against a throw-away HOME, a local git origin and a stub `docker` (`tests/config-hardening.test.sh` covers the mount/project/worktree/env_file/GPG-mirror refusals; `tests/profile-flow.test.sh` the multi-account profiles; `tests/profile-migration.test.sh` the move of a pre-profiles tree into `profiles/default`; `tests/commands-smoke.test.sh` every command's happy path, refusals and help drift). Test-only command overrides (`GPG_AGENT_PROBE_CMD`, `GPG_AGENT_LAUNCH_CMD`, `GPG_RELAY_CMD`) are honoured only with `OPENCODE_DOCKERIZED_TEST_HOOKS=1`
 - `scripts/` — `check-version-bumps.sh` (CI) and `pins-report.sh`
 - `SECURITY.md`, `CONTRIBUTING.md` — Security model and contribution guide
 - `config.example` — Example user config (INI-style), in `examples/`
@@ -148,7 +149,7 @@ config_info() {
 ### Shared Logic (lib/config-lib.sh)
 
 All volume mount logic lives in `lib/config-lib.sh` to eliminate duplication:
-- `OCODE_HOME` (`~/.config/opencode-dockerized/home`) — self-contained OpenCode state root mirroring the container home; all OpenCode mounts source from here, never from host XDG dirs
+- `OCODE_HOME` (`$CONFIG_DIR/home`, i.e. `~/.config/opencode-dockerized/profiles/<profile>/home`) — self-contained OpenCode state root mirroring the container home; all OpenCode mounts source from here, never from host XDG dirs
 - `build_standard_volume_args "$project_dir" [include_docker_socket]` — populates `VOLUME_ARGS` array (socket is passed from `setting.docker_socket`; OpenCode config dir mounted `:ro`)
 - `build_common_docker_args` — populates `DOCKER_COMMON_ARGS` array (--rm, --network host, `--user <host uid>:<host gid>`, `--group-add coder`, `--cap-drop=ALL`, `--security-opt no-new-privileges:true`, TERM, `OPENCODE_DOCKERIZED_POLICY`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_DISABLE_AUTOUPDATE`)
 - `ensure_opencode_dirs` — creates required host directories, seeds the state tree and installs the versioned security layer (`ensure_opencode_dockerized_config`: `plugins/security-guard.js` from the repo + `policies/*.json` with their `policies/VERSION` marker, mirrored into `$OCODE_HOME/.config/opencode`)
@@ -187,31 +188,46 @@ setting.security_policy=balanced
 setting.memory=4g
 setting.cpus=2
 setting.pids_limit=4096
-setting.env_file=~/.config/opencode-dockerized/env
+setting.env_file=~/.config/opencode-dockerized/profiles/default/env
 setting.websearch_provider=exa
 setting.theme=catppuccin
 mount.gitconfig=~/.gitconfig:/home/coder/.gitconfig
 ```
 
-Secrets only travel via `setting.env_file` (dotenv file under `~/.config/opencode-dockerized/`,
-`docker --env-file`, never mounted; a file under `$OCODE_HOME` is refused because that tree is mounted). The old `env.*` host passthrough was removed.
+Secrets only travel via `setting.env_file` (dotenv file inside the active profile's directory,
+`docker --env-file`, never mounted; a file outside the profile, or under `$OCODE_HOME` because that tree is mounted, is refused). The old `env.*` host passthrough was removed.
 
 ### Profiles (multi-account)
 
-`--profile NAME` (or `OPENCODE_DOCKERIZED_PROFILE=NAME`) repoints `CONFIG_DIR` at
-`<base>/profiles/NAME` **before** `lib/config-lib.sh` is sourced (the flag is
-pre-scanned in `bin/opencode-dockerized`, since every path — `CONFIG_FILE`,
-`OCODE_HOME`, `SESSIONS_DIR`, `GPG_RELAY_DIR`, the lock — derives from
-`CONFIG_DIR` at load time). Each profile is therefore a full standalone tree:
-its own config (e.g. `security_policy=strict` in one profile, `balanced` in
-another), env file, generated `opencode.json`, security layer and OpenCode home
-(auth database, sessions, state, cache). Without a profile, the classic paths
-are used unchanged ("default"). The profiles base (`OCD_PROFILES_BASE`) is a
-protected location in `host_path_is_protected`, so one profile can never mount
-or open another profile's tree. Managed with `profile
-list|current|path|create|remove`; `profile create` seeds the tree by
-re-invoking `config sync` + `config init` under the new profile. Contract test:
-`tests/profile-flow.test.sh`.
+Every invocation runs against a profile: `--profile NAME` (or
+`OPENCODE_DOCKERIZED_PROFILE=NAME`), `default` otherwise. `bin/opencode-dockerized`
+pre-scans the flag, sets `OCD_PROFILES_BASE` (`${CONFIG_DIR:-~/.config/opencode-dockerized}`)
+and points `CONFIG_DIR` at `<base>/profiles/NAME` **before** `lib/config-lib.sh` is
+sourced, since every per-profile path — `CONFIG_FILE`, `OCODE_HOME`,
+`SESSIONS_DIR` — derives from `CONFIG_DIR` at load time. Each profile is a full
+standalone tree: its own config (e.g. `security_policy=strict` in one profile,
+`balanced` in another), env file, generated `opencode.json`, security layer and
+OpenCode home (auth database, sessions, state, cache). Install-wide state stays
+in the base: the wrapper lock (`.lock`/`.lock.d`), `.previous-rev` (rollback)
+and `gnupg-relay/` (per-PID relay sockets). The base is a protected location
+in `host_path_is_protected`, so one profile can never mount or open another
+profile's tree. Managed with `profile list|current|path|create|remove` (the
+`default` profile cannot be removed); `profile create` seeds the tree by
+re-invoking `config init` + `config sync` under the new profile.
+
+**Layout migration.** Releases before 0.16 kept the default tree directly in
+the base. `ocd_migrate_legacy_layout` (`lib/profiles-lib.sh`) runs on every
+invocation before the paths are derived and, when the base holds anything but
+the install-wide entries, moves it into `profiles/default`: each entry is
+renamed into `profiles/.default.migrating` (same filesystem, atomic) and the
+stage is renamed into place, so an interrupted run is resumed; a `setting.env_file`
+pointing into the old tree is rewritten (keeping `~/`). It runs under the
+install lock (skipped under `OCD_LOCK_HELD`, i.e. the post-pull re-exec of
+`update`), is deferred — the default profile keeps the old tree for that run —
+while a session of the old layout is alive or the lock is busy, never merges
+into an existing `profiles/default` (leftovers are reported), and fails closed
+(nothing starts) on a stage/base name clash. Contract tests:
+`tests/profile-flow.test.sh`, `tests/profile-migration.test.sh`.
 
 ### Dockerfile Conventions
 
@@ -266,15 +282,15 @@ re-invoking `config sync` + `config init` under the new profile. Contract test:
 | Host Path | Container Path | Mode | Purpose |
 |-----------|---------------|------|---------|
 | `$PROJECT_DIR` | `$PROJECT_DIR` (with `$HOME` stripped; a path whose first component is a system dir such as `~/bin` maps to `/home/coder/bin`) | rw | Project files |
-| `~/.config/opencode-dockerized/home/.config/opencode/` | `/home/coder/.config/opencode/` | ro | Self-contained config: MCP servers, `cli.json`, skills, agents, commands, plugins. The security files (`AGENTS.md`, `plugins/security-guard.js`, `plugins/policies/`) are mirrored into this tree on the host by `ensure_opencode_dockerized_config` |
-| `~/.config/opencode-dockerized/home/.local/share/opencode/` | `/home/coder/.local/share/opencode/` | rw | Auth database, sessions |
-| `~/.config/opencode-dockerized/home/.local/state/opencode/` | `/home/coder/.local/state/opencode/` | rw | Selected model, prompt history, locks |
-| `~/.config/opencode-dockerized/home/.cache/opencode/` | `/home/coder/.cache/opencode/` | rw | Provider cache |
+| `<profile>/home/.config/opencode/` | `/home/coder/.config/opencode/` | ro | Self-contained config: MCP servers, `cli.json`, skills, agents, commands, plugins. The security files (`AGENTS.md`, `plugins/security-guard.js`, `plugins/policies/`) are mirrored into this tree on the host by `ensure_opencode_dockerized_config` |
+| `<profile>/home/.local/share/opencode/` | `/home/coder/.local/share/opencode/` | rw | Auth database, sessions |
+| `<profile>/home/.local/state/opencode/` | `/home/coder/.local/state/opencode/` | rw | Selected model, prompt history, locks |
+| `<profile>/home/.cache/opencode/` | `/home/coder/.cache/opencode/` | rw | Provider cache |
 | `~/.mcp-auth/` | `/home/coder/.mcp-auth/` | rw | MCP OAuth store (`mcp-remote`) |
 | `~/.claude/{skills,agents,commands,CLAUDE.md}` | `/home/coder/.claude/…` | ro | Claude Code compat: CLAUDE.md rules, skills; mounted per path via `add_ro_mount`, never the whole `~/.claude` (login, history, projects) |
 | `~/.agents/skills/` | `/home/coder/.agents/skills/` | ro | Agent-compatible skills (<name>/SKILL.md) |
 | `~/.composio/` | `/home/coder/.composio/` | rw | Composio CLI binary + login (custom `mount.composio`) — treat `user_data.json`/`config.json` as credentials |
-| `~/.config/opencode-dockerized/home/.gnupg/` | `/home/coder/.gnupg/` | rw (opt-in) | Mirrored **public** GnuPG material (pubring/trustdb/gpg.conf) + agent socket, only when `setting.gpg_agent_support=true`; `private-keys-v1.d/` is never copied |
+| `<profile>/home/.gnupg/` | `/home/coder/.gnupg/` | rw (opt-in) | Mirrored **public** GnuPG material (pubring/trustdb/gpg.conf) + agent socket, only when `setting.gpg_agent_support=true`; `private-keys-v1.d/` is never copied |
 | `/var/run/docker.sock` | `/var/run/docker.sock` | rw (opt-in) | Docker socket, only when `setting.docker_socket=true` |
 
-The wrapper's own directory (`~/.config/opencode-dockerized/`) is **never** mounted. Its `opencode.json` (sandbox permissions) is read on the host and passed inline via `OPENCODE_CONFIG_CONTENT`; its `AGENTS.md`, guard and policies are sourced from there and mirrored into the config tree. With `--profile NAME`, every `home/...` path above comes from `profiles/NAME/home/...` instead, and the same never-mounted rule covers the whole profiles base.
+`<profile>` is the active profile's directory, `~/.config/opencode-dockerized/profiles/<name>/` (`default` without `--profile`). The wrapper's own directory (`~/.config/opencode-dockerized/`, every profile included) is **never** mounted. The profile's `opencode.json` (sandbox permissions) is read on the host and passed inline via `OPENCODE_CONFIG_CONTENT`; its `AGENTS.md`, guard and policies are sourced from there and mirrored into the config tree.

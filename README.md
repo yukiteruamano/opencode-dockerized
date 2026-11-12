@@ -28,8 +28,8 @@ Run OpenCode in a secure, isolated Docker container with controlled access to yo
 ## 🔒 Security Features
 
 - **Isolated Environment** - OpenCode only has access to the mounted project directory
-- **Persistent Configuration** - All OpenCode state lives self-contained under `~/.config/opencode-dockerized/home/`, so MCP servers, sessions and auth survive container restarts and image rebuilds. The OpenCode config directory itself is mounted **read-only**: edit it on the host
-- **Security Layer** - A generated `~/.config/opencode-dockerized/` directory (permission rules, `AGENTS.md` rules, plugin hooks plus the ported `opencode-policy` unsafe/injection patterns) is never mounted as a directory: the permission rules are passed inline (`OPENCODE_CONFIG_CONTENT`) and the rules/hooks/policies are mirrored into the read-only config tree, so every session receives them and cannot relax them
+- **Persistent Configuration** - All OpenCode state lives self-contained under the active profile's `~/.config/opencode-dockerized/profiles/<name>/home/` (`default` unless `--profile` is given), so MCP servers, sessions and auth survive container restarts and image rebuilds. The OpenCode config directory itself is mounted **read-only**: edit it on the host
+- **Security Layer** - A generated security layer in each profile's `~/.config/opencode-dockerized/profiles/<name>/` directory (permission rules, `AGENTS.md` rules, plugin hooks plus the ported `opencode-policy` unsafe/injection patterns) is never mounted as a directory: the permission rules are passed inline (`OPENCODE_CONFIG_CONTENT`) and the rules/hooks/policies are mirrored into the read-only config tree, so every session receives them and cannot relax them
 - **Configurable policy** - `setting.security_policy` selects `strict`, `balanced` (default, drops the noisy cloud/multi-tenant false positives) or `off`
 - **No host Docker control by default** - The host Docker socket is **not** mounted unless you opt in with `setting.docker_socket=true` (it is root-equivalent on the host; see [SECURITY.md](SECURITY.md))
 - **Session Persistence** - Logs and project session data persist across container restarts
@@ -53,7 +53,7 @@ Everything below is on top of what upstream provides.
 - **Fail-closed conventions** - `docker --env-file` for secrets (never `-e KEY=value` on the command line), `DRY_RUN` redaction, `--mount` (not `-v`) for agent sockets so stale sources fail loudly, `commit.gpgsign`-compatible signing without private keys in the container.
 
 ### Usability and host integration
-- **Self-contained state tree** (`~/.config/opencode-dockerized/home/`) - config, auth, sessions and caches survive rebuilds without touching host XDG dirs.
+- **Self-contained state tree per profile** (`~/.config/opencode-dockerized/profiles/<name>/`) - config, secrets, auth, sessions and caches survive rebuilds without touching host XDG dirs; a pre-profiles setup is migrated to `profiles/default` automatically.
 - **`doctor` command** - in-container diagnosis of guard version, SSH/GPG agents, websearch provider/key presence, theme, env file and inline-secret scans.
 - **`config sync [--check]`** - refreshes the versioned security layer, merges custom permission rules (template wins conflicts, everything reported), repairs `cli.json` and removes the legacy symlink; `--check` is read-only (CI-ready).
 - **Secrets file workflow** - `setting.env_file` (`600`, under the config dir, never mounted) with hidden-value `install` prompts, format/permission validation and one-shot migration of legacy entries.
@@ -109,7 +109,8 @@ opencode-dockerized auth
 
 # This will:
 # - Run 'opencode auth login' inside the container
-# - Save credentials to ~/.config/opencode-dockerized/home/.local/share/opencode on your host
+# - Save credentials to ~/.config/opencode-dockerized/profiles/default/home/.local/share/opencode
+#   on your host (--profile NAME authenticates that profile's account instead)
 # - Make authentication available to all future OpenCode runs
 ```
 
@@ -311,22 +312,26 @@ Let's add a new feature for user profiles
 
 ### Configuration File
 
-The wrapper is configured through `~/.config/opencode-dockerized/config`
-(INI-style, created by `./install.sh`). It holds the `setting.*` and `mount.*`
-directives described under
+The wrapper is configured per profile, through
+`~/.config/opencode-dockerized/profiles/<profile>/config` (INI-style; the
+`default` profile's config is created by `./install.sh`, and
+`opencode-dockerized config path` prints the active one). It holds the
+`setting.*` and `mount.*` directives described under
 [Custom Global Configuration](#custom-global-configuration-optional).
 
 There is **no `.env` file**: secrets live in `setting.env_file` (a dotenv file
-under `~/.config/opencode-dockerized/`, loaded with `docker --env-file`), and
+inside the profile's own directory, loaded with `docker --env-file`), and
 `TERM` is forwarded automatically. The
 container runs as your host UID/GID (`--user`), so no `HOST_UID`/`HOST_GID`
 mapping is needed.
 
 ### Profiles (Multi-Account)
 
-`--profile NAME` (or `OPENCODE_DOCKERIZED_PROFILE=NAME`) runs any command
-against a self-contained state tree under
-`~/.config/opencode-dockerized/profiles/NAME/`. Each profile has its **own**:
+Every command runs against a **profile**: a self-contained state tree under
+`~/.config/opencode-dockerized/profiles/NAME/`. Without `--profile` the
+`default` profile is used; `--profile NAME` (or
+`OPENCODE_DOCKERIZED_PROFILE=NAME`) selects another one. Each profile has its
+**own**:
 
 - wrapper config — so one agent can run `setting.security_policy=strict`
   while another runs `balanced`, with different mounts, network or theme;
@@ -334,10 +339,20 @@ against a self-contained state tree under
 - OpenCode home: auth database, sessions, selected model, cache;
 - generated permissions and security layer.
 
-Without `--profile`, the classic tree is used unchanged (shown as `default`).
 Profiles are isolated from each other: the profiles base is a protected
 location, so a session in one profile can neither mount nor open another
-profile's credentials or state.
+profile's credentials or state, and a profile's `setting.env_file` must live
+inside that profile. The `default` profile cannot be removed.
+
+**Upgrading from 0.15 or earlier:** releases before 0.16 kept the default
+setup directly in `~/.config/opencode-dockerized/`. The first run of 0.16
+(normally the `update` itself) moves it into `profiles/default/` — config,
+secrets file (`setting.env_file` is rewritten to the new path), auth
+database, sessions and security layer — and leaves the install-wide files
+(`.lock`, `.previous-rev`, `gnupg-relay/`) and any existing `profiles/` in
+place. The move is atomic per file and resumes if interrupted; it waits while
+a session started by the old version is still running, and it never merges
+into an existing `profiles/default/` (leftovers are reported instead).
 
 ```bash
 opencode-dockerized profile create work            # new profile (own config + auth)
@@ -353,46 +368,61 @@ opencode-dockerized profile remove lab             # delete a profile (asks; --y
 | Host Path | Container Path | Mode | Purpose |
 |-----------|---------------|------|---------|
 | `$PROJECT_DIR` | `$PROJECT_DIR` (with `$HOME` stripped) | read-write | Your project files |
-| `~/.config/opencode-dockerized/home/.config/opencode/` | `/home/coder/.config/opencode/` | **read-only** | Self-contained OpenCode config: MCP servers, models, `cli.json`, skills, agents, commands, plugins. The security files (`AGENTS.md`, `plugins/security-guard.js`, `plugins/policies/`) are mirrored into this tree on the host |
-| `~/.config/opencode-dockerized/home/.local/share/opencode/` | `/home/coder/.local/share/opencode/` | read-write | Auth database (API keys, MCP OAuth), logs, sessions, storage |
-| `~/.config/opencode-dockerized/home/.local/state/opencode/` | `/home/coder/.local/state/opencode/` | read-write | Selected model, prompt history, locks |
-| `~/.config/opencode-dockerized/home/.cache/opencode/` | `/home/coder/.cache/opencode/` | read-write | Provider package cache |
+| `<profile>/home/.config/opencode/` | `/home/coder/.config/opencode/` | **read-only** | Self-contained OpenCode config: MCP servers, models, `cli.json`, skills, agents, commands, plugins. The security files (`AGENTS.md`, `plugins/security-guard.js`, `plugins/policies/`) are mirrored into this tree on the host |
+| `<profile>/home/.local/share/opencode/` | `/home/coder/.local/share/opencode/` | read-write | Auth database (API keys, MCP OAuth), logs, sessions, storage |
+| `<profile>/home/.local/state/opencode/` | `/home/coder/.local/state/opencode/` | read-write | Selected model, prompt history, locks |
+| `<profile>/home/.cache/opencode/` | `/home/coder/.cache/opencode/` | read-write | Provider package cache |
 | `~/.npmrc` | `/home/coder/.npmrc` | read-only | NPM config, **opt-in** with `setting.mount_npmrc=true` (it can hold registry auth tokens) |
 | `~/.claude/{skills,agents,commands,CLAUDE.md}` | `/home/coder/.claude/…` | **read-only** | Claude Code compat: skills and fallback rules (each path only if it exists). The rest of `~/.claude` (login credentials, history, `projects/`) is never mounted |
 | `~/.agents/skills/` | `/home/coder/.agents/skills/` | **read-only** | Agent-compatible skills (`<name>/SKILL.md`) (optional) |
 | `~/.mcp-auth/` | `/home/coder/.mcp-auth/` | **read-write** | MCP OAuth store for `mcp-remote` servers (optional) |
 | `~/.composio/` | `/home/coder/.composio/` | read-write | Composio CLI binary + login (optional custom `mount.composio`) |
-| `~/.config/opencode-dockerized/home/.gnupg/` | `/home/coder/.gnupg/` | read-write | Mirrored **public** GnuPG material (pubring/trustdb/gpg.conf) + agent socket (only with `setting.gpg_agent_support=true`); `private-keys-v1.d/` is never copied |
+| `<profile>/home/.gnupg/` | `/home/coder/.gnupg/` | read-write | Mirrored **public** GnuPG material (pubring/trustdb/gpg.conf) + agent socket (only with `setting.gpg_agent_support=true`); `private-keys-v1.d/` is never copied |
 
-The wrapper's own directory (`~/.config/opencode-dockerized/`) is **not** mounted at all: its permission rules are read on the host and passed inline, and its security files are mirrored into the config tree above. With `--profile NAME`, every `~/.config/opencode-dockerized/home/...` path above comes from `~/.config/opencode-dockerized/profiles/NAME/home/...` instead.
+`<profile>` is the active profile's directory,
+`~/.config/opencode-dockerized/profiles/<name>/` (`profiles/default/` without
+`--profile`). The wrapper's own directory (`~/.config/opencode-dockerized/`,
+every profile included) is **not** mounted at all: its permission rules are
+read on the host and passed inline, and its security files are mirrored into
+the config tree above.
 
 ### Persistent Configuration & Security Layer
 
 The wrapper is **self-contained and replaces native host usage**: all of OpenCode's
-state lives under a single host directory (`~/.config/opencode-dockerized/home/`,
-override with `OCODE_HOME`), mirroring the container home layout 1:1. Back up or move
-that one directory and the whole setup travels with it. The host XDG dirs
-(`~/.config/opencode`, `~/.local/...`) are never touched.
+state lives under one host directory per profile
+(`~/.config/opencode-dockerized/profiles/<name>/home/`, override with
+`OCODE_HOME`), mirroring the container home layout 1:1. Back up or move
+`~/.config/opencode-dockerized/` and every profile travels with it. The host XDG
+dirs (`~/.config/opencode`, `~/.local/...`) are never touched.
 
 ```text
 ~/.config/opencode-dockerized/
-│   config                          ← wrapper INI config (mounts, env vars, settings)
-│   opencode.json                   ← sandbox permission rules (deny rm -rf/sudo,
-│                                      ask git push, deny reading .env/keys, ...);
-│                                      passed inline via OPENCODE_CONFIG_CONTENT
-│   AGENTS.md                       ← security rules source
-│   plugins/security-guard.js       ← guard source (versioned in the repo)
-│   plugins/policies/*.json         ← opencode-policy pattern sets + local allowlist
+│   .lock  .previous-rev            ← install-wide: update/install lock, rollback rev
+│   gnupg-relay/                    ← install-wide: per-session GnuPG relay sockets
 │
-└── home/                            ← mirrors /home/coder, mounted piece by piece
-    └── .config/opencode/            ← mounted READ-ONLY
-    │   AGENTS.md                   ← security rules (mirrored from the source above)
-    │   opencode.json               ← YOUR config: MCP servers, models (seeded minimal)
-    │   cli.json                    ← V2 terminal client settings (seeded `{}`)
-    │   plugins/                    ← your plugins + mirrored guard + policies/
-    │   agents/ commands/ skills/   ← seeded empty (V2 plural layout)
-    └── .local/share|state/opencode/ ← auth, sessions, history (rw)
-    └── .cache/opencode/ ← caches (rw)
+└── profiles/
+    ├── default/                    ← used when no --profile is given
+    │   │   config                  ← wrapper INI config (mounts, settings)
+    │   │   env                     ← secrets file (setting.env_file, mode 600)
+    │   │   opencode.json           ← sandbox permission rules (deny rm -rf/sudo,
+    │   │                              ask git push, deny reading .env/keys, ...);
+    │   │                              passed inline via OPENCODE_CONFIG_CONTENT
+    │   │   AGENTS.md               ← security rules source
+    │   │   plugins/security-guard.js  ← guard source (versioned in the repo)
+    │   │   plugins/policies/*.json ← opencode-policy pattern sets + local allowlist
+    │   │   sessions/               ← live-session markers
+    │   │
+    │   └── home/                   ← mirrors /home/coder, mounted piece by piece
+    │       └── .config/opencode/   ← mounted READ-ONLY
+    │       │   AGENTS.md           ← security rules (mirrored from the source above)
+    │       │   opencode.json       ← YOUR config: MCP servers, models (seeded minimal)
+    │       │   cli.json            ← V2 terminal client settings (seeded `{}`)
+    │       │   plugins/            ← your plugins + mirrored guard + policies/
+    │       │   agents/ commands/ skills/  ← seeded empty (V2 plural layout)
+    │       └── .local/share|state/opencode/  ← auth, sessions, history (rw)
+    │       └── .cache/opencode/    ← caches (rw)
+    │
+    └── work/                       ← another profile: same layout, own account
 ```
 
 Because everything lives on the host, all state persists across `docker` up/down
@@ -457,13 +487,15 @@ settings there across restarts).
 # (written to the env file without echoing their values)
 ./install.sh
 
-# Or manually edit the config file
-~/.config/opencode-dockerized/config
+# Or edit the active profile's config file in $EDITOR
+opencode-dockerized config edit            # ~/.config/opencode-dockerized/profiles/default/config
+opencode-dockerized --profile work config edit
 ```
 
 #### Config Format
 
-Configuration is stored in `~/.config/opencode-dockerized/config` (INI format):
+Configuration is stored per profile in
+`~/.config/opencode-dockerized/profiles/<name>/config` (INI format):
 
 ```ini
 # Settings (built-in features)
@@ -480,7 +512,7 @@ setting.mount_npmrc=false
 setting.memory=4g
 setting.cpus=2
 setting.pids_limit=4096
-setting.env_file=~/.config/opencode-dockerized/env
+setting.env_file=~/.config/opencode-dockerized/profiles/default/env
 setting.websearch_provider=exa
 setting.theme=catppuccin
 
@@ -518,23 +550,23 @@ Inside the container, configure git to use your signing key (e.g. `git config --
 
 Verify the setup with `opencode-dockerized doctor`. If the host agent socket is missing, `run` starts it automatically (`setting.gpg_autostart_agent=true`, the default); before launching it probes whether the agent already answers (`gpg-connect-agent` with a 2 s timeout), so a live agent is never relaunched and a stale socket is replaced. Set `gpg_autostart_agent=false` to only warn and never launch anything.
 
-**Important:** many Docker setups cannot bind a socket under a per-user tmpfs (`/run/user/<uid>/gnupg/…`) — they create an empty directory instead. The wrapper transparently relays the agent socket through a socket on a normal filesystem (under `~/.config/opencode-dockerized/gnupg-relay/`) using `socat`, and mounts that. Install `socat` on the host; if it is missing the wrapper warns and skips GPG forwarding. Only the restricted `S.gpg-agent.extra` socket is relayed, and the relay exists only while the container runs (`setting.gpg_relay=true`, the default; `clean` purges leftovers).
+**Important:** many Docker setups cannot bind a socket under a per-user tmpfs (`/run/user/<uid>/gnupg/…`) — they create an empty directory instead. The wrapper transparently relays the agent socket through a socket on a normal filesystem (under the install-wide `~/.config/opencode-dockerized/gnupg-relay/`, shared by every profile) using `socat`, and mounts that. Install `socat` on the host; if it is missing the wrapper warns and skips GPG forwarding. Only the restricted `S.gpg-agent.extra` socket is relayed, and the relay exists only while the container runs (`setting.gpg_relay=true`, the default; `clean` purges leftovers).
 
 Pinentry runs on the **host** agent, so it is independent of the container's desktop: install a suitable `pinentry` for your session (KDE/LXQt → `pinentry-qt`; GNOME → `pinentry-gnome3`; sway/i3/awesome → `pinentry-gtk`/`pinentry-qt` or `pinentry-rofi`). With a terminal-only pinentry, run `gpg-connect-agent updatestartuptty /bye` on the host so prompts appear in your terminal.
 
 **Example 3: API keys and credentials (secrets file recommended)**
 ```ini
-setting.env_file=~/.config/opencode-dockerized/env
+setting.env_file=~/.config/opencode-dockerized/profiles/default/env
 ```
 
-Create the file with `install -m 600 /dev/null ~/.config/opencode-dockerized/env`, then add one `KEY=VALUE` per line. It must live under `~/.config/opencode-dockerized/` (anywhere else is refused) and is passed with `docker --env-file`, so values never appear on the command line; the file itself is never mounted.
+Create the file with `install -m 600 /dev/null ~/.config/opencode-dockerized/profiles/default/env`, then add one `KEY=VALUE` per line. It must live inside the active profile's directory (`profiles/<name>/`; anywhere else — including another profile — is refused) and is passed with `docker --env-file`, so values never appear on the command line; the file itself is never mounted. `opencode-dockerized install` adds keys to it without printing them.
 
 **Never write secrets inline in `opencode.json`** — use `{env:VARNAME}` references instead (e.g. `"apiKey": "{env:EXA_API_KEY}"`). The wrapper aborts the run if it finds inline secrets there; `doctor` reports them too.
 
 **Example 4: Websearch with Exa**
 ```ini
 setting.websearch_provider=exa
-setting.env_file=~/.config/opencode-dockerized/env
+setting.env_file=~/.config/opencode-dockerized/profiles/default/env
 ```
 With `EXA_API_KEY=...` in the env file, web search uses Exa without asking. Supported ids: `exa | firecrawl | parallel | tavily | random`; empty means the TUI asks once per session.
 
@@ -685,9 +717,9 @@ chmod +x bin/opencode-dockerized install.sh entrypoint.sh
 # Run install script
 ./install.sh
 
-# Or manually create the self-contained tree
-mkdir -p ~/.config/opencode-dockerized/home/.config/opencode ~/.config/opencode-dockerized/home/.local/share/opencode
-echo '{"$schema": "https://opencode.ai/config.json"}' > ~/.config/opencode-dockerized/home/.config/opencode/opencode.json
+# Or let the wrapper recreate the active profile's tree and security layer
+opencode-dockerized config sync
+opencode-dockerized config opencode path   # the seeded OpenCode config
 ```
 
 ### Permission Issues with Files
@@ -804,8 +836,8 @@ This significantly reduces risk while maintaining full functionality.
 
 1. **Docker Socket (opt-in)**: Not mounted by default. Set `setting.docker_socket=true` to use the host's Docker daemon (no privileged mode needed) — it is root-equivalent on the host, so enable it only when required.
 2. **Network Access**: Container uses host network mode by default for convenience. That shares the host network namespace: every host service on localhost is reachable, and so are **abstract unix sockets** (for example X11's `@/tmp/.X11-unix/X0`, D-Bus or other desktop session buses), which file-based isolation does not cover. Prefer `setting.network=bridge` unless you need host networking
-3. **Configuration Updates**: The OpenCode config is self-contained under `~/.config/opencode-dockerized/home/.config/opencode/` and mounted **read-only**; modify it on the host (`config opencode edit`) and restart. Auth/MCP-OAuth live in the read-write data dir, so `auth`/`mcp auth` keep working
-4. **Persistent Data**: Project files plus the whole `~/.config/opencode-dockerized/home/` state tree persist across restarts and rebuilds
+3. **Configuration Updates**: The OpenCode config is self-contained under `~/.config/opencode-dockerized/profiles/<name>/home/.config/opencode/` and mounted **read-only**; modify it on the host (`config opencode edit`) and restart. Auth/MCP-OAuth live in the read-write data dir, so `auth`/`mcp auth` keep working
+4. **Persistent Data**: Project files plus each profile's `home/` state tree persist across restarts and rebuilds
 5. **No sudo/apt inside**: The image ships no sudo (no sudoers entry, no binary) — the agent runs as the host user, never as root, with all Linux capabilities dropped and `no-new-privileges` set, so it cannot escalate by design
 6. **Not a Replacement for Caution**: Review OpenCode's actions, especially with `--allow-all-tools`
 
@@ -824,7 +856,7 @@ This setup is optimized for minimal overhead:
 **Testcontainers support is available** (opt-in). Enable the host Docker socket first:
 
 ```ini
-# ~/.config/opencode-dockerized/config
+# ~/.config/opencode-dockerized/profiles/<name>/config (opencode-dockerized config edit)
 setting.docker_socket=true
 ```
 

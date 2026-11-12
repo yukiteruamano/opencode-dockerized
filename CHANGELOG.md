@@ -4,17 +4,42 @@ All notable changes to opencode-dockerized. Versions follow `WRAPPER_VERSION`;
 the guard (`OPENCODE_DOCKERIZED_GUARD_VERSION`) and the policy set
 (`policies/VERSION`) carry their own counters.
 
-## Unreleased — multi-account profiles and balanced-mode false positives
+## 0.16.0 (unreleased) — profile layout, multi-account profiles and balanced-mode false positives
+
+### Layout change (migrated automatically)
+- Profiles are now the only layout: every run uses a profile, `default` when
+  no `--profile` is given, at `~/.config/opencode-dockerized/profiles/default/`.
+  The base keeps only install-wide state: the update/install lock
+  (`.lock`/`.lock.d`), `.previous-rev` (rollback) and `gnupg-relay/`.
+- On the first run of 0.16 (normally the `update` that installs it), a
+  pre-0.16 setup — config, secrets file, generated permissions, security
+  layer, sessions and the OpenCode home with its auth database — is moved
+  from the base into `profiles/default` (`lib/profiles-lib.sh`). Each entry
+  is renamed into a stage that is renamed into place at the end, so an
+  interrupted move resumes on the next run; `setting.env_file` pointing into
+  the old tree follows the move (keeping its `~/` form, mode 600 preserved).
+  The move runs under the install lock (and under the parent's lock in the
+  post-pull re-exec of `update`), waits while a session started by the old
+  version is still running (that run keeps the old tree), never merges into
+  an existing `profiles/default` (leftovers are reported, not deleted), and
+  fails closed — no container starts — on a conflict.
+- `profile remove default` is refused; `profile create --from default` copies
+  the default profile like any other; `profile list` shows only real profiles.
+- `--profile=` with an empty name is refused instead of falling back.
+- A `~/` form of `setting.env_file` (written by the migration and shown in
+  the docs) is now expanded by every reader, not only by `docker --env-file`:
+  the layer check no longer reports it "not found" (which made `update` end
+  as INCOMPLETE), `config show` counts its keys, and adding keys through
+  `install` no longer creates a literal `~` directory in the current dir.
 
 ### Profiles (multi-account)
 - `--profile NAME` (or `OPENCODE_DOCKERIZED_PROFILE=NAME`) selects a
   self-contained state tree under `~/.config/opencode-dockerized/profiles/NAME`:
   its own wrapper config (e.g. one profile `security_policy=strict`, another
   `balanced`), env file (provider account), generated permissions, security
-  layer and OpenCode home (auth database, sessions, state, cache). Without a
-  profile, paths are exactly the previous ones.
+  layer and OpenCode home (auth database, sessions, state, cache).
 - New `profile` command: `list`, `current`, `path`,
-  `create NAME [--from NAME|default]`, `remove NAME [--yes]`; plus a
+  `create NAME [--from NAME]`, `remove NAME [--yes]`; plus a
   non-interactive `config init`.
 - The profiles base is a protected location: a session in one profile cannot
   mount or open another profile's tree (credentials, auth database).

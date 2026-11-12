@@ -10,7 +10,8 @@ on npm), vendored verbatim:
 
 Upstream ships them for the OpenCode **V1** plugin API, which does not load on the
 V2-only setup used here — so instead of depending on that package, the generator in
-`lib/config-lib.sh` copies these files to `~/.config/opencode-dockerized/plugins/policies/`
+`lib/config-lib.sh` copies these files to each profile's
+`~/.config/opencode-dockerized/profiles/<name>/plugins/policies/`
 and our V2 `security-guard.js` hook evaluates them with the same first-match semantics
 (`new RegExp(pattern, flags ?? "i")`).
 
@@ -40,7 +41,7 @@ in `plugins/security-guard.js` (`SHELL_INJECTION_IDS` vs
 `FETCH_ONLY_INJECTION_IDS` — whether balanced mode scans shell commands with it
 or only webfetch/websearch text); `tests/policy-lint.test.mjs` fails until a
 new rule is classified. `lib/config-lib.sh` compares it with the installed copy under
-`~/.config/opencode-dockerized/plugins/policies/` and refreshes the rule files
+the active profile's `plugins/policies/` and refreshes the rule files
 (backing up the previous ones) whenever the version changes or a file is missing.
 Deleting the installed copies still re-seeds them on the next run.
 
