@@ -119,6 +119,45 @@ check "profile remove --yes" 0 "removed" -- profile remove smoke2 --yes
 check "profile remove --yes (smoke)" 0 "removed" -- profile remove smoke --yes
 check "invalid profile name" 1 "Invalid profile name" -- --profile "bad/../name" config path
 
+# Every command that starts OpenCode must bring its own server: --standalone or
+# the private server (`opencode serve` + --server). The background service
+# rewrites a legacy ~/.config/opencode/service.json, which is read-only in the
+# container (EROFS), and listens on a fixed localhost port shared with the host
+# under --network host.
+server_mode_check() {
+    local desc="$1"
+    shift
+    : >"$DOCKER_STUB_LOG"
+    "$W" "$@" </dev/null >/dev/null 2>&1
+    if grep -q -- ' private-server /api/' "$DOCKER_STUB_LOG"; then
+        return
+    fi
+    if grep -q -- '--standalone' "$DOCKER_STUB_LOG"; then
+        return
+    fi
+    failures=$((failures + 1))
+    echo "FAIL [$desc] starts OpenCode without --standalone or the private server (background service)"
+    grep '^run ' "$DOCKER_STUB_LOG" | tail -1 | cut -c1-200
+}
+server_mode_check "run" run "$TMP/proj"
+server_mode_check "auth" auth
+server_mode_check "models" models
+server_mode_check "exec" exec "hello"
+server_mode_check "stats" stats
+server_mode_check "debug" debug
+server_mode_check "mcp (list)" mcp
+server_mode_check "mcp auth" mcp auth Composio
+server_mode_check "mcp logout" mcp logout Composio
+server_mode_check "plugin (list)" plugin
+server_mode_check "plugin check" plugin check
+# The subcommand and its arguments reach the CLI unchanged.
+: >"$DOCKER_STUB_LOG"
+"$W" mcp auth Composio </dev/null >/dev/null 2>&1
+grep -q -- ' private-server /api/config \. [0-9]* mcp auth Composio$' "$DOCKER_STUB_LOG" || {
+    failures=$((failures + 1))
+    echo "FAIL [mcp auth] must pass 'mcp auth Composio' to the private server"
+}
+
 # Every dispatched command must be documented in help (catches drift the
 # completions test, which reads help, would then propagate silently).
 help_out="$("$W" help 2>&1)"

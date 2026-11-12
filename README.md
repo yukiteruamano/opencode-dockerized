@@ -60,7 +60,7 @@ Everything below is on top of what upstream provides.
 - **Built-in websearch provider** (`exa | firecrawl | parallel | tavily | random`) merged into the inline config, key via env file.
 - **Catppuccin theme** (and variants) via inline CLI config.
 - **Global install + aliases guaranteed** - `install.sh` puts `<install>/bin` on `PATH` (no symlink/stub/copy in `~/.local/bin`, legacy symlink auto-removed), ensures `PATH` in bash/zsh, and verifies/repairs the `ocd`, `ocd-run`, `ocd-auth` aliases, which point at the command on `PATH` rather than an absolute repo path (immune to repo moves; `sync --check` watches PATH health).
-- **Non-interactive setup** (`--yes`, `--only`, `NO_COLOR`, multiline redacted `DRY_RUN`) and private-server readiness for `models`/`stats`/`exec`/`debug`.
+- **Non-interactive setup** (`--yes`, `--only`, `NO_COLOR`, multiline redacted `DRY_RUN`) and private-server readiness for `models`/`stats`/`exec`/`debug`/`mcp`/`plugin` (OpenCode's background service is never used in the container).
 - **Multi-account profiles** (`--profile NAME`, `profile create|list|remove`) - each profile keeps its own config (even a different `security_policy`), secrets file and OpenCode auth/sessions, isolated from the others.
 - **Git worktree support**, container resource limits, drift hints in `config show`, and a contract test suite (`bash` + `node`) covering mounts, permissions, policies, profiles, every command's surface and sync.
 

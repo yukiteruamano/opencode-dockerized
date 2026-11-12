@@ -147,6 +147,15 @@ the least access it needs to be useful.
   (read-only) config dir are not written back, so any in-session change to them
   does not persist. The CLI and local server were verified to start and run with
   the config dir read-only.
+- **OpenCode's background service is never used in the container.** Every
+  command that starts OpenCode brings its own server: `run` and `auth` use
+  `--standalone`; `models`, `stats`, `debug`, `exec`, `mcp` and `plugin` use a
+  private `opencode serve` (random port, random password) and `--server`. The
+  background service would listen on a fixed localhost port that
+  `--network host` shares with a native OpenCode on the host, and it rewrites
+  a legacy `service.json` (`"remote": true/false`) in the read-only config dir,
+  which failed `mcp auth` with `EROFS`. `tests/commands-smoke.test.sh` asserts
+  this for every server-backed command.
 - **MCP auth store is read-write.** `~/.mcp-auth` is mounted read-write so
   `mcp-remote` OAuth tokens persist; the agent can read or alter those tokens.
 - **Config is read-only, so config changes are host-only.** `opencode mcp add`

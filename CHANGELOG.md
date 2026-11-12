@@ -26,6 +26,17 @@ the guard (`OPENCODE_DOCKERIZED_GUARD_VERSION`) and the policy set
 - `profile remove default` is refused; `profile create --from default` copies
   the default profile like any other; `profile list` shows only real profiles.
 - `--profile=` with an empty name is refused instead of falling back.
+
+### Fixes
+- `mcp` (`list`, `auth`, `logout`) and `plugin` (`list`, `check`) now run
+  against the private server like `models`/`stats`. They were the only
+  commands still using OpenCode's background service, which rewrites a legacy
+  `~/.config/opencode/service.json` in place: `mcp auth <server>` failed with
+  `EROFS: read-only file system ... service.json.<pid>.tmp`. The background
+  service also listens on a fixed localhost port shared with the host under
+  `--network host`. `tests/commands-smoke.test.sh` now fails if any
+  server-backed command starts OpenCode without `--standalone` or the private
+  server.
 - A `~/` form of `setting.env_file` (written by the migration and shown in
   the docs) is now expanded by every reader, not only by `docker --env-file`:
   the layer check no longer reports it "not found" (which made `update` end

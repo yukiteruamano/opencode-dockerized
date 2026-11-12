@@ -1128,7 +1128,14 @@ config_readonly_guard() {
     print_info "File: $OCODE_HOME/.config/opencode/opencode.json"
 }
 
-# Function to manage MCP servers (list, add, auth, logout)
+# mcp and plugin subcommands run against the private server, like models and
+# stats. Without --server/--standalone the CLI starts or reuses OpenCode's
+# background service instead: that rewrites a legacy
+# ~/.config/opencode/service.json in place (read-only here, so it fails with
+# EROFS) and listens on a fixed localhost port that --network host shares with
+# a native OpenCode on the host.
+
+# Function to manage MCP servers (list, auth, logout; add is host-only)
 manage_mcp() {
     local subcommand="${1:-list}"
     shift || true
@@ -1140,7 +1147,7 @@ manage_mcp() {
         exit 1
         ;;
     esac
-    run_cli_command mcp "$(pwd)" false opencode mcp "$subcommand" "$@"
+    run_with_private_server mcp "$(pwd)" false /api/config . mcp "$subcommand" "$@"
 }
 
 # Function to manage plugins (list, add, check, update, remove)
@@ -1154,7 +1161,7 @@ manage_plugins() {
         exit 1
         ;;
     esac
-    run_cli_command plugin "$(pwd)" false opencode plugin "$subcommand" "$@"
+    run_with_private_server plugin "$(pwd)" false /api/config . plugin "$subcommand" "$@"
 }
 
 # Function to run OpenCode debugging tools (agents, config, paths)
