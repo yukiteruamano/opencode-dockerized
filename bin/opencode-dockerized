@@ -1277,18 +1277,19 @@ profile_create() {
         chmod 600 "$dest/config" 2>/dev/null || true
     fi
 
-    # Seed the state tree, security layer and (when not copied) the config
-    # template through the normal per-profile code path. CONFIG_DIR is passed
+    # Seed the config template first (when not copied), then the state tree
+    # and security layer, both through the normal per-profile code path — so
+    # the sync already finds a config to parse. CONFIG_DIR is passed
     # explicitly: it may arrive exported and already profile-shaped, and the
     # child derives <base>/profiles/<name> from the base again.
+    if [ -z "$src_config" ]; then
+        OPENCODE_DOCKERIZED_PROFILE="$name" CONFIG_DIR="$OCD_PROFILES_BASE" \
+            "$BIN_DIR/opencode-dockerized" config init || exit 1
+    fi
     if ! OPENCODE_DOCKERIZED_PROFILE="$name" CONFIG_DIR="$OCD_PROFILES_BASE" \
         "$BIN_DIR/opencode-dockerized" config sync; then
         print_error "Failed to initialize profile '$name'"
         exit 1
-    fi
-    if [ -z "$src_config" ]; then
-        OPENCODE_DOCKERIZED_PROFILE="$name" CONFIG_DIR="$OCD_PROFILES_BASE" \
-            "$BIN_DIR/opencode-dockerized" config init || exit 1
     fi
 
     print_success "Profile '$name' created: $dest"

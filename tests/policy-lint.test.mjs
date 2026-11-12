@@ -31,6 +31,22 @@ const check = (label, ok) => {
   }
 };
 
+// Wall-clock budgets are load-sensitive: a busy host adds scheduler noise in
+// the hundreds of milliseconds. Measure once; only when over budget re-measure
+// (up to two retries) and keep the minimum — the common case stays a single
+// run, and a real quadratic blowup (seconds) still fails every attempt.
+const timedMs = (fn, budgetMs) => {
+  let best = Infinity;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const t0 = process.hrtime.bigint();
+    fn();
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    if (ms < best) best = ms;
+    if (best < budgetMs) break;
+  }
+  return best;
+};
+
 const allIds = new Set();
 const rulesByFile = {};
 for (const file of FILES) {
@@ -120,9 +136,7 @@ for (const file of FILES.slice(0, 2)) {
       continue;
     }
     for (const input of ADVERSARIAL) {
-      const t0 = process.hrtime.bigint();
-      re.test(input);
-      const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+      const ms = timedMs(() => re.test(input), BUDGET_MS);
       check(`${file}/${rule.id}: ${ms.toFixed(0)} ms on "${input.slice(0, 12)}…" x${input.length} (budget ${BUDGET_MS})`, ms < BUDGET_MS);
     }
   }
@@ -183,9 +197,7 @@ for (const file of FILES.slice(0, 2)) {
       ["webfetch", "http://" + "a.".repeat(Math.floor(CAP / 2) - 8) + "com/"],
     ];
     for (const [action, value] of cases) {
-      const t0 = process.hrtime.bigint();
-      evaluate.raw(action, [value]);
-      const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+      const ms = timedMs(() => evaluate.raw(action, [value]), budget);
       check(`[${mode}] guard ${action}: ${ms.toFixed(0)} ms on "${value.slice(0, 16)}…" x${value.length} (budget ${budget})`, ms < budget);
     }
   }

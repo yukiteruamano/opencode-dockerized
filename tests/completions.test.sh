@@ -82,4 +82,39 @@ grep -q 'CURRENT == 2' "$REPO_DIR/completions/zsh.sh" || fail "zsh config comple
 grep -q "_values 'opencode config subcommand' path edit" "$REPO_DIR/completions/zsh.sh" ||
     fail "zsh 'config opencode' must complete path|edit"
 
+# `config <TAB>` must offer the non-interactive init subcommand.
+COMP_WORDS=(opencode-dockerized config "")
+COMP_CWORD=2
+_opencode_dockerized
+grep -qw init <<<"${COMPREPLY[*]}" || fail "config must complete init (got: ${COMPREPLY[*]})"
+
+# `profile <TAB>` offers its subcommands; `debug profile <TAB>` must not.
+COMP_WORDS=(opencode-dockerized profile "")
+COMP_CWORD=2
+_opencode_dockerized
+for sub in list current path create remove; do
+    grep -qw -- "$sub" <<<"${COMPREPLY[*]}" || fail "profile must complete '$sub' (got: ${COMPREPLY[*]})"
+done
+COMP_WORDS=(opencode-dockerized debug profile "")
+COMP_CWORD=3
+_opencode_dockerized
+if grep -qw create <<<"${COMPREPLY[*]}"; then
+    fail "'debug profile <TAB>' must not offer profile subcommands (got: ${COMPREPLY[*]})"
+fi
+
+# `--profile <TAB>` completes existing profile names from the profiles dir.
+export CONFIG_DIR="$HOME/cfg"
+mkdir -p "$CONFIG_DIR/profiles/work" "$CONFIG_DIR/profiles/lab"
+COMP_WORDS=(opencode-dockerized --profile "")
+COMP_CWORD=2
+_opencode_dockerized
+grep -qw work <<<"${COMPREPLY[*]}" || fail "--profile must complete profile names (got: ${COMPREPLY[*]})"
+grep -qw lab <<<"${COMPREPLY[*]}" || fail "--profile must complete every profile (got: ${COMPREPLY[*]})"
+unset CONFIG_DIR
+
+# zsh keeps the profile subcommand list.
+grep -q "_values 'profile subcommand' list current path create remove" "$REPO_DIR/completions/zsh.sh" ||
+    fail "zsh 'profile' must complete its subcommands"
+grep -q "'init:" "$REPO_DIR/completions/zsh.sh" || fail "zsh config completion must offer init"
+
 echo "completions test passed"
