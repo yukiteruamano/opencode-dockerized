@@ -18,6 +18,12 @@ the guard (`OPENCODE_DOCKERIZED_GUARD_VERSION`) and the policy set
   non-interactive `config init`.
 - The profiles base is a protected location: a session in one profile cannot
   mount or open another profile's tree (credentials, auth database).
+- Secrets are per profile: `setting.env_file` must live under the active
+  profile's tree (the existing containment check now anchors there), the
+  generated config template points its env-file example at the profile's own
+  directory, and `profile create --from` repoints the copied `env_file` at
+  the new tree, seeds an empty mode-600 file and never copies the source
+  account's secrets.
 - Container names and the `OPENCODE_DOCKERIZED_PROFILE` indicator carry the
   profile; `config show` and `doctor` print it.
 

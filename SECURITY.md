@@ -133,7 +133,10 @@ the least access it needs to be useful.
   matching, as before.
 - **Profiles are isolated, not hidden.** With `--profile` each account's
   credentials, sessions and config live in their own tree and the profiles
-  base is refused as a mount or project directory; inside a session, the
+  base is refused as a mount or project directory; a profile's
+  `setting.env_file` must live under its own tree, so one profile cannot load
+  another's secrets, and `profile create --from` repoints the copied
+  `env_file` and never copies the source secrets. Inside a session, the
   active profile's provider keys are still visible to that session's agent
   (same as without profiles), and `profile remove` deletes the tree
   irreversibly (it asks for the profile name, or `--yes`).

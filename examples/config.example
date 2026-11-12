@@ -99,8 +99,11 @@
 # setting.pids_limit=4096
 
 # Secrets file (dotenv KEY=VALUE lines) loaded with docker --env-file.
-# Must live under ~/.config/opencode-dockerized/ (never mounted; elsewhere is
-# refused). Create with: install -m 600 /dev/null ~/.config/opencode-dockerized/env
+# Must live under the active config tree (never mounted; elsewhere is refused):
+# ~/.config/opencode-dockerized/ by default, or the profile's own
+# profiles/NAME/ dir when using --profile — so each profile keeps its own
+# account's secrets and cannot load another profile's.
+# Create with: install -m 600 /dev/null ~/.config/opencode-dockerized/env
 # This is the only way user secrets reach the container. Empty = disabled.
 # setting.env_file=~/.config/opencode-dockerized/env
 

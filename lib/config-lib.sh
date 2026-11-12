@@ -2386,12 +2386,6 @@ init_config_file() {
 # setting.memory=4g
 # setting.cpus=2
 
-# Secrets file (dotenv KEY=VALUE lines) loaded with docker --env-file.
-# Must live under ~/.config/opencode-dockerized/ (never mounted). Create it with
-# `install -m 600 /dev/null ~/.config/opencode-dockerized/env` and add keys like
-# EXA_API_KEY=... Empty = disabled.
-# setting.env_file=~/.config/opencode-dockerized/env
-
 # Built-in websearch provider: exa | firecrawl | parallel | tavily | random.
 # Empty = ask once in the TUI. The provider API key must be in the env file.
 # setting.websearch_provider=exa
@@ -2408,8 +2402,17 @@ init_config_file() {
 # setting.ssh_agent_support=true: the agent socket plus ~/.ssh/config and
 # known_hosts are mounted read-only automatically.
 
-# Secrets live in setting.env_file (dotenv KEY=VALUE, never mounted).
-# Use `opencode-dockerized install` to add keys without ever printing them.
+EOF
+    # Appended unquoted so the env-file example matches the active tree: with
+    # --profile it must name the profile's own directory (an env file outside
+    # the active CONFIG_DIR is refused at run time).
+    cat >>"$CONFIG_FILE" <<EOF
+# Secrets file (dotenv KEY=VALUE lines) loaded with docker --env-file.
+# Must live under this config tree ($CONFIG_DIR/, never mounted). Create it
+# with: install -m 600 /dev/null $CONFIG_DIR/env
+# then add keys like EXA_API_KEY=... Empty = disabled. Use
+# 'opencode-dockerized install' to add keys without ever printing them.
+# setting.env_file=$CONFIG_DIR/env
 EOF
     config_success "Created config file at $CONFIG_FILE"
 }

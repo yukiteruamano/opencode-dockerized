@@ -1275,6 +1275,24 @@ profile_create() {
     if [ -n "$src_config" ]; then
         cp "$src_config" "$dest/config"
         chmod 600 "$dest/config" 2>/dev/null || true
+        # Secrets are per account and never copied. A copied setting.env_file
+        # would keep pointing into the source tree, which the run refuses (the
+        # env file must live under the active profile), so repoint it at this
+        # profile's own tree and seed an empty 600 file for the new account.
+        if grep -q '^setting\.env_file=..*' "$dest/config"; then
+            local tmp_cfg line
+            tmp_cfg=$(mktemp "$dest/.config.XXXXXX")
+            while IFS= read -r line || [ -n "$line" ]; do
+                case "$line" in
+                setting.env_file=?*) printf 'setting.env_file=%s\n' "$dest/env" ;;
+                *) printf '%s\n' "$line" ;;
+                esac
+            done <"$dest/config" >"$tmp_cfg"
+            mv "$tmp_cfg" "$dest/config"
+            chmod 600 "$dest/config" 2>/dev/null || true
+            [ -f "$dest/env" ] || install -m 600 /dev/null "$dest/env"
+            print_warning "setting.env_file now points at $dest/env — secrets are per profile and were NOT copied; add this account's keys there"
+        fi
     fi
 
     # Seed the config template first (when not copied), then the state tree

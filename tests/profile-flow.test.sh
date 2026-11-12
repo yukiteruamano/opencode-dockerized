@@ -80,6 +80,10 @@ run_wrapper profile create dev
 [ -f "$CONFIG_DIR/profiles/dev/config" ] || fail "create must seed the profile config template"
 [ -f "$CONFIG_DIR/profiles/dev/home/.config/opencode/plugins/security-guard.js" ] ||
     fail "create must install the security layer into the profile's OpenCode home"
+# The template's env-file example must name the profile's own tree, not the
+# default one (an env file outside the active CONFIG_DIR is refused at run time).
+grep -q "# setting.env_file=$CONFIG_DIR/profiles/dev/env" "$CONFIG_DIR/profiles/dev/config" ||
+    fail "the generated template must point its env-file example at the profile tree"
 run_wrapper profile create dev
 [ "$RC" -ne 0 ] || fail "creating an existing profile must fail"
 run_wrapper profile create 'bad/name'
@@ -128,10 +132,49 @@ printf 'setting.security_policy=strict\n' >"$CONFIG_DIR/profiles/dev/config"
 run_wrapper --profile dev run "$CONFIG_DIR/profiles/other/home"
 [ "$RC" -ne 0 ] || fail "another profile's home must be refused as a project directory"
 
+# 4b. Per-profile secrets: each profile's env_file lives in its own tree.
+install -m 600 /dev/null "$CONFIG_DIR/profiles/dev/env"
+printf 'A_KEY=1\n' >"$CONFIG_DIR/profiles/dev/env"
+printf 'setting.security_policy=strict\nsetting.env_file=%s\n' "$CONFIG_DIR/profiles/dev/env" \
+    >"$CONFIG_DIR/profiles/dev/config"
+run_wrapper --profile dev run "$TMP/proj"
+[ "$RC" -eq 0 ] || fail "an env file under the profile's own tree must be accepted: $OUT"
+docker_run_line | grep -q -- "--env-file $CONFIG_DIR/profiles/dev/env" ||
+    fail "the profile's own env file must reach docker --env-file"
+
+# The default tree's env file is outside the profile and must be refused.
+install -m 600 /dev/null "$CONFIG_DIR/env"
+printf 'setting.env_file=%s\n' "$CONFIG_DIR/env" >"$CONFIG_DIR/profiles/dev/config"
+run_wrapper --profile dev run "$TMP/proj"
+[ "$RC" -ne 0 ] || fail "the default tree's env file must be refused from a profile"
+grep -qi 'outside' <<<"$OUT" || fail "the env refusal must say it is outside the config dir: $OUT"
+
+# Another profile's env file must be refused too.
+install -m 600 /dev/null "$CONFIG_DIR/profiles/other/env"
+printf 'setting.env_file=%s\n' "$CONFIG_DIR/profiles/other/env" >"$CONFIG_DIR/profiles/dev/config"
+run_wrapper --profile dev run "$TMP/proj"
+[ "$RC" -ne 0 ] || fail "another profile's env file must be refused"
+
 # 5. create --from copies the source profile's config.
+printf 'setting.security_policy=strict\nsetting.env_file=%s\n' "$CONFIG_DIR/profiles/dev/env" \
+    >"$CONFIG_DIR/profiles/dev/config"
 run_wrapper profile create lab --from dev
 [ "$RC" -eq 0 ] || fail "profile create --from failed: $OUT"
 grep -q 'strict' "$CONFIG_DIR/profiles/lab/config" || fail "--from must copy the source config"
+# Secrets are per account: the env_file is repointed at the new tree, the
+# source secrets are not copied, and an empty 600 env file is seeded.
+grep -q "^setting.env_file=$CONFIG_DIR/profiles/lab/env$" "$CONFIG_DIR/profiles/lab/config" ||
+    fail "--from must repoint setting.env_file at the new profile"
+[ -f "$CONFIG_DIR/profiles/lab/env" ] || fail "--from must seed an empty env file"
+grep -q 'A_KEY' "$CONFIG_DIR/profiles/lab/env" && fail "--from must NOT copy the source secrets"
+env_mode="$(stat -c '%a' "$CONFIG_DIR/profiles/lab/env" 2>/dev/null || stat -f '%Lp' "$CONFIG_DIR/profiles/lab/env")"
+[ "$env_mode" = "600" ] || fail "the seeded env file must be mode 600 (got $env_mode)"
+grep -q 'NOT copied' <<<"$OUT" || fail "--from must warn that secrets were not copied: $OUT"
+# The copied profile must run with its own (empty) env file.
+run_wrapper --profile lab run "$TMP/proj"
+[ "$RC" -eq 0 ] || fail "the copied profile must run with its own env file: $OUT"
+docker_run_line | grep -q -- "--env-file $CONFIG_DIR/profiles/lab/env" ||
+    fail "the copied profile must pass its own env file to docker"
 
 # 6. remove: confirmation is required, the active profile is refused.
 run_wrapper profile remove lab
