@@ -26,6 +26,7 @@ the least access it needs to be useful.
 | Persistence into the next session | A worktree `.git` file is trusted only when the shared repo's `worktrees/<name>/gitdir` points back at the project, so a session cannot make the next run mount another host repository; the guard denies writes to `.git/**/hooks/` and `.git/**/config` and `git config` of executable keys (`core.fsmonitor`, `core.hooksPath`, `core.sshCommand`, editors/pagers, `!` aliases, filters, textconv, credential helpers), which would otherwise run on the host |
 | Fail closed | If the permission template cannot be merged into a customized `opencode.json`, the run is blocked instead of starting with the old rules |
 | Policy patterns | The vendored `opencode-policy` pattern sets, evaluated by `plugins/security-guard.js` (see `policies/README.md`) |
+| Profile isolation (multi-account) | Each `--profile` gets its own full state tree (config, env file, security policy, OpenCode auth/sessions) under `~/.config/opencode-dockerized/profiles/<name>`; the profiles base is a protected location, so a session in one profile can neither mount nor open another profile's credentials or state |
 
 ## Known limitations
 
@@ -99,6 +100,43 @@ the least access it needs to be useful.
   the built-in backstops. Commands are evaluated per shell segment, so an
   anchored pattern can fire on a segment (`cmd --yes && ...` trips `dos-yes`,
   which is why `balanced` drops the `dos-yes*` rules while `strict` keeps them).
+  Guard v22 extends the `balanced` exclusions with empirically verified false
+  positives (boundary-less `.env` readers that matched `process.env`, Python
+  idiom heuristics such as `re.compile(`/`getattr`/`importlib`/`[::-1]`,
+  `for`/`while` loops containing `&&`, `LD_LIBRARY_PATH`/`LD_PRELOAD`,
+  `xxd <file>`, `JSON.stringify`+`process`, `sleep NNNN`, blanket `ln -s`
+  rules and `printf`/`echo` hex output); each dropped rule's real attack
+  stays covered by a builtin or another rule, and the pairs are asserted in
+  `tests/security-guard.test.mjs`.
+- **Prompt-injection prose rules are fetch-only in `balanced` (guard v22).**
+  Role-play / "ignore instructions" / decode-and-run wording and long
+  base64-ish payload rules apply to `webfetch`/`websearch`, where the text
+  comes from or goes to the outside; on shell they scanned the agent's own
+  commit messages and search patterns (`git commit -m "act as a fallback"`,
+  `rg jailbreak docs/`). Literal base64 payloads (`aW1wb3J0IG9z`,
+  `/proc/self/environ`, `/run/secrets` encodings) are still denied on shell in
+  `balanced`; `strict` applies every rule to every action, and
+  `tests/policy-lint.test.mjs` fails until any new vendored injection rule is
+  classified.
+- **Symlink targets are resolved (guard v22).** `ln -s` is denied in every
+  mode when the target (absolute, `~`/`$HOME`, or relative resolved against
+  the project root) aliases `$HOME` outside the writable roots or a sensitive
+  system tree (`/etc`, `/root`, `/proc`, `/sys`, `/dev`, `/run`); in-project
+  symlinks and links to read-only system paths (`ln -s /usr/bin/python3 …`)
+  stay allowed. A `cd` elsewhere followed by a relative `ln -s` remains a
+  documented residual, like staged scripts.
+- **Hex output is allowed, hex arguments are not (guard v22).** `printf`/`echo`
+  with `\xNN` escapes is denied only inside a command substitution or
+  backticks (`cat $(printf '\x2e\x65\x6e\x76')`), where it assembles an
+  argument the text scan cannot see; ANSI color output and binary test
+  fixtures to stdout stay allowed. `$'\x..'` ANSI-C quoting is decoded before
+  matching, as before.
+- **Profiles are isolated, not hidden.** With `--profile` each account's
+  credentials, sessions and config live in their own tree and the profiles
+  base is refused as a mount or project directory; inside a session, the
+  active profile's provider keys are still visible to that session's agent
+  (same as without profiles), and `profile remove` deletes the tree
+  irreversibly (it asks for the profile name, or `--yes`).
 - **Project mount is read-write and shares the host filesystem.** The agent can
   modify (or delete) anything inside the mounted project directory.
 - **Config runtime files are read-only.** `service.json`/`cli.json` in the

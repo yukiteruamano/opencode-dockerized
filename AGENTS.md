@@ -44,6 +44,9 @@ opencode-dockerized version           # Show OpenCode version
 opencode-dockerized config show       # Show parsed configuration
 opencode-dockerized config edit       # Edit config in $EDITOR
 opencode-dockerized config path       # Print config file path
+opencode-dockerized config init       # Create the config from the template if missing (non-interactive)
+opencode-dockerized profile [ARGS]    # Multi-account profiles (list|current|path|create|remove)
+opencode-dockerized --profile NAME …  # Run any command against the profile's own state tree
 opencode-dockerized clean             # Remove Docker image
 opencode-dockerized help              # Show help
 DRY_RUN=true opencode-dockerized run  # Print docker command without running
@@ -193,6 +196,23 @@ mount.gitconfig=~/.gitconfig:/home/coder/.gitconfig
 Secrets only travel via `setting.env_file` (dotenv file under `~/.config/opencode-dockerized/`,
 `docker --env-file`, never mounted; a file under `$OCODE_HOME` is refused because that tree is mounted). The old `env.*` host passthrough was removed.
 
+### Profiles (multi-account)
+
+`--profile NAME` (or `OPENCODE_DOCKERIZED_PROFILE=NAME`) repoints `CONFIG_DIR` at
+`<base>/profiles/NAME` **before** `lib/config-lib.sh` is sourced (the flag is
+pre-scanned in `bin/opencode-dockerized`, since every path — `CONFIG_FILE`,
+`OCODE_HOME`, `SESSIONS_DIR`, `GPG_RELAY_DIR`, the lock — derives from
+`CONFIG_DIR` at load time). Each profile is therefore a full standalone tree:
+its own config (e.g. `security_policy=strict` in one profile, `balanced` in
+another), env file, generated `opencode.json`, security layer and OpenCode home
+(auth database, sessions, state, cache). Without a profile, the classic paths
+are used unchanged ("default"). The profiles base (`OCD_PROFILES_BASE`) is a
+protected location in `host_path_is_protected`, so one profile can never mount
+or open another profile's tree. Managed with `profile
+list|current|path|create|remove`; `profile create` seeds the tree by
+re-invoking `config sync` + `config init` under the new profile. Contract test:
+`tests/profile-flow.test.sh`.
+
 ### Dockerfile Conventions
 
 - Base image: `debian:trixie-slim@sha256:<digest>` (tag and digest, never `latest`)
@@ -225,7 +245,7 @@ Secrets only travel via `setting.env_file` (dotenv file under `~/.config/opencod
 - The OpenCode config tree is mounted **read-only**; the security files are mirrored into it on the host by `ensure_opencode_dockerized_config`. A non-managed `AGENTS.md` is backed up to `AGENTS.md.user.bak` before the rules are installed
 - `plugins/security-guard.js` is the guard source of truth; bump `OPENCODE_DOCKERIZED_GUARD_VERSION` when changing its behavior (CI enforces it on pull requests); installs are refreshed by file content, atomically, and the previous copy is kept as a timestamped `.bak.<stamp>` (three are retained)
 - Prefer `policies/allow-patterns.json` or a policy mode over editing the vendored `policies/*.json`
-- In `balanced` mode the guard drops broad, whole-string false positives (e.g. `history-1`, `dns-exfil-3`, `exec-builtin`, `fork-bomb-2`, `env-direct-2`) via `BALANCED_EXCLUDED_IDS`; `strict` keeps them all
+- In `balanced` mode the guard drops broad, whole-string false positives (e.g. `history-1`, `dns-exfil-3`, `exec-builtin`, `fork-bomb-2`, `env-direct-2`, and since v22 the boundary-less `.env` readers, Python idiom heuristics, `for`/`while`+`&&` loops, `LD_*`, `xxd <file>`, `sleep NNNN` and the blanket `ln -s` rules) via `BALANCED_EXCLUDED_IDS`; `strict` keeps them all. Prompt-injection prose rules apply only to `webfetch`/`websearch` in `balanced` (`SHELL_INJECTION_IDS` / `FETCH_ONLY_INJECTION_IDS`; `tests/policy-lint.test.mjs` forces every vendored injection rule to be classified); replacements live in the builtins (`symlinkEscape`, hex-in-substitution)
 - Writes are allowed only inside the project directory and `/tmp/opencode` (the advertised scratch dir); the generated `opencode.json` allowlists `/tmp/opencode/*` for writes and the guard mirrors that root
 - OpenCode self-update is disabled in the container via `OPENCODE_DISABLE_AUTOUPDATE=true`
 - Run as non-root `coder` inside container; the wrapper maps the host user with `--user <host uid>:<host gid>` so no root process runs

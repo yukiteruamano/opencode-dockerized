@@ -258,6 +258,8 @@ opencode-dockerized config path    # Print wrapper config file path
 opencode-dockerized config sync [--check]  # Refresh security layer (guard/policies) from repo
 opencode-dockerized config opencode path   # Print OpenCode config path
 opencode-dockerized config opencode edit   # Edit OpenCode config (MCP, models)
+opencode-dockerized profile list           # Multi-account profiles (also: current|path|create|remove)
+opencode-dockerized --profile work run     # Run any command against a profile's own state tree
 opencode-dockerized clean          # Remove the Docker image
 opencode-dockerized help           # Show help
 ```
@@ -317,6 +319,32 @@ under `~/.config/opencode-dockerized/`, loaded with `docker --env-file`), and
 container runs as your host UID/GID (`--user`), so no `HOST_UID`/`HOST_GID`
 mapping is needed.
 
+### Profiles (Multi-Account)
+
+`--profile NAME` (or `OPENCODE_DOCKERIZED_PROFILE=NAME`) runs any command
+against a self-contained state tree under
+`~/.config/opencode-dockerized/profiles/NAME/`. Each profile has its **own**:
+
+- wrapper config — so one agent can run `setting.security_policy=strict`
+  while another runs `balanced`, with different mounts, network or theme;
+- `setting.env_file` secrets (a different provider account per profile);
+- OpenCode home: auth database, sessions, selected model, cache;
+- generated permissions and security layer.
+
+Without `--profile`, the classic tree is used unchanged (shown as `default`).
+Profiles are isolated from each other: the profiles base is a protected
+location, so a session in one profile can neither mount nor open another
+profile's credentials or state.
+
+```bash
+opencode-dockerized profile create work            # new profile (own config + auth)
+opencode-dockerized profile create lab --from work # copy work's config
+opencode-dockerized --profile work auth            # authenticate the work account
+opencode-dockerized --profile work run ~/repo      # run with the work profile
+opencode-dockerized profile list                   # list profiles (active marked *)
+opencode-dockerized profile remove lab             # delete a profile (asks; --yes to skip)
+```
+
 ### Volume Mounts
 
 | Host Path | Container Path | Mode | Purpose |
@@ -333,7 +361,7 @@ mapping is needed.
 | `~/.composio/` | `/home/coder/.composio/` | read-write | Composio CLI binary + login (optional custom `mount.composio`) |
 | `~/.config/opencode-dockerized/home/.gnupg/` | `/home/coder/.gnupg/` | read-write | Mirrored **public** GnuPG material (pubring/trustdb/gpg.conf) + agent socket (only with `setting.gpg_agent_support=true`); `private-keys-v1.d/` is never copied |
 
-The wrapper's own directory (`~/.config/opencode-dockerized/`) is **not** mounted at all: its permission rules are read on the host and passed inline, and its security files are mirrored into the config tree above.
+The wrapper's own directory (`~/.config/opencode-dockerized/`) is **not** mounted at all: its permission rules are read on the host and passed inline, and its security files are mirrored into the config tree above. With `--profile NAME`, every `~/.config/opencode-dockerized/home/...` path above comes from `~/.config/opencode-dockerized/profiles/NAME/home/...` instead.
 
 ### Persistent Configuration & Security Layer
 

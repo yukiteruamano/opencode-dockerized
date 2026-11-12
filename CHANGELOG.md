@@ -4,6 +4,42 @@ All notable changes to opencode-dockerized. Versions follow `WRAPPER_VERSION`;
 the guard (`OPENCODE_DOCKERIZED_GUARD_VERSION`) and the policy set
 (`policies/VERSION`) carry their own counters.
 
+## Unreleased — multi-account profiles and balanced-mode false positives
+
+### Profiles (multi-account)
+- `--profile NAME` (or `OPENCODE_DOCKERIZED_PROFILE=NAME`) selects a
+  self-contained state tree under `~/.config/opencode-dockerized/profiles/NAME`:
+  its own wrapper config (e.g. one profile `security_policy=strict`, another
+  `balanced`), env file (provider account), generated permissions, security
+  layer and OpenCode home (auth database, sessions, state, cache). Without a
+  profile, paths are exactly the previous ones.
+- New `profile` command: `list`, `current`, `path`,
+  `create NAME [--from NAME|default]`, `remove NAME [--yes]`; plus a
+  non-interactive `config init`.
+- The profiles base is a protected location: a session in one profile cannot
+  mount or open another profile's tree (credentials, auth database).
+- Container names and the `OPENCODE_DOCKERIZED_PROFILE` indicator carry the
+  profile; `config show` and `doctor` print it.
+
+### Guard (v22) — balanced mode stops flagging everyday development
+- Verified false positives dropped from `balanced` (kept in `strict`):
+  `.env` reader rules without a word boundary (matched `process.env`), Python
+  idiom heuristics (`re.compile(`, `getattr`, `importlib`, `[::-1]`),
+  `for`/`while` loops containing `&&`, `LD_LIBRARY_PATH`/`LD_PRELOAD`,
+  `xxd <file>`, `JSON.stringify`+`process`, `sleep NNNN`, and the blanket
+  `ln -s` rules. These also blocked *writing* ordinary source files.
+- Prompt-injection prose rules (role-play, "ignore instructions",
+  decode-and-run wording) now apply only to `webfetch`/`websearch` in
+  `balanced`: on shell they scanned the agent's own commit messages and
+  searches. Literal base64 payload rules still apply to shell;
+  `strict` keeps everything everywhere. `tests/policy-lint.test.mjs` forces a
+  classification for every vendored injection rule.
+- New targeted builtins (every mode): `ln -s` targets are resolved and denied
+  when they alias `$HOME` outside the writable roots or a sensitive system
+  tree (in-project symlinks and `/usr/...` links stay allowed), and
+  `printf`/`echo` hex escapes are denied only inside a command substitution
+  (ANSI color output stays allowed).
+
 ## Unreleased — security audit fixes
 
 ### Guard (v21)
