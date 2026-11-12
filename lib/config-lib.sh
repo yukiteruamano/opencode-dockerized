@@ -14,6 +14,22 @@
 CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/opencode-dockerized}"
 CONFIG_FILE="${CONFIG_FILE:-$CONFIG_DIR/config}"
 
+# Active profile (multi-account). The wrapper resolves --profile /
+# OPENCODE_DOCKERIZED_PROFILE before sourcing this file and points CONFIG_DIR
+# at <base>/profiles/<name>, so every path below derives per profile. The base
+# is recovered here because it (and with it every OTHER profile's credentials
+# and state) must stay as protected from mounts and project dirs as the active
+# tree; without a profile the base IS the config dir.
+OCD_PROFILE="${OCD_PROFILE:-${OPENCODE_DOCKERIZED_PROFILE:-}}"
+OCD_PROFILES_BASE="$CONFIG_DIR"
+if [ -n "$OCD_PROFILE" ]; then
+    # Strip exactly the active profile's suffix: a custom CONFIG_DIR that
+    # happens to contain "/profiles/" elsewhere must not widen the base.
+    case "$CONFIG_DIR" in
+    */profiles/"$OCD_PROFILE") OCD_PROFILES_BASE="${CONFIG_DIR%/profiles/"$OCD_PROFILE"}" ;;
+    esac
+fi
+
 # Self-contained OpenCode state tree. The wrapper owns all of OpenCode's runtime
 # state (config, data, state, cache) under this single host directory instead of
 # spreading it across the host XDG dirs, so the setup is portable and replaces
@@ -266,6 +282,7 @@ host_path_is_protected() {
         "$HOME/.gnupg|GnuPG private keys|Use setting.gpg_agent_support=true instead (only the public keyring and the agent socket are shared)."
         "$CONFIG_DIR|the wrapper configuration and its security layer|Keep the wrapper config ($CONFIG_DIR) out of the container."
         "$OCODE_HOME|the OpenCode state tree (config, guard, auth)|Keep the wrapper state ($OCODE_HOME) out of the container."
+        "$OCD_PROFILES_BASE|the wrapper configuration (every profile's credentials and state)|Keep the wrapper config ($OCD_PROFILES_BASE) out of the container."
         "$HOME/.claude|Claude Code credentials and history|Only skills, agents, commands and CLAUDE.md are shared, automatically and read-only."
         "/var/run/docker.sock|the Docker socket|$docker_hint"
         "/run/docker.sock|the Docker socket|$docker_hint"
@@ -2808,6 +2825,7 @@ build_env_args() {
     DOCKER_ENV_ARGS+=(-e "OPENCODE_DOCKERIZED_WEBSEARCH=$WEBSEARCH_PROVIDER")
     DOCKER_ENV_ARGS+=(-e "OPENCODE_DOCKERIZED_THEME=$THEME")
     DOCKER_ENV_ARGS+=(-e "OPENCODE_DOCKERIZED_ENV_FILE=$([ -n "$ENV_FILE" ] && echo yes || echo no)")
+    DOCKER_ENV_ARGS+=(-e "OPENCODE_DOCKERIZED_PROFILE=${OCD_PROFILE:-default}")
 }
 
 # Build the docker --env-file argument from setting.env_file.

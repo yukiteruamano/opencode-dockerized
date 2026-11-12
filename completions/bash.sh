@@ -8,7 +8,7 @@ _opencode_dockerized() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    opts="run auth models exec mcp plugin stats debug doctor install upgrade build update rollback uninstall version config clean help --help -h"
+    opts="run auth models exec mcp plugin stats debug doctor install upgrade build update rollback uninstall version config profile clean help --help -h --profile"
 
     case "${prev}" in
         run|models)
@@ -25,7 +25,26 @@ _opencode_dockerized() {
         config)
             # Only `opencode-dockerized config <TAB>`, never `debug config <TAB>`
             if [ "${COMP_WORDS[1]}" = "config" ] && [ "${COMP_CWORD}" -eq 2 ]; then
-                mapfile -t COMPREPLY < <(compgen -W "show edit path opencode sync" -- "${cur}")
+                mapfile -t COMPREPLY < <(compgen -W "show edit path init opencode sync" -- "${cur}")
+            fi
+            return 0
+            ;;
+        profile)
+            if [ "${COMP_WORDS[1]}" = "profile" ] && [ "${COMP_CWORD}" -eq 2 ]; then
+                mapfile -t COMPREPLY < <(compgen -W "list current path create remove" -- "${cur}")
+            fi
+            return 0
+            ;;
+        --profile)
+            # Complete existing profile names from the default profiles dir
+            local profiles_dir="${CONFIG_DIR:-$HOME/.config/opencode-dockerized}/profiles"
+            if [ -d "${profiles_dir}" ]; then
+                local -a names=()
+                local d
+                for d in "${profiles_dir}"/*/; do
+                    [ -d "${d}" ] && names+=("$(basename "${d}")")
+                done
+                mapfile -t COMPREPLY < <(compgen -W "${names[*]}" -- "${cur}")
             fi
             return 0
             ;;

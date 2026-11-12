@@ -24,6 +24,7 @@ _opencode_dockerized() {
         'uninstall:Show how to remove the install (config is left untouched)'
         'version:Show OpenCode version in the container'
         'config:Show, edit, or print config file path'
+        'profile:Manage multi-account profiles (list|current|path|create|remove)'
         'clean:Remove the Docker image'
         'help:Show help message'
     )
@@ -71,6 +72,7 @@ _opencode_dockerized() {
                             'show:Show current configuration'
                             'edit:Edit wrapper config file in $EDITOR'
                             'path:Print wrapper config file path'
+                            'init:Create the config file from the template when missing'
                             'sync:Refresh security layer from repo (--check for drift only)'
                             'opencode:Show or edit the OpenCode config (path|edit)'
                         )
@@ -79,6 +81,11 @@ _opencode_dockerized() {
                         _values 'opencode config subcommand' path edit
                     elif (( CURRENT == 3 )) && [[ $words[2] == sync ]]; then
                         _values 'sync flag' --check
+                    fi
+                    ;;
+                profile)
+                    if (( CURRENT == 2 )); then
+                        _values 'profile subcommand' list current path create remove
                     fi
                     ;;
                 upgrade|update)

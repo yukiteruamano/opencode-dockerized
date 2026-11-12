@@ -226,6 +226,69 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# --- Profile selection (multi-account) ---------------------------------------
+# A profile is a self-contained state tree — wrapper config, env file, security
+# layer and OpenCode home (its own auth database, sessions, MCP config) — under
+# <config>/profiles/<name>. It must be resolved BEFORE config-lib.sh is
+# sourced: CONFIG_FILE, OCODE_HOME, SESSIONS_DIR, GPG_RELAY_DIR and the lock
+# all derive from CONFIG_DIR when the library loads. Selected with
+# `--profile NAME` / `--profile=NAME` (anywhere before a literal `--`) or
+# OPENCODE_DOCKERIZED_PROFILE=NAME; the flag wins. The name is exported so
+# re-execs (update --post-pull) and the container indicator keep it. Without a
+# profile the paths are exactly the pre-profile ones.
+OCD_PROFILE="${OPENCODE_DOCKERIZED_PROFILE:-}"
+_ocd_args=()
+_ocd_passthrough=false
+while [ $# -gt 0 ]; do
+    if [ "$_ocd_passthrough" = true ]; then
+        _ocd_args+=("$1")
+        shift
+        continue
+    fi
+    case "$1" in
+    --)
+        _ocd_passthrough=true
+        _ocd_args+=("$1")
+        shift
+        ;;
+    --profile)
+        if [ $# -lt 2 ] || [ -z "$2" ]; then
+            echo -e "${RED}✗${NC} --profile requires a name" >&2
+            exit 1
+        fi
+        OCD_PROFILE="$2"
+        shift 2
+        ;;
+    --profile=*)
+        OCD_PROFILE="${1#--profile=}"
+        shift
+        ;;
+    *)
+        _ocd_args+=("$1")
+        shift
+        ;;
+    esac
+done
+set -- ${_ocd_args[@]+"${_ocd_args[@]}"}
+unset _ocd_args _ocd_passthrough
+if [ -n "$OCD_PROFILE" ]; then
+    # The name becomes a path component and a container-name part: validate it
+    # here (config-lib is not loaded yet) and again in `profile` subcommands.
+    if ! [[ "$OCD_PROFILE" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]; then
+        echo -e "${RED}✗${NC} Invalid profile name '$OCD_PROFILE' (letters, digits, '-' and '_'; must start with a letter or digit)" >&2
+        exit 1
+    fi
+    # Idempotent: a re-exec (update --post-pull) may inherit an exported
+    # CONFIG_DIR that is already profile-shaped; never nest profiles/ twice.
+    _ocd_base="${CONFIG_DIR:-$HOME/.config/opencode-dockerized}"
+    case "$_ocd_base" in
+    */profiles/"$OCD_PROFILE") CONFIG_DIR="$_ocd_base" ;;
+    *) CONFIG_DIR="$_ocd_base/profiles/$OCD_PROFILE" ;;
+    esac
+    unset _ocd_base
+    export OPENCODE_DOCKERIZED_PROFILE="$OCD_PROFILE"
+fi
+
 # Source the shared config module
 source "$REPO_ROOT/lib/config-lib.sh"
 
@@ -462,7 +525,7 @@ run_cli_command() {
 
     local -a docker_cmd=(
         docker run "${tty_args[@]}"
-        --name "opencode-${name_suffix}-$$"
+        --name "opencode-${OCD_PROFILE:+${OCD_PROFILE}-}${name_suffix}-$$"
         "${workdir_args[@]}"
         "${DOCKER_COMMON_ARGS[@]}"
         "${VOLUME_ARGS[@]}"
@@ -555,9 +618,12 @@ run_opencode() {
     dir_name=$(sanitize_container_name "$(basename "$project_dir")")
     local random_suffix
     random_suffix=$(generate_random_suffix)
-    local container_name="opencode-${dir_name}-${random_suffix}"
+    local container_name="opencode-${OCD_PROFILE:+${OCD_PROFILE}-}${dir_name}-${random_suffix}"
 
     print_info "Starting OpenCode in Docker..."
+    if [ -n "$OCD_PROFILE" ]; then
+        print_info "Profile: $OCD_PROFILE"
+    fi
     print_info "Project directory: $project_dir"
     print_info "Container name: $container_name"
 
@@ -1080,6 +1146,7 @@ run_doctor() {
     local host_rc=0 container_rc=0
     require_security_layer
     echo "== host: wrapper and security layer =="
+    print_info "Profile: ${OCD_PROFILE:-default} ($CONFIG_DIR)"
     parse_config
     check_security_layer || host_rc=1
     echo "== container =="
@@ -1132,12 +1199,194 @@ clean_image() {
 }
 
 # Function to show or edit configuration
+# --- Profile management (multi-account) --------------------------------------
+# Each profile is a full state tree under $OCD_PROFILES_BASE/profiles/<name>:
+# its own wrapper config (so one agent can run security_policy=strict while
+# another runs balanced), env file (provider account), generated permissions,
+# security layer and OpenCode home (auth database, sessions, state, cache).
+# One is selected per invocation with --profile NAME or
+# OPENCODE_DOCKERIZED_PROFILE; without one the classic tree directly under
+# $OCD_PROFILES_BASE is used ("default").
+
+# The same rule the pre-source scan applies to --profile (names become path
+# components and container-name parts).
+# Usage: valid_profile_name NAME && ...
+valid_profile_name() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]
+}
+
+# Usage: profile_create NAME [--from NAME|default]
+profile_create() {
+    local name="${1:-}"
+    shift || true
+    local from=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --from)
+            if [ $# -lt 2 ] || [ -z "$2" ]; then
+                print_error "--from requires a profile name (or 'default')"
+                exit 1
+            fi
+            from="$2"
+            shift 2
+            ;;
+        --from=*)
+            from="${1#--from=}"
+            shift
+            ;;
+        *)
+            print_error "Unknown option for profile create: $1"
+            exit 1
+            ;;
+        esac
+    done
+    if [ -z "$name" ]; then
+        print_error "Usage: $(basename "$0") profile create NAME [--from NAME|default]"
+        exit 1
+    fi
+    if ! valid_profile_name "$name"; then
+        print_error "Invalid profile name '$name' (letters, digits, '-' and '_'; must start with a letter or digit)"
+        exit 1
+    fi
+    local dest="$OCD_PROFILES_BASE/profiles/$name"
+    if [ -e "$dest" ]; then
+        print_error "Profile '$name' already exists: $dest"
+        exit 1
+    fi
+
+    local src_config=""
+    if [ -n "$from" ]; then
+        if [ "$from" = default ]; then
+            src_config="$OCD_PROFILES_BASE/config"
+        else
+            if ! valid_profile_name "$from"; then
+                print_error "Invalid source profile name '$from'"
+                exit 1
+            fi
+            src_config="$OCD_PROFILES_BASE/profiles/$from/config"
+        fi
+        if [ ! -f "$src_config" ]; then
+            print_error "No config to copy from: $src_config"
+            exit 1
+        fi
+    fi
+
+    mkdir -p "$dest"
+    if [ -n "$src_config" ]; then
+        cp "$src_config" "$dest/config"
+        chmod 600 "$dest/config" 2>/dev/null || true
+    fi
+
+    # Seed the state tree, security layer and (when not copied) the config
+    # template through the normal per-profile code path. CONFIG_DIR is passed
+    # explicitly: it may arrive exported and already profile-shaped, and the
+    # child derives <base>/profiles/<name> from the base again.
+    if ! OPENCODE_DOCKERIZED_PROFILE="$name" CONFIG_DIR="$OCD_PROFILES_BASE" \
+        "$BIN_DIR/opencode-dockerized" config sync; then
+        print_error "Failed to initialize profile '$name'"
+        exit 1
+    fi
+    if [ -z "$src_config" ]; then
+        OPENCODE_DOCKERIZED_PROFILE="$name" CONFIG_DIR="$OCD_PROFILES_BASE" \
+            "$BIN_DIR/opencode-dockerized" config init || exit 1
+    fi
+
+    print_success "Profile '$name' created: $dest"
+    print_info "Configure it:  $(basename "$0") --profile $name config edit"
+    print_info "Authenticate:  $(basename "$0") --profile $name auth"
+    print_info "Run:           $(basename "$0") --profile $name run [DIR]"
+}
+
+# Usage: profile_remove NAME [--yes]
+profile_remove() {
+    local name="${1:-}" yes=false
+    shift || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --yes | -y)
+            yes=true
+            shift
+            ;;
+        *)
+            print_error "Unknown option for profile remove: $1"
+            exit 1
+            ;;
+        esac
+    done
+    if [ -z "$name" ] || ! valid_profile_name "$name"; then
+        print_error "Usage: $(basename "$0") profile remove NAME [--yes]"
+        exit 1
+    fi
+    local dest="$OCD_PROFILES_BASE/profiles/$name"
+    if [ ! -d "$dest" ]; then
+        print_error "No such profile: $name ($dest)"
+        exit 1
+    fi
+    if [ "$name" = "$OCD_PROFILE" ]; then
+        print_error "Profile '$name' is selected by this invocation; run the remove without --profile $name"
+        exit 1
+    fi
+    print_warning "This permanently deletes $dest (config, env file, auth database, sessions)."
+    if [ "$yes" != true ]; then
+        if [ ! -t 0 ]; then
+            print_error "Refusing to remove a profile without --yes on a non-interactive run"
+            exit 1
+        fi
+        local reply
+        read -r -p "Type the profile name to confirm: " reply
+        if [ "$reply" != "$name" ]; then
+            print_error "Aborted (confirmation did not match)"
+            exit 1
+        fi
+    fi
+    rm -rf -- "$dest"
+    print_success "Profile '$name' removed"
+}
+
+# Usage: manage_profile [list|current|path|create|remove] [ARGS]
+manage_profile() {
+    local sub="${1:-list}"
+    shift || true
+    case "$sub" in
+    list)
+        local marker="" dir name
+        [ -z "$OCD_PROFILE" ] && marker=" *"
+        echo "default${marker} ($OCD_PROFILES_BASE)"
+        for dir in "$OCD_PROFILES_BASE/profiles"/*/; do
+            [ -d "$dir" ] || continue
+            name=$(basename "$dir")
+            marker=""
+            [ "$name" = "$OCD_PROFILE" ] && marker=" *"
+            echo "${name}${marker} (${dir%/})"
+        done
+        ;;
+    current)
+        echo "${OCD_PROFILE:-default}"
+        ;;
+    path)
+        echo "$CONFIG_DIR"
+        ;;
+    create)
+        profile_create "$@"
+        ;;
+    remove | rm)
+        profile_remove "$@"
+        ;;
+    *)
+        print_error "Unknown profile subcommand: $sub"
+        echo "Usage: $0 profile [list|current|path|create NAME [--from NAME|default]|remove NAME [--yes]]"
+        exit 1
+        ;;
+    esac
+}
+
 show_config() {
     local subcommand="${1:-show}"
     shift || true
 
     case "$subcommand" in
     show)
+        print_info "Profile: ${OCD_PROFILE:-default} ($CONFIG_DIR)"
         parse_config
         print_config
         maybe_drift_hint
@@ -1159,6 +1408,15 @@ show_config() {
         ;;
     path)
         echo "$CONFIG_FILE"
+        ;;
+    init)
+        # Create the config file from the commented template when missing
+        # (non-interactive; used by `profile create`). Never overwrites.
+        if config_exists; then
+            print_info "Config already exists: $CONFIG_FILE"
+        else
+            init_config_file
+        fi
         ;;
     sync)
         # Local-only command: refresh the versioned security layer (guard,
@@ -1198,7 +1456,7 @@ show_config() {
         ;;
     *)
         print_error "Unknown config subcommand: $subcommand"
-        echo "Usage: $0 config [show|edit|path|sync|opencode]"
+        echo "Usage: $0 config [show|edit|path|init|sync|opencode]"
         exit 1
         ;;
     esac
@@ -1209,7 +1467,14 @@ show_help() {
     cat <<EOF
 OpenCode Docker Wrapper
 
-Usage: $0 [COMMAND] [OPTIONS]
+Usage: $0 [--profile NAME] [COMMAND] [OPTIONS]
+
+Global options:
+    --profile NAME      Use the profile's own state tree (multi-account):
+                        config, env file, security policy and OpenCode auth
+                        live under ~/.config/opencode-dockerized/profiles/NAME.
+                        Also: OPENCODE_DOCKERIZED_PROFILE=NAME. Without it the
+                        classic tree is used ("default").
 
 Commands:
     run [--] [DIR]      Run OpenCode in Docker (default: current directory)
@@ -1228,8 +1493,11 @@ Commands:
     rollback            Restore the previous image; show how to restore the previous code
     uninstall           Show how to remove the install (config is left untouched)
     version             Show wrapper, guard and OpenCode versions
-    config [show|edit|path|sync]      Wrapper config (INI)
+    config [show|edit|path|init|sync] Wrapper config (INI)
     config opencode [path|edit]       OpenCode config (opencode.json)
+    profile [list|current|path]       Multi-account profiles
+    profile create NAME [--from NAME|default]   Create a profile (own config + auth)
+    profile remove NAME [--yes]       Delete a profile and all its state
     clean               Remove the Docker image
     help                Show this help message
 
@@ -1257,6 +1525,10 @@ Examples:
     $0 config edit                  # Edit wrapper config in \$EDITOR
     $0 config opencode edit         # Edit the OpenCode config (MCP, models)
     $0 config sync                  # Refresh security layer (guard/policies) from repo
+    $0 profile create work          # New profile (own account, own config)
+    $0 profile create lab --from work   # New profile copying work's config
+    $0 --profile work auth          # Authenticate the 'work' account
+    $0 --profile work run ~/repo    # Run with the 'work' profile
     $0 clean                        # Remove Docker image
     DRY_RUN=true $0 run             # Show Docker command without running
 
@@ -1383,6 +1655,10 @@ main() {
             acquire_wrapper_lock || exit 1
         fi
         show_config "$@"
+        ;;
+    profile)
+        # Local-only command: works without a running Docker daemon.
+        manage_profile "$@"
         ;;
     clean)
         check_docker
