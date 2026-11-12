@@ -16,7 +16,7 @@ NPM_REGISTRY="${OCD_NPM_REGISTRY:-https://registry.npmjs.org}"
 
 # Wrapper release line, shown by the version command next to the OpenCode
 # version and the bundled security-guard version.
-WRAPPER_VERSION="0.15.0"
+WRAPPER_VERSION="0.16.0"
 
 # Keep temporary files in a private per-user dir unless overridden: a shared
 # /tmp name may be pre-created by another user, and relay sockets, server logs
@@ -227,15 +227,16 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # --- Profile selection (multi-account) ---------------------------------------
-# A profile is a self-contained state tree — wrapper config, env file, security
-# layer and OpenCode home (its own auth database, sessions, MCP config) — under
-# <config>/profiles/<name>. It must be resolved BEFORE config-lib.sh is
-# sourced: CONFIG_FILE, OCODE_HOME, SESSIONS_DIR, GPG_RELAY_DIR and the lock
-# all derive from CONFIG_DIR when the library loads. Selected with
+# Every run uses a profile: a self-contained state tree — wrapper config, env
+# file, security layer and OpenCode home (its own auth database, sessions, MCP
+# config) — under <base>/profiles/<name>; "default" when none is selected.
+# It must be resolved BEFORE config-lib.sh is sourced: CONFIG_FILE, OCODE_HOME
+# and SESSIONS_DIR derive from CONFIG_DIR when the library loads. Selected with
 # `--profile NAME` / `--profile=NAME` (anywhere before a literal `--`) or
 # OPENCODE_DOCKERIZED_PROFILE=NAME; the flag wins. The name is exported so
-# re-execs (update --post-pull) and the container indicator keep it. Without a
-# profile the paths are exactly the pre-profile ones.
+# re-execs (update --post-pull) and the container indicator keep it. A tree
+# from the pre-profiles layout is moved into profiles/default first
+# (lib/profiles-lib.sh).
 OCD_PROFILE="${OPENCODE_DOCKERIZED_PROFILE:-}"
 _ocd_args=()
 _ocd_passthrough=false
@@ -261,6 +262,10 @@ while [ $# -gt 0 ]; do
         ;;
     --profile=*)
         OCD_PROFILE="${1#--profile=}"
+        if [ -z "$OCD_PROFILE" ]; then
+            echo -e "${RED}✗${NC} --profile requires a name" >&2
+            exit 1
+        fi
         shift
         ;;
     *)
@@ -271,23 +276,45 @@ while [ $# -gt 0 ]; do
 done
 set -- ${_ocd_args[@]+"${_ocd_args[@]}"}
 unset _ocd_args _ocd_passthrough
-if [ -n "$OCD_PROFILE" ]; then
-    # The name becomes a path component and a container-name part: validate it
-    # here (config-lib is not loaded yet) and again in `profile` subcommands.
-    if ! [[ "$OCD_PROFILE" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]; then
-        echo -e "${RED}✗${NC} Invalid profile name '$OCD_PROFILE' (letters, digits, '-' and '_'; must start with a letter or digit)" >&2
-        exit 1
-    fi
-    # Idempotent: a re-exec (update --post-pull) may inherit an exported
-    # CONFIG_DIR that is already profile-shaped; never nest profiles/ twice.
-    _ocd_base="${CONFIG_DIR:-$HOME/.config/opencode-dockerized}"
-    case "$_ocd_base" in
-    */profiles/"$OCD_PROFILE") CONFIG_DIR="$_ocd_base" ;;
-    *) CONFIG_DIR="$_ocd_base/profiles/$OCD_PROFILE" ;;
-    esac
-    unset _ocd_base
-    export OPENCODE_DOCKERIZED_PROFILE="$OCD_PROFILE"
+
+# shellcheck source=lib/profiles-lib.sh
+source "$REPO_ROOT/lib/profiles-lib.sh"
+
+OCD_PROFILE="${OCD_PROFILE:-$OCD_DEFAULT_PROFILE}"
+# The name becomes a path component and a container-name part: validate it
+# here (config-lib is not loaded yet) and again in `profile` subcommands.
+if ! ocd_valid_profile_name "$OCD_PROFILE"; then
+    echo -e "${RED}✗${NC} Invalid profile name '$OCD_PROFILE' (letters, digits, '-' and '_'; must start with a letter or digit)" >&2
+    exit 1
 fi
+export OPENCODE_DOCKERIZED_PROFILE="$OCD_PROFILE"
+
+# Idempotent: a re-exec (update --post-pull) may inherit an exported
+# CONFIG_DIR that is already profile-shaped; never nest profiles/ twice.
+OCD_PROFILES_BASE="${CONFIG_DIR:-$HOME/.config/opencode-dockerized}"
+case "$OCD_PROFILES_BASE" in
+*/profiles/"$OCD_PROFILE") OCD_PROFILES_BASE="${OCD_PROFILES_BASE%/profiles/"$OCD_PROFILE"}" ;;
+esac
+CONFIG_DIR="$OCD_PROFILES_BASE/profiles/$OCD_PROFILE"
+
+# One-time move of a pre-profiles tree into profiles/default. When it has to
+# wait (an old-layout session is running, or the install lock is busy), the
+# default profile keeps using the old tree for this run only.
+_ocd_mig_rc=0
+ocd_migrate_legacy_layout "$OCD_PROFILES_BASE" || _ocd_mig_rc=$?
+case "$_ocd_mig_rc" in
+0) ;;
+2)
+    if [ "$OCD_PROFILE" = "$OCD_DEFAULT_PROFILE" ]; then
+        CONFIG_DIR="$OCD_PROFILES_BASE"
+    fi
+    ;;
+*)
+    echo -e "${RED}✗${NC} The configuration could not be migrated to the profile layout; nothing was started. Fix the error above and re-run." >&2
+    exit 1
+    ;;
+esac
+unset _ocd_mig_rc
 
 # Source the shared config module
 source "$REPO_ROOT/lib/config-lib.sh"
@@ -758,8 +785,8 @@ _git_pull_wrapper() {
         esac
     fi
     # Keep the previous revision so `rollback` can point back to it.
-    mkdir -p "$CONFIG_DIR" 2>/dev/null || true
-    printf '%s\n' "$local_rev" >"$CONFIG_DIR/.previous-rev" 2>/dev/null || true
+    mkdir -p "$OCD_PROFILES_BASE" 2>/dev/null || true
+    printf '%s\n' "$local_rev" >"$OCD_PROFILES_BASE/.previous-rev" 2>/dev/null || true
     # Merge the exact revision that was shown above, not whatever a second
     # fetch inside `git pull` might resolve to.
     git -C "$REPO_ROOT" merge --ff-only "$remote_rev" || {
@@ -927,24 +954,25 @@ _print_check_json() {
 }
 
 # Serialise the commands that rewrite the checkout, the image or the config
-# tree (update, upgrade, install, clean, config sync). flock when available,
-# an atomic mkdir lock otherwise (macOS). The lock survives the re-exec after
-# a pull through OCD_LOCK_HELD.
+# tree (update, upgrade, install, clean, config sync). Install-wide (the base
+# dir, shared by every profile and by the layout migration). flock when
+# available, an atomic mkdir lock otherwise (macOS). The lock survives the
+# re-exec after a pull through OCD_LOCK_HELD.
 acquire_wrapper_lock() {
     if [ -n "${OCD_LOCK_HELD:-}" ]; then
         # shellcheck disable=SC2016  # expanded when the trap fires
         [ -n "${OCD_LOCK_DIR:-}" ] && trap 'rmdir "$OCD_LOCK_DIR" 2>/dev/null || true' EXIT
         return 0
     fi
-    mkdir -p "$CONFIG_DIR" 2>/dev/null || return 0
+    mkdir -p "$OCD_PROFILES_BASE" 2>/dev/null || return 0
     if command -v flock >/dev/null 2>&1; then
-        exec 9>"$CONFIG_DIR/.lock" || return 0
+        exec 9>"$OCD_PROFILES_BASE/.lock" || return 0
         if ! flock -n 9; then
-            print_error "Another opencode-dockerized update/install/clean is already running (lock: $CONFIG_DIR/.lock)."
+            print_error "Another opencode-dockerized update/install/clean is already running (lock: $OCD_PROFILES_BASE/.lock)."
             return 1
         fi
     else
-        export OCD_LOCK_DIR="$CONFIG_DIR/.lock.d"
+        export OCD_LOCK_DIR="$OCD_PROFILES_BASE/.lock.d"
         if ! mkdir "$OCD_LOCK_DIR" 2>/dev/null; then
             print_error "Another opencode-dockerized update/install/clean is already running (remove $OCD_LOCK_DIR if it is stale)."
             unset OCD_LOCK_DIR
@@ -960,7 +988,7 @@ acquire_wrapper_lock() {
 # previous wrapper revision. The git step is only printed, never run, because
 # it rewrites the checkout.
 rollback_wrapper() {
-    local previous_tag="${IMAGE_NAME%:*}:previous" rev_file="$CONFIG_DIR/.previous-rev" restored=false
+    local previous_tag="${IMAGE_NAME%:*}:previous" rev_file="$OCD_PROFILES_BASE/.previous-rev" restored=false
     if docker image inspect "$previous_tag" >/dev/null 2>&1; then
         docker tag "$previous_tag" "$IMAGE_NAME"
         print_success "Image restored from $previous_tag."
@@ -1198,24 +1226,15 @@ clean_image() {
     fi
 }
 
-# Function to show or edit configuration
 # --- Profile management (multi-account) --------------------------------------
 # Each profile is a full state tree under $OCD_PROFILES_BASE/profiles/<name>:
 # its own wrapper config (so one agent can run security_policy=strict while
 # another runs balanced), env file (provider account), generated permissions,
 # security layer and OpenCode home (auth database, sessions, state, cache).
 # One is selected per invocation with --profile NAME or
-# OPENCODE_DOCKERIZED_PROFILE; without one the classic tree directly under
-# $OCD_PROFILES_BASE is used ("default").
+# OPENCODE_DOCKERIZED_PROFILE; without one the "default" profile is used.
 
-# The same rule the pre-source scan applies to --profile (names become path
-# components and container-name parts).
-# Usage: valid_profile_name NAME && ...
-valid_profile_name() {
-    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]
-}
-
-# Usage: profile_create NAME [--from NAME|default]
+# Usage: profile_create NAME [--from NAME]
 profile_create() {
     local name="${1:-}"
     shift || true
@@ -1224,7 +1243,7 @@ profile_create() {
         case "$1" in
         --from)
             if [ $# -lt 2 ] || [ -z "$2" ]; then
-                print_error "--from requires a profile name (or 'default')"
+                print_error "--from requires a profile name"
                 exit 1
             fi
             from="$2"
@@ -1241,10 +1260,10 @@ profile_create() {
         esac
     done
     if [ -z "$name" ]; then
-        print_error "Usage: $(basename "$0") profile create NAME [--from NAME|default]"
+        print_error "Usage: $(basename "$0") profile create NAME [--from NAME]"
         exit 1
     fi
-    if ! valid_profile_name "$name"; then
+    if ! ocd_valid_profile_name "$name"; then
         print_error "Invalid profile name '$name' (letters, digits, '-' and '_'; must start with a letter or digit)"
         exit 1
     fi
@@ -1256,15 +1275,11 @@ profile_create() {
 
     local src_config=""
     if [ -n "$from" ]; then
-        if [ "$from" = default ]; then
-            src_config="$OCD_PROFILES_BASE/config"
-        else
-            if ! valid_profile_name "$from"; then
-                print_error "Invalid source profile name '$from'"
-                exit 1
-            fi
-            src_config="$OCD_PROFILES_BASE/profiles/$from/config"
+        if ! ocd_valid_profile_name "$from"; then
+            print_error "Invalid source profile name '$from'"
+            exit 1
         fi
+        src_config="$OCD_PROFILES_BASE/profiles/$from/config"
         if [ ! -f "$src_config" ]; then
             print_error "No config to copy from: $src_config"
             exit 1
@@ -1332,8 +1347,12 @@ profile_remove() {
             ;;
         esac
     done
-    if [ -z "$name" ] || ! valid_profile_name "$name"; then
+    if [ -z "$name" ] || ! ocd_valid_profile_name "$name"; then
         print_error "Usage: $(basename "$0") profile remove NAME [--yes]"
+        exit 1
+    fi
+    if [ "$name" = "$OCD_DEFAULT_PROFILE" ]; then
+        print_error "The '$OCD_DEFAULT_PROFILE' profile is used whenever no --profile is given and cannot be removed."
         exit 1
     fi
     local dest="$OCD_PROFILES_BASE/profiles/$name"
@@ -1368,19 +1387,22 @@ manage_profile() {
     shift || true
     case "$sub" in
     list)
-        local marker="" dir name
-        [ -z "$OCD_PROFILE" ] && marker=" *"
-        echo "default${marker} ($OCD_PROFILES_BASE)"
+        local marker dir name active_listed=false
         for dir in "$OCD_PROFILES_BASE/profiles"/*/; do
             [ -d "$dir" ] || continue
             name=$(basename "$dir")
             marker=""
-            [ "$name" = "$OCD_PROFILE" ] && marker=" *"
+            if [ "$name" = "$OCD_PROFILE" ]; then
+                marker=" *"
+                active_listed=true
+            fi
             echo "${name}${marker} (${dir%/})"
         done
+        # The active profile is created on its first real use.
+        [ "$active_listed" = true ] || echo "$OCD_PROFILE * ($CONFIG_DIR, not created yet)"
         ;;
     current)
-        echo "${OCD_PROFILE:-default}"
+        echo "$OCD_PROFILE"
         ;;
     path)
         echo "$CONFIG_DIR"
@@ -1393,7 +1415,7 @@ manage_profile() {
         ;;
     *)
         print_error "Unknown profile subcommand: $sub"
-        echo "Usage: $0 profile [list|current|path|create NAME [--from NAME|default]|remove NAME [--yes]]"
+        echo "Usage: $0 profile [list|current|path|create NAME [--from NAME]|remove NAME [--yes]]"
         exit 1
         ;;
     esac
@@ -1493,7 +1515,8 @@ Global options:
                         config, env file, security policy and OpenCode auth
                         live under ~/.config/opencode-dockerized/profiles/NAME.
                         Also: OPENCODE_DOCKERIZED_PROFILE=NAME. Without it the
-                        classic tree is used ("default").
+                        'default' profile is used (profiles/default; a config
+                        from an older release is moved there automatically).
 
 Commands:
     run [--] [DIR]      Run OpenCode in Docker (default: current directory)
@@ -1515,7 +1538,7 @@ Commands:
     config [show|edit|path|init|sync] Wrapper config (INI)
     config opencode [path|edit]       OpenCode config (opencode.json)
     profile [list|current|path]       Multi-account profiles
-    profile create NAME [--from NAME|default]   Create a profile (own config + auth)
+    profile create NAME [--from NAME]   Create a profile (own config + auth)
     profile remove NAME [--yes]       Delete a profile and all its state
     clean               Remove the Docker image
     help                Show this help message
@@ -1560,8 +1583,8 @@ Getting Started:
 Security Features:
     - Isolated environment: only access to mounted project directory
     - Persistent config: OpenCode state lives on the host under
-      ~/.config/opencode-dockerized/home/ and survives restarts and image
-      rebuilds. The OpenCode config dir is mounted READ-ONLY: edit it on the
+      ~/.config/opencode-dockerized/profiles/<profile>/home/ and survives
+      restarts and image rebuilds. The OpenCode config dir is mounted READ-ONLY: edit it on the
       host (or with 'config opencode edit') to add MCP servers/models
     - Security layer: opencode-dockerized directory (permissions, hooks, AGENTS.md)
       is generated once on the host and never mounted; its files are delivered
@@ -1656,7 +1679,7 @@ main() {
         ;;
     uninstall)
         print_info "To uninstall: remove the 'opencode-dockerized/bin' PATH line from ~/.bashrc/~/.zshrc,"
-        print_info "then delete $REPO_ROOT (config in $CONFIG_DIR is left untouched)."
+        print_info "then delete $REPO_ROOT (config and profiles in $OCD_PROFILES_BASE are left untouched)."
         ;;
     update)
         update_opencode "$@"

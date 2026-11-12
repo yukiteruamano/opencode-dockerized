@@ -15,19 +15,22 @@ CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/opencode-dockerized}"
 CONFIG_FILE="${CONFIG_FILE:-$CONFIG_DIR/config}"
 
 # Active profile (multi-account). The wrapper resolves --profile /
-# OPENCODE_DOCKERIZED_PROFILE before sourcing this file and points CONFIG_DIR
-# at <base>/profiles/<name>, so every path below derives per profile. The base
-# is recovered here because it (and with it every OTHER profile's credentials
-# and state) must stay as protected from mounts and project dirs as the active
-# tree; without a profile the base IS the config dir.
+# OPENCODE_DOCKERIZED_PROFILE ("default" when none) before sourcing this file,
+# points CONFIG_DIR at <base>/profiles/<name> and sets OCD_PROFILES_BASE, so
+# every per-profile path below derives from CONFIG_DIR. The base holds every
+# OTHER profile's credentials and state, so it stays as protected from mounts
+# and project dirs as the active tree. Sourced on its own (tests), the base is
+# recovered from CONFIG_DIR, or is CONFIG_DIR itself.
 OCD_PROFILE="${OCD_PROFILE:-${OPENCODE_DOCKERIZED_PROFILE:-}}"
-OCD_PROFILES_BASE="$CONFIG_DIR"
-if [ -n "$OCD_PROFILE" ]; then
-    # Strip exactly the active profile's suffix: a custom CONFIG_DIR that
-    # happens to contain "/profiles/" elsewhere must not widen the base.
-    case "$CONFIG_DIR" in
-    */profiles/"$OCD_PROFILE") OCD_PROFILES_BASE="${CONFIG_DIR%/profiles/"$OCD_PROFILE"}" ;;
-    esac
+if [ -z "${OCD_PROFILES_BASE:-}" ]; then
+    OCD_PROFILES_BASE="$CONFIG_DIR"
+    if [ -n "$OCD_PROFILE" ]; then
+        # Strip exactly the active profile's suffix: a custom CONFIG_DIR that
+        # happens to contain "/profiles/" elsewhere must not widen the base.
+        case "$CONFIG_DIR" in
+        */profiles/"$OCD_PROFILE") OCD_PROFILES_BASE="${CONFIG_DIR%/profiles/"$OCD_PROFILE"}" ;;
+        esac
+    fi
 fi
 
 # Self-contained OpenCode state tree. The wrapper owns all of OpenCode's runtime
@@ -36,10 +39,12 @@ fi
 # native host usage. It mirrors the container home layout and is mounted 1:1.
 OCODE_HOME="${OCODE_HOME:-$CONFIG_DIR/home}"
 
-# Directory holding active GPG relay sockets (one subdir per session). The relay
-# lives on a normal filesystem so Docker can bind it (it cannot bind sockets
-# under the per-user /run/user tmpfs).
-GPG_RELAY_DIR="${GPG_RELAY_DIR:-$CONFIG_DIR/gnupg-relay}"
+# Directory holding active GPG relay sockets (one subdir per session PID). The
+# relay lives on a normal filesystem so Docker can bind it (it cannot bind
+# sockets under the per-user /run/user tmpfs). Install-wide, not per profile:
+# subdirs are per process anyway, `clean` purges them all, and a short path
+# keeps the socket under the 108-byte unix socket limit.
+GPG_RELAY_DIR="${GPG_RELAY_DIR:-$OCD_PROFILES_BASE/gnupg-relay}"
 SESSIONS_DIR="${SESSIONS_DIR:-$CONFIG_DIR/sessions}"
 
 # Self-contained install location (Doom-style). The git checkout lives here;
@@ -182,6 +187,15 @@ expand_tilde() {
     "~/"*) p="$HOME/${p#"~/"}" ;;
     esac
     printf '%s\n' "$p"
+}
+
+# The env file path to open. ENV_FILE keeps the value as written in the config
+# (a portable `~/` form is saved back unchanged), so every reader and writer
+# goes through this instead of using ENV_FILE as a path.
+# Usage: path=$(env_file_path)
+env_file_path() {
+    [ -n "${ENV_FILE:-}" ] || return 0
+    expand_tilde "$ENV_FILE"
 }
 
 # Collapse "//", "/./" and ".." in an absolute path without touching the
@@ -1306,14 +1320,16 @@ check_security_layer() {
 
     # The secrets file is never read for values here; only its permissions.
     if [ -n "${ENV_FILE:-}" ]; then
-        if [ ! -f "$ENV_FILE" ]; then
-            config_warning "env file not found: $ENV_FILE"
+        local env_path
+        env_path=$(env_file_path)
+        if [ ! -f "$env_path" ]; then
+            config_warning "env file not found: $env_path"
             stale=true
         else
             local mode=""
-            mode=$(stat -c '%a' "$ENV_FILE" 2>/dev/null || stat -f '%Lp' "$ENV_FILE" 2>/dev/null || true)
+            mode=$(stat -c '%a' "$env_path" 2>/dev/null || stat -f '%Lp' "$env_path" 2>/dev/null || true)
             if [ -n "$mode" ] && [ $((8#$mode & 8#044)) -ne 0 ]; then
-                config_warning "env file is readable by group/others ($ENV_FILE); run: chmod 600"
+                config_warning "env file is readable by group/others ($env_path); run: chmod 600"
             else
                 config_success "env file permissions ok"
             fi
@@ -1819,7 +1835,7 @@ relay_dir_ok() {
         / | "") return 1 ;;
     esac
     case "$GPG_RELAY_DIR" in
-        "$CONFIG_DIR"/* | "$HOME"/*) return 0 ;;
+        "$CONFIG_DIR"/* | "$OCD_PROFILES_BASE"/* | "$HOME"/*) return 0 ;;
     esac
     return 1
 }
@@ -3156,7 +3172,7 @@ migrate_legacy_env_vars() {
             skipped=$((skipped + 1))
             continue
         fi
-        if env_file_upsert "$ENV_FILE" "$var_name" "$var_value"; then
+        if env_file_upsert "$(env_file_path)" "$var_name" "$var_value"; then
             config_success "Migrated $var_name"
             count=$((count + 1))
         fi
@@ -3213,7 +3229,7 @@ prompt_env_vars() {
             continue
         fi
 
-        if env_file_upsert "$ENV_FILE" "$var_name" "$var_value"; then
+        if env_file_upsert "$(env_file_path)" "$var_name" "$var_value"; then
             config_success "Saved $var_name to the secrets file"
         fi
         var_value=""
@@ -3418,7 +3434,7 @@ prompt_websearch_provider() {
         parallel) need=PARALLEL_API_KEY ;;
         tavily) need=TAVILY_API_KEY ;;
         esac
-        if [ -n "$need" ] && [ -n "${ENV_FILE:-}" ] && [ -f "$ENV_FILE" ] && ! grep -qE "^${need}=" "$ENV_FILE"; then
+        if [ -n "$need" ] && [ -n "${ENV_FILE:-}" ] && [ -f "$(env_file_path)" ] && ! grep -qE "^${need}=" "$(env_file_path)"; then
             config_warning "'$need' not found in the secrets file; add it via the env setup step"
         fi
         ;;
@@ -3537,9 +3553,10 @@ print_config() {
     echo "  Memory limit: ${MEMORY:-(none)}"
     echo "  CPU limit: ${CPUS:-(none)}"
     if [ -n "$ENV_FILE" ]; then
-        local env_key_count="?"
-        if [ -f "$ENV_FILE" ]; then
-            env_key_count=$(grep -cE '^[A-Za-z_][A-Za-z0-9_]*=' "$ENV_FILE" 2>/dev/null || true)
+        local env_key_count="?" env_path
+        env_path=$(env_file_path)
+        if [ -f "$env_path" ]; then
+            env_key_count=$(grep -cE '^[A-Za-z_][A-Za-z0-9_]*=' "$env_path" 2>/dev/null || true)
         fi
         echo "  Env file: $ENV_FILE ($env_key_count keys)"
     else

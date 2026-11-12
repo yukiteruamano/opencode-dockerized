@@ -267,6 +267,18 @@ ln -s "$TMP/outside.env" "$CONFIG_DIR/link.env"
 if (ENV_FILE="$CONFIG_DIR/link.env" build_env_file_args) >/dev/null 2>&1; then
     fail "an env file symlinked out of CONFIG_DIR must be refused"
 fi
+# A `~/` env_file (the form the layout migration and the docs write) is a
+# path under $HOME for every reader and writer, never a literal "~" dir.
+mkdir -p "$TMP/cwd"
+(
+    cd "$TMP/cwd" || exit 1
+    # shellcheck disable=SC2088 # the literal ~ as written in a config file
+    ENV_FILE="~/tilde-secrets/env"
+    [ "$(env_file_path)" = "$HOME/tilde-secrets/env" ] || exit 2
+    env_file_upsert "$(env_file_path)" TILDE_KEY v >/dev/null 2>&1 || exit 3
+    [ ! -e "$TMP/cwd/~" ] || exit 4
+) || fail "a ~/ env_file must resolve under \$HOME, not a literal ~ dir (step $?)"
+grep -qx 'TILDE_KEY=v' "$HOME/tilde-secrets/env" || fail "env_file_upsert must write the expanded ~/ path"
 
 # --- 6. GnuPG mirror never writes through planted symlinks ------------------------
 export GNUPGHOME="$TMP/hostgpg"

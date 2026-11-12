@@ -20,8 +20,11 @@ fail() {
 }
 
 export HOME="$TMP/home"
+# CONFIG_DIR is the base: with no --profile the wrapper uses the 'default'
+# profile below it (install-wide state such as relays stays in the base).
 export CONFIG_DIR="$TMP/cfg"
-export OCODE_HOME="$CONFIG_DIR/home"
+PROFILE_DIR="$CONFIG_DIR/profiles/default"
+export OCODE_HOME="$PROFILE_DIR/home"
 export OPENCODE_DOCKERIZED_ALLOW_CONTAINER_SYNC=1
 mkdir -p "$HOME" "$TMP/proj" "$TMP/bin"
 export PATH="$REPO_DIR/bin:$TMP/bin:$PATH"
@@ -70,8 +73,8 @@ grep -q -- ' -e TZ=Europe/Madrid ' <<<"$line" || fail "TZ must be forwarded when
 grep -q -- ' -e LC_ALL=es_ES.UTF-8 ' <<<"$line" || fail "LC_ALL must be forwarded when set"
 
 # 1c. Resource limits: memory also pins swap; a zero limit is rejected.
-mkdir -p "$CONFIG_DIR"
-printf 'setting.memory=2g\nsetting.pids_limit=512\nsetting.network=bridge\n' >"$CONFIG_DIR/config"
+mkdir -p "$PROFILE_DIR"
+printf 'setting.memory=2g\nsetting.pids_limit=512\nsetting.network=bridge\n' >"$PROFILE_DIR/config"
 run_wrapper run "$TMP/proj"
 line="$(docker_run_line)"
 grep -q -- ' --memory 2g ' <<<"$line" || fail "setting.memory must reach docker"
@@ -79,12 +82,12 @@ grep -q -- ' --memory-swap 2g ' <<<"$line" || fail "memory must pin swap to the 
 grep -q -- ' --pids-limit 512 ' <<<"$line" || fail "setting.pids_limit must override the default"
 grep -q -- ' --add-host host.docker.internal:host-gateway ' <<<"$line" ||
     fail "bridge networking must map host.docker.internal"
-printf 'setting.memory=0g\nsetting.pids_limit=0\n' >"$CONFIG_DIR/config"
+printf 'setting.memory=0g\nsetting.pids_limit=0\n' >"$PROFILE_DIR/config"
 run_wrapper run "$TMP/proj"
 line="$(docker_run_line)"
 if grep -q -- ' --memory ' <<<"$line"; then fail "a zero memory limit must be ignored"; fi
 grep -q -- ' --pids-limit 4096 ' <<<"$line" || fail "an invalid pids_limit must fall back to the default"
-rm -f "$CONFIG_DIR/config"
+rm -f "$PROFILE_DIR/config"
 
 # 1d. `run` takes a single DIR: extra arguments are refused before anything
 # runs (they used to be dropped silently); `--` still ends option parsing.
@@ -137,7 +140,7 @@ OUT="$(env -u TMPDIR XDG_RUNTIME_DIR="$TMP/xdg" "$WRAPPER" run "$TMP/proj" 2>&1 
 [ "$(stat -c %a "$want" 2>/dev/null || stat -f %Lp "$want")" = 700 ] || fail "an existing temp dir must be re-tightened to 700"
 
 # 3c. `clean` removes dead relay dirs but never a live session's.
-RELAYS="$CONFIG_DIR/gnupg-relay"
+RELAYS="$CONFIG_DIR/gnupg-relay" # install-wide, in the base
 mkdir -p "$RELAYS/live" "$RELAYS/dead" "$RELAYS/fresh"
 sleep 30 &
 live_pid=$!
@@ -168,12 +171,12 @@ run_wrapper doctor
 [ "$RC" -eq 0 ] || fail "doctor must pass on a healthy host with a healthy container (got $RC)"
 grep -q '== host: wrapper and security layer ==' <<<"$OUT" || fail "doctor must include the host-side check"
 grep -q 'security-guard.js .* (in sync)' <<<"$OUT" || fail "doctor must verify the guard on the host"
-printf '\n// drift\n' >>"$CONFIG_DIR/plugins/security-guard.js"
+printf '\n// drift\n' >>"$PROFILE_DIR/plugins/security-guard.js"
 cp "$REPO_DIR/plugins/security-guard.js" "$TMP/guard.orig"
 run_wrapper doctor
 # the run repairs drift before checking, so it must end healthy again
 [ "$RC" -eq 0 ] || fail "doctor must repair guard drift and then pass (got $RC)"
-cmp -s "$CONFIG_DIR/plugins/security-guard.js" "$REPO_DIR/plugins/security-guard.js" || fail "doctor must leave the installed guard in sync"
+cmp -s "$PROFILE_DIR/plugins/security-guard.js" "$REPO_DIR/plugins/security-guard.js" || fail "doctor must leave the installed guard in sync"
 printf '{ "apiKey": "sk-literal" }\n' >"$OCODE_HOME/.config/opencode/opencode.json"
 EXPECT_UNEXPECTED=true run_wrapper doctor
 [ "$RC" -ne 0 ] || fail "doctor must fail on an inline secret in the OpenCode config"
@@ -229,7 +232,11 @@ if grep -q -- 'OPENCODE_VERSION=' "$DOCKER_STUB_LOG"; then fail "no version arg 
 
 # 3e2. `version` identifies the exact checkout (git describe), not just a number.
 DOCKER_STUB_SHA_LABEL="$want_dsha" run_wrapper version
-grep -qE 'opencode-dockerized 0\.15\.0 \([0-9a-f]{7,}' <<<"$OUT" || fail "version must show the wrapper release and git describe (got: $(head -1 <<<"$OUT"))"
+wrapper_version="$(sed -n 's/^WRAPPER_VERSION="\([0-9.]*\)"$/\1/p' "$WRAPPER")"
+[ -n "$wrapper_version" ] || fail "could not read WRAPPER_VERSION from the wrapper"
+grep -qF "opencode-dockerized $wrapper_version (" <<<"$OUT" &&
+    grep -qE "opencode-dockerized [0-9.]+ \([0-9a-f]{7,}" <<<"$OUT" ||
+    fail "version must show the wrapper release and git describe (got: $(head -1 <<<"$OUT"))"
 
 # 3f. A stale image (different Dockerfile hash, or no labels) is reported.
 DOCKER_STUB_SHA_LABEL="$want_dsha" run_wrapper run "$TMP/proj"

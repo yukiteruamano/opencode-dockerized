@@ -1020,8 +1020,10 @@ grep -qF -- 'opencode-dockerized/bin' "$SETUP_HOME/.bashrc" ||
 if ! env -u CONFIG_DIR -u OCODE_HOME HOME="$SETUP_HOME" "$REPO_DIR/bin/opencode-dockerized" install --yes <&- >/dev/null 2>&1; then
     fail "install --yes must succeed with closed stdin"
 fi
-[ -f "$SETUP_HOME/.config/opencode-dockerized/config" ] ||
-    fail "install --yes must create the default config"
+[ -f "$SETUP_HOME/.config/opencode-dockerized/profiles/default/config" ] ||
+    fail "install --yes must create the default profile's config"
+[ ! -e "$SETUP_HOME/.config/opencode-dockerized/config" ] ||
+    fail "install --yes must not create a config outside the profile layout"
 
 # resolve_editor prefers $EDITOR, falls back, or fails cleanly.
 [ "$(EDITOR=myeditor resolve_editor)" = myeditor ] || fail "resolve_editor must prefer EDITOR"
@@ -1068,7 +1070,7 @@ fi
 if grep -q "OpenCode Dockerized aliases" "$ONLY_HOME/.bashrc"; then
     fail "--only global must not touch aliases"
 fi
-[ ! -e "$ONLY_HOME/.config/opencode-dockerized/config" ] ||
+[ ! -e "$ONLY_HOME/.config/opencode-dockerized/profiles/default/config" ] ||
     fail "--only global must not create config"
 
 # bin/ must hold only the opencode-dockerized binary (no second install binary).
@@ -1086,8 +1088,8 @@ mkdir -p "$PIPE_HOME"
 if ! env -u CONFIG_DIR -u OCODE_HOME HOME="$PIPE_HOME" "$REPO_DIR/bin/opencode-dockerized" install <&- >/dev/null 2>&1; then
     fail "install with closed stdin and no --yes must succeed (auto --yes)"
 fi
-[ -f "$PIPE_HOME/.config/opencode-dockerized/config" ] ||
-    fail "piped install must create the default config"
+[ -f "$PIPE_HOME/.config/opencode-dockerized/profiles/default/config" ] ||
+    fail "piped install must create the default profile's config"
 grep -qF -- 'opencode-dockerized/bin' "$PIPE_HOME/.bashrc" ||
     fail "piped install must add bin/ to PATH"
 grep -qF -- "alias ocd='opencode-dockerized'" "$PIPE_HOME/.bashrc" ||

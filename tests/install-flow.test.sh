@@ -44,7 +44,7 @@ export OCODE_REPO_URL="$TMP/origin.git"
 new_home() {
     export HOME="$TMP/home-$1"
     export CONFIG_DIR="$HOME/.config/opencode-dockerized"
-    export OCODE_HOME="$CONFIG_DIR/home"
+    export OCODE_HOME="$CONFIG_DIR/profiles/default/home"
     export XDG_DATA_HOME="$HOME/.local/share"
     mkdir -p "$HOME"
     : >"$HOME/.bashrc"

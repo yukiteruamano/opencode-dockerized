@@ -66,7 +66,7 @@ check "help" 0 "Usage:" -- help
 check "version" 0 "GUARD_VERSION" -- version
 check "uninstall" 0 "PATH line" -- uninstall
 check "unknown command" 1 "Unknown command" -- definitely-not-a-command
-check "config path" 0 "$CONFIG_DIR/config" -- config path
+check "config path" 0 "$CONFIG_DIR/profiles/default/config" -- config path
 check "config init (creates)" 0 "" -- config init
 check "config init (idempotent)" 0 "already exists" -- config init
 check "config show" 0 "Profile: default" -- config show

@@ -20,8 +20,10 @@ fail() {
 }
 
 export HOME="$TMP/home"
+# CONFIG_DIR is the base: the lock and .previous-rev are install-wide and stay
+# there; per-profile state lives in profiles/default.
 export CONFIG_DIR="$TMP/cfg"
-export OCODE_HOME="$CONFIG_DIR/home"
+export OCODE_HOME="$CONFIG_DIR/profiles/default/home"
 export OPENCODE_DOCKERIZED_ALLOW_CONTAINER_SYNC=1
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid

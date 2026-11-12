@@ -54,7 +54,10 @@ run_wrapper --profile dev config path
 [ "$OUT" = "$CONFIG_DIR/profiles/dev/config" ] || fail "profile config path must derive from the base (got $OUT)"
 
 run_wrapper config path
-[ "$OUT" = "$CONFIG_DIR/config" ] || fail "without a profile the classic path must be unchanged (got $OUT)"
+[ "$OUT" = "$CONFIG_DIR/profiles/default/config" ] ||
+    fail "without --profile the 'default' profile must be used (got $OUT)"
+run_wrapper --profile default config path
+[ "$OUT" = "$CONFIG_DIR/profiles/default/config" ] || fail "--profile default must name the same tree (got $OUT)"
 
 # 1b. The environment variable selects the same tree; the flag wins over it.
 OUT="$(OPENCODE_DOCKERIZED_PROFILE=dev "$WRAPPER" config path 2>&1)" || fail "env-var profile selection failed"
@@ -73,6 +76,8 @@ run_wrapper --profile '.hidden' config path
 [ "$RC" -ne 0 ] || fail "a profile name must start with a letter or digit"
 run_wrapper --profile '' config path
 [ "$RC" -ne 0 ] || fail "an empty profile name must be refused"
+run_wrapper --profile= config path
+[ "$RC" -ne 0 ] || fail "an empty --profile= must be refused, not fall back to default"
 
 # 2. profile create: seeds the tree, the security layer and a config template.
 run_wrapper profile create dev
@@ -119,6 +124,9 @@ run_wrapper run "$TMP/proj"
 line="$(docker_run_line)"
 grep -q -- ' -e OPENCODE_DOCKERIZED_POLICY=balanced ' <<<"$line" || fail "default profile must stay balanced"
 grep -q -- ' -e OPENCODE_DOCKERIZED_PROFILE=default ' <<<"$line" || fail "default indicator must be 'default'"
+grep -q -- "--name opencode-default-" <<<"$line" || fail "the default profile must name its containers too"
+grep -q -- "$CONFIG_DIR/profiles/default/home/.local/share/opencode" <<<"$line" ||
+    fail "the default profile's data mount must come from profiles/default"
 
 # 4. Isolation: another profile's state must be unreachable as mount or project.
 run_wrapper profile create other
@@ -142,11 +150,11 @@ run_wrapper --profile dev run "$TMP/proj"
 docker_run_line | grep -q -- "--env-file $CONFIG_DIR/profiles/dev/env" ||
     fail "the profile's own env file must reach docker --env-file"
 
-# The default tree's env file is outside the profile and must be refused.
-install -m 600 /dev/null "$CONFIG_DIR/env"
-printf 'setting.env_file=%s\n' "$CONFIG_DIR/env" >"$CONFIG_DIR/profiles/dev/config"
+# The default profile's env file is outside the dev profile and must be refused.
+install -m 600 /dev/null "$CONFIG_DIR/profiles/default/env"
+printf 'setting.env_file=%s\n' "$CONFIG_DIR/profiles/default/env" >"$CONFIG_DIR/profiles/dev/config"
 run_wrapper --profile dev run "$TMP/proj"
-[ "$RC" -ne 0 ] || fail "the default tree's env file must be refused from a profile"
+[ "$RC" -ne 0 ] || fail "the default profile's env file must be refused from another profile"
 grep -qi 'outside' <<<"$OUT" || fail "the env refusal must say it is outside the config dir: $OUT"
 
 # Another profile's env file must be refused too.
@@ -187,6 +195,15 @@ run_wrapper profile remove lab --yes
 [ ! -d "$CONFIG_DIR/profiles/lab" ] || fail "remove --yes must delete the profile tree"
 run_wrapper profile remove nope --yes
 [ "$RC" -ne 0 ] || fail "removing a missing profile must fail"
+run_wrapper profile remove default --yes
+[ "$RC" -ne 0 ] || fail "the default profile must not be removable"
+[ -d "$CONFIG_DIR/profiles/default" ] || fail "a refused remove must keep the default profile"
+
+# 6b. --from default copies the default profile like any other.
+printf 'setting.theme=catppuccin\n' >"$CONFIG_DIR/profiles/default/config"
+run_wrapper profile create fromdef --from default
+[ "$RC" -eq 0 ] || fail "--from default must work: $OUT"
+grep -q 'catppuccin' "$CONFIG_DIR/profiles/fromdef/config" || fail "--from default must copy the default profile's config"
 
 # 7. config init is idempotent and never overwrites.
 printf 'setting.security_policy=strict\n' >"$CONFIG_DIR/profiles/dev/config"
