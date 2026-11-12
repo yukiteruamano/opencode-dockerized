@@ -360,8 +360,13 @@ build_mount_args
 build_env_args
 gpg_mounts="$(printf '%s\n' "${DOCKER_MOUNT_ARGS[@]}")"
 gpg_envs="$(printf '%s\n' "${DOCKER_ENV_ARGS[@]}")"
-grep -qxF -- "type=bind,source=$OCODE_HOME/.gnupg,target=/home/coder/.gnupg" <<<"$gpg_mounts" ||
-    fail "GnuPG public keyring must be mounted read-write"
+# The mirror is shared by every session of the profile: it is a read-only seed,
+# never the container's GNUPGHOME (keyboxd sockets and locks must not be shared).
+grep -qxF -- "type=bind,source=$OCODE_HOME/.gnupg,target=/home/coder/.gnupg-mirror,readonly" <<<"$gpg_mounts" ||
+    fail "GnuPG public keyring must be mounted read-only as the seed"
+if grep -qE -- 'target=/home/coder/\.gnupg(,|$)' <<<"$gpg_mounts"; then
+    fail "nothing may be mounted at GNUPGHOME: each container keeps its own"
+fi
 if grep -q 'private-keys-v1.d' <<<"$gpg_mounts"; then
     fail "private-keys-v1.d must never be mounted"
 fi
@@ -374,7 +379,12 @@ if [ -e "$OCODE_HOME/.gnupg/private-keys-v1.d" ]; then
     fail "private keys must not be mirrored"
 fi
 grep -qx -- 'GNUPGHOME=/home/coder/.gnupg' <<<"$gpg_envs" ||
-    fail "GNUPGHOME must point at the mirrored keyring"
+    fail "GNUPGHOME must point at the container's own GnuPG home"
+grep -qx -- 'OPENCODE_DOCKERIZED_GNUPG_SEED=/home/coder/.gnupg-mirror' <<<"$gpg_envs" ||
+    fail "the entrypoint must be told where the read-only seed is"
+if grep -q -- 'OPENCODE_DOCKERIZED_GPG_AGENT_SOCK=' <<<"$gpg_envs"; then
+    fail "no agent socket was mounted, so none may be announced"
+fi
 grep -qx -- 'OPENCODE_DOCKERIZED_GPG_AGENT=true' <<<"$gpg_envs" ||
     fail "doctor GPG flag must be true when forwarding is enabled"
 
@@ -394,14 +404,15 @@ grep -qiE '^[[:space:]]*use-keyboxd([[:space:]]|$)' "$OCODE_HOME/.gnupg/common.c
 [ -f "$OCODE_HOME/.gnupg/public-keys.d/pubring.db" ] ||
     fail "keyboxd public DB must be mirrored"
 
-# A stale keyboxd socket from a previous run must be cleared before mounting.
+# A keyboxd socket left in the mirror by an older version (when the mirror was
+# GNUPGHOME) must be cleared.
 : >"$OCODE_HOME/.gnupg/S.keyboxd"
 ensure_gpg_mirror
 [ ! -e "$OCODE_HOME/.gnupg/S.keyboxd" ] ||
     fail "stale keyboxd socket must be cleared from the mirror"
 
-# ...but never while another live session shares the mirror: removing its
-# keyboxd socket would break that session's gpg.
+# ...but never while another live session shares the mirror: one still running
+# an older image may be using it.
 sleep 30 &
 other_session=$!
 mkdir -p "$CONFIG_DIR/sessions"
@@ -447,14 +458,18 @@ if [ "$have_node" = true ]; then
     grep -qxF -- "type=bind,source=$gpg_extra,target=/home/coder/.gnupg-agent/S.gpg-agent" <<<"$gpg_sel" ||
         fail "restricted extra socket must be preferred as the agent socket"
 
-    # The agent socket must be exposed through a symlink in the mirror, never a
-    # nested bind mount (Docker can shadow the latter).
-    [ -L "$OCODE_HOME/.gnupg/S.gpg-agent" ] ||
-        fail "the mirror must contain an S.gpg-agent symlink"
-    [ "$(readlink "$OCODE_HOME/.gnupg/S.gpg-agent")" = "/home/coder/.gnupg-agent/S.gpg-agent" ] ||
-        fail "S.gpg-agent symlink must point at the dedicated agent path"
+    # The agent socket is announced to the entrypoint, which links it into the
+    # container's own GNUPGHOME: the shared mirror gets no runtime entries,
+    # and the socket is never a nested bind mount (Docker can shadow those).
+    build_env_args
+    grep -qx -- 'OPENCODE_DOCKERIZED_GPG_AGENT_SOCK=/home/coder/.gnupg-agent/S.gpg-agent' \
+        <<<"$(printf '%s\n' "${DOCKER_ENV_ARGS[@]}")" ||
+        fail "a mounted agent socket must be announced to the entrypoint"
+    if [ -e "$OCODE_HOME/.gnupg/S.gpg-agent" ] || [ -L "$OCODE_HOME/.gnupg/S.gpg-agent" ]; then
+        fail "the shared mirror must not get an S.gpg-agent entry"
+    fi
     if grep -qF -- "target=/home/coder/.gnupg/S.gpg-agent" <<<"$gpg_sel"; then
-        fail "the agent socket must not be mounted inside the mirror (nested bind)"
+        fail "the agent socket must not be mounted inside GNUPGHOME (nested bind)"
     fi
 
     # Without the restricted extra socket and without explicit opt-in, the main

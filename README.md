@@ -377,7 +377,7 @@ opencode-dockerized profile remove lab             # delete a profile (asks; --y
 | `~/.agents/skills/` | `/home/coder/.agents/skills/` | **read-only** | Agent-compatible skills (`<name>/SKILL.md`) (optional) |
 | `~/.mcp-auth/` | `/home/coder/.mcp-auth/` | **read-write** | MCP OAuth store for `mcp-remote` servers (optional) |
 | `~/.composio/` | `/home/coder/.composio/` | read-write | Composio CLI binary + login (optional custom `mount.composio`) |
-| `<profile>/home/.gnupg/` | `/home/coder/.gnupg/` | read-write | Mirrored **public** GnuPG material (pubring/trustdb/gpg.conf) + agent socket (only with `setting.gpg_agent_support=true`); `private-keys-v1.d/` is never copied |
+| `<profile>/home/.gnupg/` | `/home/coder/.gnupg-mirror/` | **read-only** | Mirrored **public** GnuPG material (pubring/trustdb/gpg.conf, only with `setting.gpg_agent_support=true`); `private-keys-v1.d/` is never copied. The entrypoint copies it into the container's own `GNUPGHOME` (`/home/coder/.gnupg`), so concurrent sessions never share keyboxd sockets or lock files |
 
 `<profile>` is the active profile's directory,
 `~/.config/opencode-dockerized/profiles/<name>/` (`profiles/default/` without
@@ -546,7 +546,7 @@ Your private keys never enter the container: only `SSH_AUTH_SOCK` and the non-se
 setting.gpg_agent_support=true
 mount.gitconfig=~/.gitconfig:/home/coder/.gitconfig
 ```
-Inside the container, configure git to use your signing key (e.g. `git config --global user.signingkey <KEYID>` and `git config --global commit.gpgsign true`, or set it per project). Only the public keyring and the host `gpg-agent` socket are shared; private keys stay on the host. The wrapper mirrors `pubring.kbx` (or `public-keys.d/pubring.db`), keeps `use-keyboxd` and sets `no-autostart` in the mirrored config, and the container starts keyboxd at boot so gpg can read the mirrored key database while private-key operations go to the host agent. The agent socket is mounted at a dedicated path (`/home/coder/.gnupg-agent/S.gpg-agent`) and exposed through a symlink in the keyring — a socket mounted inside another bind mount can be shadowed by Docker. It prefers the restricted `S.gpg-agent.extra` socket; if that socket is missing it warns and skips instead of silently using the full-control main socket, and set `setting.gpg_allow_main_socket=true` only if you accept that risk.
+Inside the container, configure git to use your signing key (e.g. `git config --global user.signingkey <KEYID>` and `git config --global commit.gpgsign true`, or set it per project). Only the public keyring and the host `gpg-agent` socket are shared; private keys stay on the host. The wrapper mirrors `pubring.kbx` (or `public-keys.d/pubring.db`), keeps `use-keyboxd` and sets `no-autostart` in the mirrored config, and the container starts keyboxd at boot so gpg can read the mirrored key database while private-key operations go to the host agent. The agent socket is mounted at a dedicated path (`/home/coder/.gnupg-agent/S.gpg-agent`) and linked into the container's own `GNUPGHOME` — a socket mounted inside another bind mount can be shadowed by Docker. The mirror itself is mounted read-only and copied into that `GNUPGHOME` at container start, so several sessions can sign at the same time: each runs its own keyboxd, and one session ending never affects the others (SSH needs nothing special: the forwarded `ssh-agent` serves every session). It prefers the restricted `S.gpg-agent.extra` socket; if that socket is missing it warns and skips instead of silently using the full-control main socket, and set `setting.gpg_allow_main_socket=true` only if you accept that risk.
 
 Verify the setup with `opencode-dockerized doctor`. If the host agent socket is missing, `run` starts it automatically (`setting.gpg_autostart_agent=true`, the default); before launching it probes whether the agent already answers (`gpg-connect-agent` with a 2 s timeout), so a live agent is never relaunched and a stale socket is replaced. Set `gpg_autostart_agent=false` to only warn and never launch anything.
 
@@ -786,7 +786,7 @@ opencode-dockerized update
 ### Tests
 
 - **`tests/*.test.mjs`** - Guard regression, adversarial-bypass and policy-lint tests (`node tests/<name>.test.mjs`, shared harness in `tests/guard-harness.mjs`)
-- **`tests/*.test.sh`** - Wrapper contract tests against a throw-away HOME and a stub docker: run/update/install/doctor flows, config hardening, profiles (`profile-flow`), the whole command surface (`commands-smoke`), completions and Dockerfile lint
+- **`tests/*.test.sh`** - Wrapper contract tests against a throw-away HOME and a stub docker: run/update/install/doctor flows, config hardening, profiles (`profile-flow`, `profile-migration`), the whole command surface (`commands-smoke`), overlapping sessions with SSH/GnuPG forwarding (`session-concurrency`), completions and Dockerfile lint
 
 ### Shell Completion (`completions/`)
 

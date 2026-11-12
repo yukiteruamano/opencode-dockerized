@@ -45,6 +45,14 @@ OCODE_HOME="${OCODE_HOME:-$CONFIG_DIR/home}"
 # subdirs are per process anyway, `clean` purges them all, and a short path
 # keeps the socket under the 108-byte unix socket limit.
 GPG_RELAY_DIR="${GPG_RELAY_DIR:-$OCD_PROFILES_BASE/gnupg-relay}"
+
+# Container-side GnuPG paths. The profile's public-key mirror is mounted
+# read-only at the seed path; entrypoint.sh copies it into GNUPGHOME (on the
+# container's own layer, so every session has its own keyboxd socket and lock
+# files) and links the forwarded agent socket there.
+GPG_CONTAINER_HOME="/home/coder/.gnupg"
+GPG_CONTAINER_SEED="/home/coder/.gnupg-mirror"
+GPG_CONTAINER_AGENT_SOCK="/home/coder/.gnupg-agent/S.gpg-agent"
 SESSIONS_DIR="${SESSIONS_DIR:-$CONFIG_DIR/sessions}"
 
 # Self-contained install location (Doom-style). The git checkout lives here;
@@ -331,7 +339,7 @@ host_path_is_protected() {
 container_path_is_protected() {
     local path="$1" p
     [ "$path" = "/" ] && return 0
-    for p in /home/coder/.config/opencode /home/coder/.ssh /home/coder/.gnupg /home/coder/.gnupg-agent; do
+    for p in /home/coder/.config/opencode /home/coder/.ssh /home/coder/.gnupg /home/coder/.gnupg-agent /home/coder/.gnupg-mirror; do
         if [ "$path" = "$p" ] || [[ "$path" == "$p"/* ]]; then
             return 0
         fi
@@ -1774,24 +1782,18 @@ ensure_gpg_mirror() {
         config_warning "No public GnuPG keyring found in $host_gpg_home (commit signing will not work)"
     fi
 
-    # Clear any stale agent entry from earlier versions: the socket is
-    # bind-mounted by the wrapper, never linked. A previous `-v` mount or a
-    # Docker run with a missing source can leave a directory here, which would
-    # block the socket mount and the real host agent.
-    if [ -d "$dest/S.gpg-agent" ] && [ ! -S "$dest/S.gpg-agent" ]; then
+    # Clear runtime entries earlier versions left in the mirror, when it was
+    # mounted read-write as GNUPGHOME: an S.gpg-agent link (or a directory a
+    # `-v` mount with a missing source created), keyboxd's socket and lock.
+    # The mirror is now a read-only seed; those live in each container's own
+    # GNUPGHOME. A session still running an older image may use them, so they
+    # are only removed when no other session of this profile is alive.
+    if [ -d "$dest/S.gpg-agent" ] && [ ! -S "$dest/S.gpg-agent" ] && [ ! -L "$dest/S.gpg-agent" ]; then
         rmdir "$dest/S.gpg-agent" 2>/dev/null ||
-            config_warning "Stray directory at $dest/S.gpg-agent; remove it on the host before mounting the agent socket"
+            config_warning "Stray directory at $dest/S.gpg-agent; remove it on the host"
     fi
-
-    # The mirror is shared by every session. Stale agent/keyboxd entries are only
-    # cleared when no other session is alive: deleting the socket of a running
-    # session would break its gpg.
     if [ "$(live_sessions)" -eq 0 ]; then
-        rm -f "$dest/S.gpg-agent" 2>/dev/null || true
-        # Clear a stale keyboxd socket/lock from a previous run: the container
-        # starts a fresh keyboxd, and a dead socket file would otherwise confuse
-        # gpgconf.
-        rm -f "$dest/S.keyboxd" "$dest/S.keyboxd.lock" 2>/dev/null || true
+        rm -f "$dest/S.gpg-agent" "$dest/S.keyboxd" "$dest/S.keyboxd.lock" 2>/dev/null || true
     fi
 }
 
@@ -2663,14 +2665,14 @@ parse_config() {
     load_config || return 0 # Continue even if load fails
 }
 
-# Add a bind mount for a socket/file. Docker's `--mount` spec separates fields
-# with commas, so fall back to `-v` when a path contains one.
-# Usage: mount_bind <source> <target>
+# Add a bind mount for a socket/file/dir. Docker's `--mount` spec separates
+# fields with commas, so fall back to `-v` when a path contains one.
+# Usage: mount_bind <source> <target> [ro]
 mount_bind() {
-    local src="$1" dst="$2"
+    local src="$1" dst="$2" mode="${3:-}"
     case "$src$dst" in
-        *,*) DOCKER_MOUNT_ARGS+=(-v "$src:$dst") ;;
-        *) DOCKER_MOUNT_ARGS+=(--mount "type=bind,source=$src,target=$dst") ;;
+        *,*) DOCKER_MOUNT_ARGS+=(-v "$src:$dst${mode:+:$mode}") ;;
+        *) DOCKER_MOUNT_ARGS+=(--mount "type=bind,source=$src,target=$dst${mode:+,readonly}") ;;
     esac
 }
 
@@ -2744,16 +2746,20 @@ build_mount_args() {
     fi
 
     # Handle GnuPG agent forwarding if enabled: mount the mirrored public
-    # keyring (rw so GPG can write lock files) and the host agent socket. The
-    # private keys stay on the host; only public material is shared. The socket
-    # is bind-mounted with --mount (a stale source fails loudly instead of Docker
-    # creating a directory) at the container's GNUPGHOME path (and at its own XDG
-    # path when applicable) so GPG discovers it without any host symlink.
+    # keyring and the host agent socket. The private keys stay on the host;
+    # only public material is shared. The mirror is shared by every session of
+    # the profile, so it is mounted READ-ONLY as a seed: entrypoint.sh copies it
+    # into a GNUPGHOME of the container's own, where keyboxd's socket, the agent
+    # symlink and gpg's lock files live. A shared, writable home let concurrent
+    # sessions reuse one container's keyboxd (dead once that container exits;
+    # no-autostart keeps gpg from starting another) and each other's locks.
+    # The socket is bind-mounted with --mount (a stale source fails loudly
+    # instead of Docker creating a directory).
     if [ "$GPG_AGENT_SUPPORT" = true ]; then
         GPG_SOCKET=""
         ensure_gpg_mirror
         if [ -d "$OCODE_HOME/.gnupg" ]; then
-            mount_bind "$OCODE_HOME/.gnupg" "/home/coder/.gnupg"
+            mount_bind "$OCODE_HOME/.gnupg" "$GPG_CONTAINER_SEED" ro
         else
             config_warning "GnuPG agent support enabled but $OCODE_HOME/.gnupg could not be prepared"
         fi
@@ -2792,16 +2798,10 @@ build_mount_args() {
             if [[ "$mount_socket" == /run/* ]]; then
                 config_warning "GnuPG agent socket is on tmpfs and no relay is available; Docker may not be able to bind it."
             fi
-            # Mount the socket at a dedicated path OUTSIDE the mirror. A socket
-            # mounted *inside* another bind mount (the mirror) can be shadowed by
-            # Docker, which left the agent socket invisible to gpg.
-            mount_bind "$mount_socket" "/home/coder/.gnupg-agent/S.gpg-agent"
-            # Expose it to gpg through GNUPGHOME with a symlink (gpg follows it).
-            # ensure_gpg_mirror clears any previous link before each run.
-            if [ -d "$OCODE_HOME/.gnupg" ]; then
-                ln -sfn "/home/coder/.gnupg-agent/S.gpg-agent" "$OCODE_HOME/.gnupg/S.gpg-agent" 2>/dev/null ||
-                    config_warning "Could not create the GnuPG agent socket symlink in $OCODE_HOME/.gnupg"
-            fi
+            # Mount the socket at a dedicated path OUTSIDE any other bind mount
+            # (a nested socket mount can be shadowed by Docker). entrypoint.sh
+            # links it into the container's own GNUPGHOME (gpg follows the link).
+            mount_bind "$mount_socket" "$GPG_CONTAINER_AGENT_SOCK"
         else
             config_warning "GnuPG agent support enabled but no usable agent socket (extra socket missing and main fallback disabled)"
         fi
@@ -2823,11 +2823,17 @@ build_env_args() {
         fi
     fi
 
-    # Handle GnuPG agent forwarding if enabled. GNUPGHOME points at the mirrored
-    # public keyring; XDG_RUNTIME_DIR is forwarded only when the agent socket
-    # lives under it, so gpgconf inside the container resolves the mounted path.
+    # Handle GnuPG agent forwarding if enabled. GNUPGHOME is the container's own
+    # home, seeded by entrypoint.sh from the read-only mirror; the agent socket
+    # is announced only when one was mounted. XDG_RUNTIME_DIR is forwarded only
+    # when the agent socket lives under it, so gpgconf inside the container
+    # resolves the mounted path.
     if [ "$GPG_AGENT_SUPPORT" = true ]; then
-        DOCKER_ENV_ARGS+=(-e "GNUPGHOME=/home/coder/.gnupg")
+        DOCKER_ENV_ARGS+=(-e "GNUPGHOME=$GPG_CONTAINER_HOME")
+        DOCKER_ENV_ARGS+=(-e "OPENCODE_DOCKERIZED_GNUPG_SEED=$GPG_CONTAINER_SEED")
+        if [ -n "${GPG_SOCKET:-}" ]; then
+            DOCKER_ENV_ARGS+=(-e "OPENCODE_DOCKERIZED_GPG_AGENT_SOCK=$GPG_CONTAINER_AGENT_SOCK")
+        fi
 
         if [ -n "${GPG_SOCKET:-}" ] && [ -n "${XDG_RUNTIME_DIR:-}" ] && [[ "$GPG_SOCKET" == "$XDG_RUNTIME_DIR"/* ]]; then
             DOCKER_ENV_ARGS+=(-e "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR")

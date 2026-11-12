@@ -28,6 +28,22 @@ the guard (`OPENCODE_DOCKERIZED_GUARD_VERSION`) and the policy set
 - `--profile=` with an empty name is refused instead of falling back.
 
 ### Fixes
+- Concurrent sessions with GnuPG forwarding no longer break each other's
+  signing. The profile's GnuPG mirror was mounted read-write as `GNUPGHOME` in
+  every container, so keyboxd's socket lived in that shared directory: a
+  second session reused the first container's keyboxd, and once the first
+  session ended the others failed with `No Keybox daemon running` (the
+  mirrored `no-autostart` keeps gpg from starting a new one). Lock files were
+  shared the same way. The mirror is now mounted **read-only** at
+  `/home/coder/.gnupg-mirror` and `entrypoint.sh` copies it into a
+  `GNUPGHOME` on the container's own layer, links the forwarded agent socket
+  there and starts that container's keyboxd. **Needs the rebuilt image**
+  (`update` rebuilds it; `run` warns while the image is stale). SSH
+  forwarding was already safe: every session bind-mounts the same
+  `SSH_AUTH_SOCK` and the host agent serves them all. New
+  `tests/session-concurrency.test.sh` runs overlapping wrapper sessions with
+  both agents and a relay, the entrypoint seeding, and, with GnuPG >= 2.3 on
+  the host, the real keyboxd scenario.
 - `mcp` (`list`, `auth`, `logout`) and `plugin` (`list`, `check`) now run
   against the private server like `models`/`stats`. They were the only
   commands still using OpenCode's background service, which rewrites a legacy
