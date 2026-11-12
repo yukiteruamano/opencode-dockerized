@@ -67,6 +67,32 @@ for (const m of block ? block[1].matchAll(/^\s*"([^"]+)",/gm) : []) {
   check(`BALANCED_EXCLUDED_IDS: "${m[1]}" exists in the vendored sets`, allIds.has(m[1]));
 }
 
+// Injection-rule classification (guard v22): every vendored prompt-injection
+// rule must be listed in exactly one of SHELL_INJECTION_IDS (also scanned on
+// shell in balanced) or FETCH_ONLY_INJECTION_IDS (webfetch/websearch only in
+// balanced; strict applies everything everywhere). A vendored update that adds
+// a rule fails here until the rule is classified, and both sets must not name
+// stale ids.
+{
+  const setIds = (name) => {
+    const m = new RegExp(`const ${name} = new Set\\(\\[([\\s\\S]*?)\\]\\);`).exec(guardSource);
+    check(`${name} found in the guard`, Boolean(m));
+    return new Set([...(m ? m[1].matchAll(/^\s*"([^"]+)",/gm) : [])].map((x) => x[1]));
+  };
+  const shellIds = setIds("SHELL_INJECTION_IDS");
+  const fetchIds = setIds("FETCH_ONLY_INJECTION_IDS");
+  const injectionRules = rulesByFile["prompt-injection-patterns.json"] ?? [];
+  for (const rule of injectionRules) {
+    const inShell = shellIds.has(rule.id);
+    const inFetch = fetchIds.has(rule.id);
+    check(`injection rule "${rule.id}" is classified (shell or fetch-only, not both)`, inShell !== inFetch);
+  }
+  const ruleIds = new Set(injectionRules.map((r) => r.id));
+  for (const id of [...shellIds, ...fetchIds]) {
+    check(`injection classification: "${id}" exists in the vendored set`, ruleIds.has(id));
+  }
+}
+
 // ReDoS budget: adversarial strings at the scan cap, per rule.
 const unit = (s) => s.repeat(Math.ceil(CAP / s.length)).slice(0, CAP);
 const ADVERSARIAL = [

@@ -39,7 +39,7 @@ import {
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 
-const GUARD_VERSION_MARKER = "OPENCODE_DOCKERIZED_GUARD_VERSION=21";
+const GUARD_VERSION_MARKER = "OPENCODE_DOCKERIZED_GUARD_VERSION=22";
 const GUARD_VERSION = Number(GUARD_VERSION_MARKER.split("=")[1]);
 
 const POLICY_MODE = (
@@ -216,6 +216,95 @@ const BALANCED_EXCLUDED_IDS = new Set([
   // Kept in strict.
   "dos-yes",
   "dos-yes-pipe",
+  // `.env` readers without the boundary the builtin secret-path rule has:
+  // their `.*\.env\b` matches `process.env` / `import.meta.env` in searches
+  // and in written source. builtin:secret-path still denies any command that
+  // names a real `.env` file (boundary-anchored, `.env.example` excepted).
+  "cat-env",
+  "less-env",
+  "more-env",
+  "head-env",
+  "tail-env",
+  "grep-env",
+  // Python obfuscation heuristics that match idiomatic code — `re.compile(`,
+  // `getattr(obj, "name")`, `importlib.import_module`, `s[::-1]` — both when
+  // run and when written to a file. The targets they guard (secret paths, env
+  // dumps) keep their own rules and builtins.
+  "compile-builtin",
+  "getattr-module",
+  "importlib-import",
+  "reverse-string-trick",
+  // Any for/while loop containing `&` (including `&&`): `for t in tests/*; do
+  // bash "$t" && echo ok; done`. Real fork bombs are still caught by
+  // fork-bomb-1 and bounded by the always-on `--pids-limit`.
+  "fork-bomb-3",
+  "fork-bomb-4",
+  // Loader variables only affect container processes the agent can already
+  // run; there is no privilege boundary inside the sandbox to cross.
+  "ld-preload",
+  "ld-library-path",
+  // `xxd <file>` over project binaries (xxd stays a LEAK_VERB, so xxd over a
+  // secret path is still denied).
+  "xxd-exfil",
+  // `JSON.stringify` + `process` anywhere in one command (`process.argv`);
+  // the interpreter env-dump builtins cover `process.env` precisely.
+  "node-e-json",
+  // Waiting on a build or deploy; time-exfil-sleep is already dropped.
+  "sleep-long",
+  // The project lives under /home/coder in the container, so in-project
+  // `ln -s` matches `/home`; symlink-1 fires on ANY absolute target (the
+  // `ln -s /usr/bin/python3 .venv/...` idiom). Replaced in every mode by
+  // symlinkEscape() below, which resolves the target and denies links into
+  // $HOME outside the writable roots or into sensitive system trees.
+  "symlink-home",
+  "symlink-1",
+  // ANSI color output (`printf "\x1b[31m"`). Replaced by the
+  // hex-in-command-substitution rules in DENY_BASH, which only deny the form
+  // that assembles a hidden argument (`cat $(printf '\x2e\x65\x6e\x76')`).
+  "bypass-printf-hex",
+  "bypass-echo-hex",
+]);
+
+// Prompt-injection rules that match natural-language prose (role-play,
+// "ignore instructions", decode-and-run wording, trigger word + long
+// base64-ish token). On webfetch/websearch they scan text that comes from or
+// goes to the outside; on shell they would scan the agent's own command —
+// commit messages, grep patterns — where they only produce false positives
+// (`git commit -m "act as a fallback"`, `rg jailbreak docs/`, `npm run x`
+// followed by a 40-hex commit SHA). In balanced mode shell commands are only
+// scanned with the literal-payload rules below; strict keeps every rule for
+// every action. tests/policy-lint.test.mjs fails when a vendored injection
+// rule is missing from both sets, so a vendored update forces a decision.
+const SHELL_INJECTION_IDS = new Set([
+  "base64-import-os-literal",
+  "base64-os-environ-literal",
+  "base64-proc-self-environ",
+  "base64-run-secrets",
+]);
+const FETCH_ONLY_INJECTION_IDS = new Set([
+  "forget-en-1",
+  "forget-ru-1",
+  "ignore-en-1",
+  "system-tag-1",
+  "system-tag-2",
+  "system-tag-3",
+  "mode-switch-1",
+  "mode-switch-2",
+  "jailbreak-1",
+  "new-instructions-1",
+  "pretend-1",
+  "act-as-1",
+  "override-1",
+  "disregard-1",
+  "you-are-now-1",
+  "reset-1",
+  "reveal-1",
+  "show-prompt-1",
+  "bypass-1",
+  "base64-decode-exec-ru-1",
+  "base64-decode-exec-en-1",
+  "base64-payload-1",
+  "base64-payload-2",
 ]);
 
 const selectRules = (rules) => {
@@ -230,6 +319,12 @@ const UNSAFE_PATTERNS = selectRules(compile(loadRules("unsafe-tool-patterns.json
 const INJECTION_PATTERNS = selectRules(
   compile(loadRules("prompt-injection-patterns.json")),
 );
+// Shell commands in balanced mode are only scanned with the literal-payload
+// injection rules; strict applies the full set to shell too.
+const INJECTION_PATTERNS_SHELL =
+  POLICY_MODE === "strict"
+    ? INJECTION_PATTERNS
+    : INJECTION_PATTERNS.filter((rule) => SHELL_INJECTION_IDS.has(rule.id));
 const ALLOW_PATTERNS = compile(loadRules("allow-patterns.json"));
 
 // balanced/strict without their vendored sets would silently behave like "off".
@@ -615,6 +710,17 @@ const DENY_BASH = [
     ],
     { flags: "i" },
   ),
+  // printf/echo emitting `\xNN` bytes inside a command substitution or
+  // backticks assembles an argument the text scan cannot see
+  // (`cat $(printf '\x2e\x65\x6e\x76')` is `cat .env`). Plain hex output to
+  // stdout (ANSI colors, binary test fixtures) stays allowed — the vendored
+  // bypass-printf-hex/echo-hex rules fire on all of it, so balanced drops
+  // them in favor of these. Matched against the raw command only:
+  // normalizeShell strips the backslashes. `$'\x..'` ANSI-C quoting is
+  // already decoded by normalizeShell, so hidden names surface to the
+  // secret-path rules.
+  /\$\((?:[^()]|\([^()]*\))*?\b(?:printf|echo)\b[^()]*\\x[0-9a-fA-F]/i,
+  /`[^`]*\b(?:printf|echo)\b[^`]*\\x[0-9a-fA-F]/i,
   // GnuPG private material and secret-key export (defense in depth; the private
   // keys are never copied into the container anyway).
   /\bprivate-keys-v1\.d\b/,
@@ -1218,6 +1324,59 @@ const destructiveTarget = (normalized) => {
   return false;
 };
 
+// `ln -s` targets that reach outside the writable roots into the home
+// directory or a sensitive system tree. The `read` tool resolves symlinks
+// (deniedRead), but shell reads do not, so a link planted inside the project
+// could alias a secret directory for later reads. In-project symlinks and
+// links to read-only system trees (`ln -s /usr/bin/python3 .venv/bin/python`)
+// stay allowed: those trees are directly readable anyway, so a link adds
+// nothing. Replaces the vendored symlink-home/symlink-1 rules in balanced
+// (strict keeps them too); relative targets resolve against the project root
+// (a `cd` elsewhere first is a documented residual, like staged scripts).
+const SENSITIVE_LINK_RE = /^\/(?:etc|root|proc|sys|dev|run|var\/run)(?:\/|$)/;
+const symlinkEscape = (normalized, isInsideRoots, base) => {
+  for (const segment of normalized.split(/[;&|\n]+/)) {
+    const words = segment.trim().split(/\s+/).filter(Boolean);
+    while (words.length > 0 && WRAPPER_WORDS.has(words[0].replace(/^\\/, ""))) words.shift();
+    if (words.length === 0) continue;
+    if (words[0].replace(/^\\/, "").replace(/^.*\//, "") !== "ln") continue;
+    const args = words.slice(1);
+    const symbolic = args.some((a) => /^-[a-zA-Z]*s/.test(a) || a === "--symbolic");
+    if (!symbolic) continue;
+    const operands = [];
+    let intoDir = false;
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a === "-t" || a === "--target-directory") {
+        intoDir = true;
+        i++; // the link directory, not a target
+        continue;
+      }
+      if (a.startsWith("--target-directory=")) {
+        intoDir = true;
+        continue;
+      }
+      if (a === "-S" || a === "--suffix") {
+        i++;
+        continue;
+      }
+      if (!a.startsWith("-")) operands.push(a);
+    }
+    // Without -t the last operand is the link name (unless it is the only one).
+    const targets = intoDir || operands.length <= 1 ? operands : operands.slice(0, -1);
+    for (const target of targets) {
+      const expanded = target.replace(/^(?:~|\$HOME|\$\{HOME\})(?=\/|$)/, HOME_DIR);
+      const canon =
+        normalizeLexical(expanded.startsWith("/") ? expanded : base + "/" + expanded) || "/";
+      if (SENSITIVE_LINK_RE.test(canon)) return true;
+      if ((canon === HOME_DIR || canon.startsWith(HOME_DIR + "/")) && !isInsideRoots(canon)) {
+        return true;
+      }
+    }
+  }
+  return false;
+};
+
 // Network clients that can carry local data off the machine.
 const URL_EGRESS_VERBS = new Set(["curl", "wget"]);
 const SOCKET_EGRESS_VERBS = new Set(["nc", "ncat", "netcat", "socat", "telnet"]);
@@ -1591,7 +1750,7 @@ export default {
       }
       if (
         INJECTION_ACTIONS.has(action) &&
-        scanValues(event, resources, INJECTION_PATTERNS)
+        scanValues(event, resources, shell ? INJECTION_PATTERNS_SHELL : INJECTION_PATTERNS)
       ) {
         return;
       }
@@ -1628,6 +1787,10 @@ export default {
         }
         if (destructiveTarget(normalized)) {
           deny("builtin:destructive-target", message);
+          return;
+        }
+        if (symlinkEscape(normalized, isInsideRoots, roots[0] ?? "/tmp/opencode")) {
+          deny("builtin:symlink-escape", message);
           return;
         }
         if (egressLeak(normalized)) {

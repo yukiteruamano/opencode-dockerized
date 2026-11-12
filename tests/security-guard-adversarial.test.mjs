@@ -467,11 +467,21 @@ for (const mode of ["balanced", "strict", "off"]) {
       check(`[${mode}] ${value.length}-char input evaluated in ${ms} ms (budget 500)`, ms < 500);
     }
     check(`[${mode}] oversized command is refused`, evaluate("bash", "echo " + "a".repeat(100000)) === "deny");
-    // The rewritten linear pattern must still catch a real payload + exec word.
-    const payload = evaluate.raw("bash", ["note aGVsbG8gd29ybGQgdGhpcyBpcyBhIGxvbmcgYmFzZTY0IHBheWxvYWQ= then run it"]);
+    // The rewritten linear pattern must still catch a real payload + exec
+    // word. In balanced the prose/payload injection rules are fetch-only
+    // (commit prose and 40-hex SHAs after "run" are everyday shell text), so
+    // the shell form is only denied in strict; webfetch is denied in both.
+    const payloadValue = "note aGVsbG8gd29ybGQgdGhpcyBpcyBhIGxvbmcgYmFzZTY0IHBheWxvYWQ= then run it";
+    const payloadShell = evaluate.raw("bash", [payloadValue]);
     check(
-      `[${mode}] base64 payload + exec word still detected (${payload.message})`,
-      payload.effect === "deny" && (mode === "strict" || /base64-payload-2/.test(payload.message || "")),
+      `[${mode}] base64 payload + exec word on shell is ${mode === "strict" ? "denied" : "fetch-only"} (${payloadShell.message})`,
+      mode === "strict" ? payloadShell.effect === "deny" : payloadShell.effect !== "deny",
+    );
+    const payloadFetch = evaluate.raw("webfetch", [payloadValue]);
+    check(
+      `[${mode}] base64 payload + exec word still detected on webfetch (${payloadFetch.message})`,
+      payloadFetch.effect === "deny" &&
+        (mode === "strict" || /base64-payload-2/.test(payloadFetch.message || "")),
     );
   }
 }
