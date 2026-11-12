@@ -61,7 +61,8 @@ Everything below is on top of what upstream provides.
 - **Catppuccin theme** (and variants) via inline CLI config.
 - **Global install + aliases guaranteed** - `install.sh` puts `<install>/bin` on `PATH` (no symlink/stub/copy in `~/.local/bin`, legacy symlink auto-removed), ensures `PATH` in bash/zsh, and verifies/repairs the `ocd`, `ocd-run`, `ocd-auth` aliases, which point at the command on `PATH` rather than an absolute repo path (immune to repo moves; `sync --check` watches PATH health).
 - **Non-interactive setup** (`--yes`, `--only`, `NO_COLOR`, multiline redacted `DRY_RUN`) and private-server readiness for `models`/`stats`/`exec`/`debug`.
-- **Git worktree support**, container resource limits, drift hints in `config show`, and a contract test suite (`bash` + `node`) covering mounts, permissions, policies and sync.
+- **Multi-account profiles** (`--profile NAME`, `profile create|list|remove`) - each profile keeps its own config (even a different `security_policy`), secrets file and OpenCode auth/sessions, isolated from the others.
+- **Git worktree support**, container resource limits, drift hints in `config show`, and a contract test suite (`bash` + `node`) covering mounts, permissions, policies, profiles, every command's surface and sync.
 
 ## 📋 Prerequisites
 
@@ -225,9 +226,10 @@ sudo cp /path/to/opencode-dockerized/completions/zsh.sh /usr/local/share/zsh/sit
 ```
 
 After installation, you'll get:
-- Command completion (`run`, `build`, `update`, `version`, `auth`, `models`, `exec`, `mcp`, `plugin`, `stats`, `debug`, `doctor`, `config`, `clean`, `help`)
-- Subcommand completion for `config` (`show`, `edit`, `path`)
-- Directory completion for the `run` command
+- Command completion (`run`, `auth`, `models`, `exec`, `mcp`, `plugin`, `stats`, `debug`, `doctor`, `install`, `upgrade`, `build`, `update`, `rollback`, `uninstall`, `version`, `config`, `profile`, `clean`, `help`)
+- Subcommand completion for `config` (`show`, `edit`, `path`, `init`, `sync`, `opencode`) and `profile` (`list`, `current`, `path`, `create`, `remove`)
+- Profile-name completion for `--profile`, and flag completion for `install`, `update`/`upgrade` and `stats`
+- Directory completion for the `run` and `models` commands
 - Helpful descriptions for each command
 - Works with the `opencode-dockerized` command on PATH and the `ocd` alias
 
@@ -255,6 +257,7 @@ opencode-dockerized version        # Show wrapper (git describe), guard and Open
 opencode-dockerized config show    # Show parsed configuration
 opencode-dockerized config edit    # Edit wrapper config in $EDITOR
 opencode-dockerized config path    # Print wrapper config file path
+opencode-dockerized config init    # Create the config from the template if missing (non-interactive)
 opencode-dockerized config sync [--check]  # Refresh security layer (guard/policies) from repo
 opencode-dockerized config opencode path   # Print OpenCode config path
 opencode-dockerized config opencode edit   # Edit OpenCode config (MCP, models)
@@ -438,7 +441,7 @@ settings there across restarts).
 
 ### Custom Global Configuration (Optional)
 
-**Advanced Users:** You can configure custom volume mounts and environment variables to be automatically mounted in the container for all projects. This is useful for:
+**Advanced Users:** You can configure custom volume mounts and a secrets file to be applied automatically to the container for all projects. This is useful for:
 
 - **SSH agent forwarding**: Enable `setting.ssh_agent_support=true` for secure git over SSH (recommended). Forwards only the host `SSH_AUTH_SOCK` and mounts `~/.ssh/config` + `known_hosts` read-only; private keys are never mounted.
 - **GnuPG agent forwarding**: Enable `setting.gpg_agent_support=true` to sign commits (`git commit -S`) with the keys held by your host gpg-agent (private keys never enter the container; the restricted agent socket is preferred). Run `opencode-dockerized doctor` to verify the socket and keyring from inside the container.
@@ -450,7 +453,8 @@ settings there across restarts).
 #### Getting Started with Custom Global Config
 
 ```bash
-# During install, you'll be prompted to add custom mounts and env vars
+# During install, you'll be prompted to add custom mounts and secrets
+# (written to the env file without echoing their values)
 ./install.sh
 
 # Or manually edit the config file
@@ -468,6 +472,11 @@ setting.ssh_agent_support=true
 setting.gpg_agent_support=true
 setting.gpg_allow_main_socket=false
 setting.gpg_autostart_agent=true
+setting.gpg_relay=true
+setting.docker_socket=false
+setting.security_policy=balanced
+setting.network=host
+setting.mount_npmrc=false
 setting.memory=4g
 setting.cpus=2
 setting.pids_limit=4096
@@ -697,11 +706,12 @@ opencode-dockerized build
 # Check Docker is running
 docker info
 
-# View container logs
-docker logs opencode-dockerized
+# List wrapper containers (names are opencode-[<profile>-]<project>-<suffix>)
+docker ps -a --filter label=opencode-dockerized=1
 
-# Remove and rebuild
-docker rm -f opencode-dockerized
+# View a container's logs / remove it, then rebuild
+docker logs <container-name>
+docker rm -f <container-name>
 opencode-dockerized build
 ```
 
@@ -724,7 +734,7 @@ opencode-dockerized update
 
 ### User Scripts
 
-- **`bin/opencode-dockerized`** - Main wrapper, no extension (build, run, auth, install, upgrade, update, version, config, clean, help). Reached via `<install>/bin` on `PATH`; `bin/` holds only this binary
+- **`bin/opencode-dockerized`** - Main wrapper, no extension (run, auth, models, exec, mcp, plugin, stats, debug, doctor, install, upgrade, build, update, rollback, uninstall, version, config, profile, clean, help; global `--profile`). Reached via `<install>/bin` on `PATH`; `bin/` holds only this binary
 - **`install.sh`** - Curl-able bootstrap (runs the local `bin/opencode-dockerized install`, or clones to `~/.local/share/opencode-dockerized` first; full setup in one shot)
 - **`run-simple.sh`** - Simplified runner script (delegates to `opencode-dockerized run`)
 - **`opencode-dockerized.sh`, `setup.sh`** - Deprecated compat shims (forward to `bin/`)
@@ -732,6 +742,7 @@ opencode-dockerized update
 ### Shared Modules
 
 - **`lib/config-lib.sh`** - Shared configuration library (sourced by other scripts, handles mounts and env vars)
+- **`lib/install-lib.sh`** - Install wizard library (sourced by the wrapper's `install` command)
 
 ### Security Layer
 
@@ -742,7 +753,8 @@ opencode-dockerized update
 
 ### Tests
 
-- **`tests/security-guard.test.mjs`** - Policy regression tests (`node tests/security-guard.test.mjs`)
+- **`tests/*.test.mjs`** - Guard regression, adversarial-bypass and policy-lint tests (`node tests/<name>.test.mjs`, shared harness in `tests/guard-harness.mjs`)
+- **`tests/*.test.sh`** - Wrapper contract tests against a throw-away HOME and a stub docker: run/update/install/doctor flows, config hardening, profiles (`profile-flow`), the whole command surface (`commands-smoke`), completions and Dockerfile lint
 
 ### Shell Completion (`completions/`)
 

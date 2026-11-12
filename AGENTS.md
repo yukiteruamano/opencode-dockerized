@@ -16,7 +16,7 @@ Shell script-based Docker wrapper for running [OpenCode](https://opencode.ai) in
 - `plugins/security-guard.js` — Versioned OpenCode V2 hooks (source of truth; copied into the user config by `lib/config-lib.sh`)
 - `policies/` — Vendored `opencode-policy` pattern sets + local `allow-patterns.json` (see `policies/README.md`)
 - `tests/security-guard.test.mjs`, `tests/security-guard-adversarial.test.mjs`, `tests/policy-lint.test.mjs` — Guard regression, bypass and rule-set tests (shared harness in `tests/guard-harness.mjs`)
-- `tests/*.test.sh` — Wrapper contract tests against a throw-away HOME, a local git origin and a stub `docker` (`tests/config-hardening.test.sh` covers the mount/project/worktree/env_file/GPG-mirror refusals). Test-only command overrides (`GPG_AGENT_PROBE_CMD`, `GPG_AGENT_LAUNCH_CMD`, `GPG_RELAY_CMD`) are honoured only with `OPENCODE_DOCKERIZED_TEST_HOOKS=1`
+- `tests/*.test.sh` — Wrapper contract tests against a throw-away HOME, a local git origin and a stub `docker` (`tests/config-hardening.test.sh` covers the mount/project/worktree/env_file/GPG-mirror refusals; `tests/profile-flow.test.sh` the multi-account profiles; `tests/commands-smoke.test.sh` every command's happy path, refusals and help drift). Test-only command overrides (`GPG_AGENT_PROBE_CMD`, `GPG_AGENT_LAUNCH_CMD`, `GPG_RELAY_CMD`) are honoured only with `OPENCODE_DOCKERIZED_TEST_HOOKS=1`
 - `scripts/` — `check-version-bumps.sh` (CI) and `pins-report.sh`
 - `SECURITY.md`, `CONTRIBUTING.md` — Security model and contribution guide
 - `config.example` — Example user config (INI-style), in `examples/`
@@ -59,7 +59,7 @@ cat Dockerfile | docker run --rm -i hadolint/hadolint:latest hadolint -   # Lint
 node --check plugins/security-guard.js  # Syntax-check the V2 hooks
 node tests/security-guard.test.mjs      # Security-policy regression tests (Node 22+)
 bash tests/wrapper-args.test.sh         # Wrapper mount/env contract test (no Docker)
-for t in tests/*.test.sh; do bash "$t"; done    # all wrapper tests (update, install, run, doctor, completions, Dockerfile lint…)
+for t in tests/*.test.sh; do bash "$t"; done    # all wrapper tests (update, install, run, doctor, profiles, command smoke, completions, Dockerfile lint…)
 for t in tests/*.test.mjs; do node "$t"; done   # guard, adversarial and policy-lint tests
 scripts/pins-report.sh                  # Which pinned Dockerfile inputs have a newer release
 
@@ -254,8 +254,8 @@ re-invoking `config sync` + `config init` under the new profile. Contract test:
 - Self-update/install trust: `OCD_VERIFY_SIGNATURES=true` verifies the target commit (or signed tag) **before** HEAD moves (`commit_signature_trusted` in the wrapper, `signature_rejected` in `install.sh`); `OCD_SIGNING_FINGERPRINTS` (space-separated) pins the accepted keys (`%G?` G or U plus `%GF`/`%GP` in the list)
 - `update` flags incoming host-executed code (`bin/`, `lib/`, `install.sh`, `scripts/`, `completions/`) and asks before pulling it on a TTY (`--yes` skips); `upgrade` always asks on a TTY
 - rc-file lines are only written for install paths without `$`, backtick, `"`, `\` or newline (`rc_safe_path`); PATH and completion lines live in `# >>> opencode-dockerized … >>>` blocks that a re-install replaces
-- Custom user mounts default to read-only. Host paths must be absolute or `~/…` and are canonicalized (`readlink -f`); a mount that is, contains or sits under `~/.ssh`, `~/.gnupg`, `$CONFIG_DIR`, `$OCODE_HOME`, `~/.claude`, a Docker socket, `/` or `$HOME` is refused, as is a container path under `/home/coder/.config/opencode`, `.ssh` or `.gnupg` (`validate_custom_mount`)
-- The project directory gets the same treatment (`validate_project_dir`, compared against the literal and the resolved `$HOME`): `$HOME`, `/`, and anything overlapping `~/.ssh`, `~/.gnupg`, `~/.config`, `$CONFIG_DIR`, `$OCODE_HOME`, `~/.claude` or a Docker socket are refused
+- Custom user mounts default to read-only. Host paths must be absolute or `~/…` and are canonicalized (`readlink -f`); a mount that is, contains or sits under `~/.ssh`, `~/.gnupg`, `$CONFIG_DIR`, `$OCODE_HOME`, the profiles base (`$OCD_PROFILES_BASE`, i.e. every profile's state), `~/.claude`, a Docker socket, `/` or `$HOME` is refused, as is a container path under `/home/coder/.config/opencode`, `.ssh` or `.gnupg` (`validate_custom_mount`)
+- The project directory gets the same treatment (`validate_project_dir`, compared against the literal and the resolved `$HOME`): `$HOME`, `/`, and anything overlapping `~/.ssh`, `~/.gnupg`, `~/.config`, `$CONFIG_DIR`, `$OCODE_HOME`, the profiles base, `~/.claude` or a Docker socket are refused
 - A git worktree's shared `.git` dir is mounted only when the project's `.git` file points at `<common>/worktrees/<name>` and that entry's `gitdir` points back at the project (the `.git` file is container-writable)
 - Refreshing a customized, outdated `opencode.json` merges JSON with `node` (or `python3`); if neither is available or the merge fails, the run is blocked (fail closed) and the user file is left untouched
 - Only pass environment variables explicitly listed in config
@@ -277,4 +277,4 @@ re-invoking `config sync` + `config init` under the new profile. Contract test:
 | `~/.config/opencode-dockerized/home/.gnupg/` | `/home/coder/.gnupg/` | rw (opt-in) | Mirrored **public** GnuPG material (pubring/trustdb/gpg.conf) + agent socket, only when `setting.gpg_agent_support=true`; `private-keys-v1.d/` is never copied |
 | `/var/run/docker.sock` | `/var/run/docker.sock` | rw (opt-in) | Docker socket, only when `setting.docker_socket=true` |
 
-The wrapper's own directory (`~/.config/opencode-dockerized/`) is **never** mounted. Its `opencode.json` (sandbox permissions) is read on the host and passed inline via `OPENCODE_CONFIG_CONTENT`; its `AGENTS.md`, guard and policies are sourced from there and mirrored into the config tree.
+The wrapper's own directory (`~/.config/opencode-dockerized/`) is **never** mounted. Its `opencode.json` (sandbox permissions) is read on the host and passed inline via `OPENCODE_CONFIG_CONTENT`; its `AGENTS.md`, guard and policies are sourced from there and mirrored into the config tree. With `--profile NAME`, every `home/...` path above comes from `profiles/NAME/home/...` instead, and the same never-mounted rule covers the whole profiles base.

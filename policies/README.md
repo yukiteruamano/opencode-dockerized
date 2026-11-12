@@ -35,7 +35,11 @@ patches and the patch list; `SHA256SUMS` pins the current files and is checked b
 
 To refresh the rules, replace the JSON files here (keeping the
 `[{ "id", "pattern", "reason", "flags"? }]` shape) and bump `VERSION` (a plain
-integer). `lib/config-lib.sh` compares it with the installed copy under
+integer). Every `prompt-injection-patterns.json` rule must also be classified
+in `plugins/security-guard.js` (`SHELL_INJECTION_IDS` vs
+`FETCH_ONLY_INJECTION_IDS` — whether balanced mode scans shell commands with it
+or only webfetch/websearch text); `tests/policy-lint.test.mjs` fails until a
+new rule is classified. `lib/config-lib.sh` compares it with the installed copy under
 `~/.config/opencode-dockerized/plugins/policies/` and refreshes the rule files
 (backing up the previous ones) whenever the version changes or a file is missing.
 Deleting the installed copies still re-seeds them on the next run.

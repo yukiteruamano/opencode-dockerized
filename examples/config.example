@@ -9,11 +9,10 @@
 # Format:
 #   setting.<name>=<value>                           # Settings (true/false)
 #   mount.<name>=<host_path>:<container_path>[:<mode>]  # Volume mounts
-#   env.<name>=<VARIABLE_NAME>                       # Environment variables
 #
 # Modes: "ro" (read-only, default) or "rw" (read-write)
 # Paths: Use ~ for home directory (expanded at runtime)
-# Vars: Must be uppercase with underscores, set in host environment
+# Secrets: there is NO env.* passthrough; they go in setting.env_file (below).
 # Values are taken verbatim: do NOT append inline comments after a value
 # (e.g. `setting.memory=4g # limit` passes "4g # limit" to docker).
 

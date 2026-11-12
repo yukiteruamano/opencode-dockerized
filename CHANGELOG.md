@@ -21,6 +21,23 @@ the guard (`OPENCODE_DOCKERIZED_GUARD_VERSION`) and the policy set
 - Container names and the `OPENCODE_DOCKERIZED_PROFILE` indicator carry the
   profile; `config show` and `doctor` print it.
 
+### Command surface and documentation sync
+- New `tests/commands-smoke.test.sh`: every command's happy path, its
+  documented refusals (`mcp add`, `plugin add/remove`, extra `run` args,
+  invalid profile names, unconfirmed `profile remove`) and help drift are
+  exercised against a stub docker; `tests/completions.test.sh` now covers
+  `profile <TAB>`, `config init` and `--profile <TAB>` profile-name completion.
+- `profile create` seeds the config template before syncing the security
+  layer, so the first sync no longer warns about a missing config.
+- Documentation synced with behavior: the removed `env.*` passthrough no
+  longer appears as a config format, the completion feature list, command
+  lists, file reference and troubleshooting names match the real commands and
+  container names, and `policies/README.md` documents the mandatory
+  classification of new vendored injection rules.
+- `tests/policy-lint.test.mjs` timing budgets re-measure (min of three) only
+  when over budget, so scheduler noise on a loaded host no longer flakes the
+  suite while real quadratic blowups still fail (guard v21 already flaked).
+
 ### Guard (v22) — balanced mode stops flagging everyday development
 - Verified false positives dropped from `balanced` (kept in `strict`):
   `.env` reader rules without a word boundary (matched `process.env`), Python
