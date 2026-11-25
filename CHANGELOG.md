@@ -4,7 +4,7 @@ All notable changes to opencode-dockerized. Versions follow `WRAPPER_VERSION`;
 the guard (`OPENCODE_DOCKERIZED_GUARD_VERSION`) and the policy set
 (`policies/VERSION`) carry their own counters.
 
-## Unreleased
+## 0.17.0 (2026-11-25) — session summary on run
 
 ### Changed
 - `run` prints an aligned session summary after building the docker
