@@ -449,7 +449,7 @@ The security layer is activated through environment variables the wrapper inject
 
 | Variable | Value | Purpose |
 |----------|-------|---------|
-| `OPENCODE_CONFIG_CONTENT` | inline JSON | Injects the sandbox permission rules (merged like a config document) |
+| `OPENCODE_CONFIG_CONTENT` | inline JSON | Injects the sandbox permission rules (merged like a config document) and `"automations": false`, so scheduled prompts and shell commands are not stored and replayed in later sessions (set `"automations": true` in the profile's `opencode.json` to opt in) |
 | `OPENCODE_DOCKERIZED_POLICY` | `strict` \| `balanced` \| `off` | Selects which `opencode-policy` pattern sets the security hook enforces (from `setting.security_policy`) |
 | `OPENCODE_DISABLE_AUTOUPDATE` | `true` | Always set: prevents OpenCode from self-updating inside the container |
 

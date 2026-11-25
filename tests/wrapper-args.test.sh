@@ -866,10 +866,18 @@ grep -q 'private-keys-v1.d' "$CONFIG_DIR/opencode.json" ||
     fail "merge must restore current markers"
 grep -q 'overrode' <<<"$sync_out" ||
     fail "merge must report overridden rules"
+grep -qF -- '"automations": false' "$CONFIG_DIR/opencode.json" ||
+    fail "merge must add \"automations\": false to a file created before OpenCode 2.4"
 if command -v node >/dev/null 2>&1; then
     node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$CONFIG_DIR/opencode.json" ||
         fail "merged opencode.json must be valid JSON"
 fi
+
+# Merge keeps a user's own "automations" opt-in instead of the template default.
+printf '{\n  "automations": true,\n  "permissions": [ { "action": "shell", "resource": "mine", "effect": "ask" } ]\n}\n' >"$CONFIG_DIR/opencode.json"
+sync_security_layer >/dev/null 2>&1 || fail "sync with an automations opt-in must succeed"
+grep -qF -- '"automations": true' "$CONFIG_DIR/opencode.json" ||
+    fail "merge must keep the user's \"automations\" value"
 
 # Merge preserves multi-line hand-written rules verbatim (interior commas kept).
 printf '{\n  "permissions": [\n    {\n      "action": "shell",\n      "resource": "longcmd*",\n      "effect": "ask"\n    }\n  ]\n}\n' >"$CONFIG_DIR/opencode.json"

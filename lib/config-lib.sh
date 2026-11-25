@@ -808,8 +808,9 @@ ensure_opencode_dockerized_config() {
     # ordered array). Existing V1-style files are treated as outdated and
     # migrated (with a backup) so every install uses the native V2 shape.
     # The `private-keys-v1.d` / `id_ed25519` markers refresh installs created
-    # before those deny rules were added.
-    if [ ! -f "$CONFIG_DIR/opencode.json" ] || ! grep -q '"permissions"' "$CONFIG_DIR/opencode.json" 2>/dev/null || ! grep -q 'private-keys-v1.d' "$CONFIG_DIR/opencode.json" 2>/dev/null || ! grep -q 'id_ed25519' "$CONFIG_DIR/opencode.json" 2>/dev/null; then
+    # before those deny rules were added, and `"automations"` those created
+    # before OpenCode 2.4 (the merge adds the key but keeps a user's own value).
+    if [ ! -f "$CONFIG_DIR/opencode.json" ] || ! grep -q '"permissions"' "$CONFIG_DIR/opencode.json" 2>/dev/null || ! grep -q 'private-keys-v1.d' "$CONFIG_DIR/opencode.json" 2>/dev/null || ! grep -q 'id_ed25519' "$CONFIG_DIR/opencode.json" 2>/dev/null || ! grep -q '"automations"' "$CONFIG_DIR/opencode.json" 2>/dev/null; then
         local had_file=false template_tmp merged_tmp
         if [ -f "$CONFIG_DIR/opencode.json" ]; then
             had_file=true
@@ -826,9 +827,13 @@ ensure_opencode_dockerized_config() {
             config_error "Could not write the sandbox permissions in $CONFIG_DIR"
             return 1
         }
+        # "automations": false — OpenCode 2.4 automations store prompts and
+        # shell commands in the (read-write) data dir and replay them on a timer
+        # in later sessions, outside the turn that created them.
         cat >"$template_tmp" <<'EOF'
 {
   "$schema": "https://opencode.ai/config.json",
+  "automations": false,
   "permissions": [
     { "action": "shell", "resource": "*", "effect": "allow" },
     { "action": "shell", "resource": "sudo", "effect": "deny" },

@@ -115,11 +115,16 @@ the guard (`OPENCODE_DOCKERIZED_GUARD_VERSION`) and the policy set
   `printf`/`echo` hex escapes are denied only inside a command substitution
   (ANSI color output stays allowed).
 
-### Dependencies
+### Dependencies and OpenCode 2.4
 - Image pins refreshed: debian trixie-slim digest, Node 24.22.3 (security
   release; the image stays on the 24.x LTS line), OpenCode 2.4.1, pnpm 12.23.0,
   nvm v0.41.0, uv 0.13.10 (installer hashes re-pinned after reviewing each
   upstream diff), docker-ce-cli 29.9.3, buildx 0.39.1, compose 5.8.0.
+- OpenCode 2.4 automations are off by default: the generated `opencode.json`
+  sets `"automations": false`, because automations store prompts and shell
+  commands in the read-write data dir and replay them in later sessions. Set
+  `"automations": true` in the profile's `opencode.json` to opt in; the
+  template merge keeps that value. Existing files are refreshed once.
 - CI runs the guard tests on Node 26 as well.
 
 ## Unreleased — security audit fixes
