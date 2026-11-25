@@ -115,6 +115,13 @@ the guard (`OPENCODE_DOCKERIZED_GUARD_VERSION`) and the policy set
   `printf`/`echo` hex escapes are denied only inside a command substitution
   (ANSI color output stays allowed).
 
+### Dependencies
+- Image pins refreshed: debian trixie-slim digest, Node 24.22.3 (security
+  release; the image stays on the 24.x LTS line), OpenCode 2.4.1, pnpm 12.23.0,
+  nvm v0.41.0, uv 0.13.10 (installer hashes re-pinned after reviewing each
+  upstream diff), docker-ce-cli 29.9.3, buildx 0.39.1, compose 5.8.0.
+- CI runs the guard tests on Node 26 as well.
+
 ## Unreleased — security audit fixes
 
 ### Guard (v21)

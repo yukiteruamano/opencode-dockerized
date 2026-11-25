@@ -2,7 +2,7 @@
 # rebuilt/moved tag cannot change the image under us. To refresh: resolve the new
 # digest of debian:trixie-slim (docker buildx imagetools inspect) and update it.
 # Note: We only install Docker CLI to use host's Docker daemon via mounted socket
-FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
+FROM debian:trixie-slim@sha256:8aa5a7bf5a1955bddbe7d74fcdd0b91ab30e74362a8b73af672b0481b35b44a0
 
 # Fail fast inside RUN pipelines (curl | sh, | tee, …)
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -11,22 +11,22 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # remote installers are downloaded to a file, verified against a pinned sha256 and
 # only then run. When an installer changes upstream the build stops on purpose:
 # review the new script, then bump the matching *_SHA256.
-ARG NVM_VERSION=v0.40.8
-ARG NVM_INSTALL_SHA256=48a0eee9a60e07422dce0eb5774754c83889570ca1ee2566c516acbe8af03a9e
+ARG NVM_VERSION=v0.41.0
+ARG NVM_INSTALL_SHA256=045932fe05f0d4247c946f2ec0ec4026dbfd8ce88a5f67ea28d8ea833227f48b
 # Node.js LTS ("Krypton", 24.x) installed through nvm
-ARG NODE_VERSION=24.22.2
-ARG UV_VERSION=0.13.6
-ARG UV_INSTALL_SHA256=f7a56e7afaec49a3bcbc3ac3cdbe917e7c6ce30e0d815308a12e531aa5ef23b7
-ARG PNPM_VERSION=12.16.1
-ARG PNPM_INSTALL_SHA256=53d3ad6ef67d49d6951f3326bd3180e5c504c8f695bcdf73bb61ec7a4d4c9407
+ARG NODE_VERSION=24.22.3
+ARG UV_VERSION=0.13.10
+ARG UV_INSTALL_SHA256=51781aafe6950cc659f79873e1bdca55fbb9da6e0ef650bf98093a0f0aaaf453
+ARG PNPM_VERSION=12.23.0
+ARG PNPM_INSTALL_SHA256=1bf54cf5560709ca7bd09e0676ffa6ce3ddd3db843258cbf74e67a72b783a846
 # OpenCode CLI release. `opencode-dockerized update` resolves the newest release
 # from the npm registry and passes it here; a plain build uses this pin.
-ARG OPENCODE_VERSION=2.2.5
+ARG OPENCODE_VERSION=2.4.1
 # Docker CLI packages from Docker's apt repository (versions exist for amd64 and
 # arm64 alike) and the fingerprint the repository key must have.
-ARG DOCKER_CLI_VERSION=5:29.9.2-1~debian.13~trixie
-ARG DOCKER_BUILDX_VERSION=0.38.1-1~debian.13~trixie
-ARG DOCKER_COMPOSE_VERSION=5.6.1-1~debian.13~trixie
+ARG DOCKER_CLI_VERSION=5:29.9.3-1~debian.13~trixie
+ARG DOCKER_BUILDX_VERSION=0.39.1-1~debian.13~trixie
+ARG DOCKER_COMPOSE_VERSION=5.8.0-1~debian.13~trixie
 ARG DOCKER_GPG_FINGERPRINT=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
 # Changing this value invalidates every layer below it. The wrapper passes the ISO
 # week on `update`, so system packages and the toolchain are refreshed at most
