@@ -173,17 +173,20 @@ WORKDIR /
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # Provenance labels (last, so changing them never invalidates the layers above).
-# The wrapper passes GIT_SHA, DOCKERFILE_SHA256 and BUILD_DATE; it reads the
-# hash back to warn when the image is older than the checkout. Despite the
-# name, DOCKERFILE_SHA256 covers every build input: the sha256 of Dockerfile
-# followed by entrypoint.sh (concatenated in that order).
+# The wrapper passes GIT_SHA, DOCKERFILE_SHA256, BUILD_DATE and WRAPPER_VERSION
+# (shown in the session summary); it reads the hash back to warn when the
+# image is older than the checkout. Despite the name, DOCKERFILE_SHA256 covers
+# every build input: the sha256 of Dockerfile followed by entrypoint.sh
+# (concatenated in that order).
 ARG GIT_SHA=unknown
 ARG DOCKERFILE_SHA256=unknown
 ARG BUILD_DATE=unknown
+ARG WRAPPER_VERSION=unknown
 LABEL org.opencontainers.image.title="opencode-dockerized" \
       org.opencontainers.image.source="https://github.com/yukiteruamano/opencode-dockerized" \
       org.opencontainers.image.revision="${GIT_SHA}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
+      dev.opencode-dockerized.version="${WRAPPER_VERSION}" \
       dev.opencode-dockerized.opencode-version="${OPENCODE_VERSION}" \
       dev.opencode-dockerized.dockerfile-sha256="${DOCKERFILE_SHA256}"
 

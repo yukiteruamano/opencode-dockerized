@@ -56,7 +56,8 @@ if grep -qF '!seen' "$DOCKERFILE"; then fail "the fingerprint must not be taken 
 
 # Provenance labels, so the wrapper can detect drift between checkout and image.
 for label in org.opencontainers.image.source org.opencontainers.image.revision \
-    dev.opencode-dockerized.opencode-version dev.opencode-dockerized.dockerfile-sha256; do
+    dev.opencode-dockerized.version dev.opencode-dockerized.opencode-version \
+    dev.opencode-dockerized.dockerfile-sha256; do
     grep -q "$label" "$DOCKERFILE" || fail "missing image label $label"
 done
 

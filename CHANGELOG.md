@@ -4,6 +4,20 @@ All notable changes to opencode-dockerized. Versions follow `WRAPPER_VERSION`;
 the guard (`OPENCODE_DOCKERIZED_GUARD_VERSION`) and the policy set
 (`policies/VERSION`) carry their own counters.
 
+## Unreleased
+
+### Changed
+- `run` prints an aligned session summary after building the docker
+  arguments, so it shows the effective (validated) settings: project,
+  container (image release, OpenCode and guard version), profile, sandbox
+  (network, policy), git (repo, worktree), forwarding (ssh-agent, gpg-agent,
+  docker-socket as on/off/unavailable), resources (memory, cpus, pids) and
+  state (custom mounts, env file, websearch, theme). It replaces the old
+  `Project directory:` / `Container name:` lines.
+- New image label `dev.opencode-dockerized.version` (the wrapper release the
+  image was built by), passed as the `WRAPPER_VERSION` build arg. Images built
+  before it show their short commit in the summary; rebuild to get the release.
+
 ## 0.16.0 (2026-11-25) — profile layout, multi-account profiles and balanced-mode false positives
 
 ### Layout change (migrated automatically)

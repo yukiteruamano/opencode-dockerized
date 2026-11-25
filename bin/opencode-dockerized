@@ -436,6 +436,7 @@ build_image_with_args() {
         --build-arg "GIT_SHA=${git_sha:-unknown}"
         --build-arg "DOCKERFILE_SHA256=${dockerfile_sha:-unknown}"
         --build-arg "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        --build-arg "WRAPPER_VERSION=$WRAPPER_VERSION"
     )
     docker build "${build_args[@]}" ${extra[@]+"${extra[@]}"} -t "$IMAGE_NAME" "$REPO_ROOT" || return 1
     tag_image_versions
@@ -615,6 +616,85 @@ check_run_args() {
     exit 1
 }
 
+# Read one label of the image; prints "" when the image or label is missing.
+# Usage: image_label NAME
+image_label() {
+    local value
+    value=$(docker image inspect --format "{{ index .Config.Labels \"$1\" }}" "$IMAGE_NAME" 2>/dev/null || true)
+    [ "$value" = "<no value>" ] && value=""
+    printf '%s' "$value"
+}
+
+# Image identity for the summary: the wrapper release it was built by, else
+# its short commit (images built before that label existed), else "unknown".
+image_version() {
+    local version revision
+    version=$(image_label dev.opencode-dockerized.version)
+    if [ -n "$version" ] && [ "$version" != unknown ]; then
+        printf '%s' "$version"
+        return 0
+    fi
+    revision=$(image_label org.opencontainers.image.revision)
+    if [ -n "$revision" ] && [ "$revision" != unknown ]; then
+        printf '%s' "${revision:0:12}"
+        return 0
+    fi
+    printf 'unknown'
+}
+
+# Guard version the container loads: the copy mirrored into the config tree.
+installed_guard_version() {
+    local marker
+    marker=$(grep -oE 'OPENCODE_DOCKERIZED_GUARD_VERSION=[0-9]+' \
+        "$OCODE_HOME/.config/opencode/plugins/security-guard.js" 2>/dev/null | head -n 1)
+    printf '%s' "${marker#*=}"
+}
+
+# State of a forwarded agent: on (forwarded), off (disabled) or unavailable
+# (enabled, but the host had no usable socket; the builders already warned).
+# Usage: forwarding_state ENABLED SOCKET
+forwarding_state() {
+    if [ "$1" != true ]; then
+        printf 'off'
+    elif [ -n "$2" ] && [ -S "$2" ]; then
+        printf 'on'
+    else
+        printf 'unavailable'
+    fi
+}
+
+# One aligned "Label: value" line of the session summary.
+# Usage: summary_line LABEL VALUE
+summary_line() {
+    print_info "$(printf '%-12s%s' "$1:" "$2")"
+}
+
+# Print the effective session setup (identity, sandbox, git, forwarding,
+# resources, state). Called after the docker-arg builders, so the values are
+# the validated ones that reach `docker run`. Prints names and flags only,
+# never env-file contents.
+# Usage: print_session_summary PROJECT_DIR CONTAINER_NAME
+print_session_summary() {
+    local project_dir="$1" container_name="$2"
+    local opencode_version guard repo=no worktree=no docker_sock=off env_file=no
+
+    opencode_version=$(image_label dev.opencode-dockerized.opencode-version)
+    guard=$(installed_guard_version)
+    [ -e "$project_dir/.git" ] && repo=yes
+    [ ${#GIT_WORKTREE_ARGS[@]} -gt 0 ] && worktree=yes
+    [ "$DOCKER_SOCKET" = true ] && docker_sock=$(forwarding_state true /var/run/docker.sock)
+    [ ${#DOCKER_ENV_FILE_ARGS[@]} -gt 0 ] && env_file=yes
+
+    summary_line "Project" "$project_dir"
+    summary_line "Container" "$container_name (image $(image_version), OpenCode ${opencode_version:-unknown}, guard ${guard:-unknown})"
+    summary_line "Profile" "${OCD_PROFILE:-default}"
+    summary_line "Sandbox" "network=$NETWORK policy=$SECURITY_POLICY"
+    summary_line "Git" "repo=$repo worktree=$worktree"
+    summary_line "Forwarding" "ssh-agent=$(forwarding_state "$SSH_AGENT_SUPPORT" "${SSH_AUTH_SOCK:-}") gpg-agent=$(forwarding_state "$GPG_AGENT_SUPPORT" "${GPG_RELAY_SOCKET:-$GPG_SOCKET}") docker-socket=$docker_sock"
+    summary_line "Resources" "memory=${MEMORY:-unlimited} cpus=${CPUS:-unlimited} pids=$PIDS_LIMIT"
+    summary_line "State" "mounts=${#CUSTOM_MOUNTS[@]} env-file=$env_file websearch=${WEBSEARCH_PROVIDER:-off} theme=${THEME:-default}"
+}
+
 # Function to run OpenCode
 # Usage: run_opencode [--] [DIR]
 run_opencode() {
@@ -648,11 +728,6 @@ run_opencode() {
     local container_name="opencode-${OCD_PROFILE:+${OCD_PROFILE}-}${dir_name}-${random_suffix}"
 
     print_info "Starting OpenCode in Docker..."
-    if [ -n "$OCD_PROFILE" ]; then
-        print_info "Profile: $OCD_PROFILE"
-    fi
-    print_info "Project directory: $project_dir"
-    print_info "Container name: $container_name"
 
     # Parse custom config and build docker arguments
     parse_config
@@ -662,6 +737,9 @@ run_opencode() {
     build_common_docker_args
     # Docker socket is opt-in: mounting it is root-equivalent on the host.
     build_standard_volume_args "$project_dir" "$DOCKER_SOCKET"
+
+    # After the builders: it reports the effective (validated) settings.
+    print_session_summary "$project_dir" "$container_name"
 
     # Build the full docker run command as an array
     # CONTAINER_WORKDIR is set by build_standard_volume_args (host path with $HOME stripped)

@@ -64,6 +64,14 @@ grep -q -- ' --pids-limit 4096 ' <<<"$line" || fail "docker run must cap process
 grep -q -- ' --tmpfs /tmp/opencode:rw,' <<<"$line" || fail "the advertised scratch dir needs a tmpfs"
 grep -q -- ' -e LANG=C.UTF-8 ' <<<"$line" || fail "LANG must default to C.UTF-8"
 grep -q -- ' --label opencode-dockerized=1 ' <<<"$line" || fail "containers must carry the opencode-dockerized label"
+# Session summary: one aligned line per area, with the effective defaults.
+for want in 'Project:    ' 'Container:  opencode-default-proj-' 'Profile:    default' \
+    'Sandbox:    network=host policy=balanced' 'Git:        repo=no worktree=no' \
+    'Forwarding: ssh-agent=off gpg-agent=off docker-socket=off' \
+    'Resources:  memory=unlimited cpus=unlimited pids=4096' \
+    'State:      mounts=0 env-file=no websearch=off theme=default'; do
+    grep -qF "$want" <<<"$OUT" || fail "session summary must include '$want'"
+done
 if grep -q -- 'host.docker.internal' <<<"$line"; then
     fail "host.docker.internal mapping is only for bridge networking"
 fi
@@ -82,6 +90,8 @@ grep -q -- ' --memory-swap 2g ' <<<"$line" || fail "memory must pin swap to the 
 grep -q -- ' --pids-limit 512 ' <<<"$line" || fail "setting.pids_limit must override the default"
 grep -q -- ' --add-host host.docker.internal:host-gateway ' <<<"$line" ||
     fail "bridge networking must map host.docker.internal"
+grep -qF 'Sandbox:    network=bridge policy=balanced' <<<"$OUT" || fail "summary must show the configured network"
+grep -qF 'Resources:  memory=2g cpus=unlimited pids=512' <<<"$OUT" || fail "summary must show the configured limits"
 printf 'setting.memory=0g\nsetting.pids_limit=0\n' >"$PROFILE_DIR/config"
 run_wrapper run "$TMP/proj"
 line="$(docker_run_line)"
